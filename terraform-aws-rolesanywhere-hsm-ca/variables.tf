@@ -148,12 +148,6 @@ variable "intermediate_ca_validity_days" {
   default     = 1825
 }
 
-variable "leaf_validity_days" {
-  description = "Default lifetime of workload certificates issued with scripts/kms_ca_tool.py sign-leaf-csr."
-  type        = number
-  default     = 90
-}
-
 variable "crl_validity_days" {
   description = "thisUpdate -> nextUpdate window of every generated CRL. Must exceed the Lambda's 24h refresh cadence comfortably."
   type        = number

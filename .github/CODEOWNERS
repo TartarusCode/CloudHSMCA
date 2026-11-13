@@ -1,0 +1,8 @@
+# Default owners for everything in the repository.
+* @BGarber42
+
+# The certificate profile and the ceremony are the highest-risk files: the
+# extensions here decide who can obtain AWS credentials.
+/terraform-aws-rolesanywhere-hsm-ca/scripts/ @BGarber42
+/terraform-aws-rolesanywhere-hsm-ca/ceremony_hsm.tf @BGarber42
+/terraform-aws-rolesanywhere-hsm-ca/roles_anywhere.tf @BGarber42

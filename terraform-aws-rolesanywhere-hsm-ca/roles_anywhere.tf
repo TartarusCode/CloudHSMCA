@@ -46,11 +46,6 @@ data "aws_ssm_parameter" "ca_bundle" {
   name  = local.ssm_ca_bundle_pem
 }
 
-data "aws_ssm_parameter" "intermediate_ca_pem" {
-  count = local.phase2 ? 1 : 0
-  name  = local.ssm_intermediate_ca_pem
-}
-
 resource "aws_rolesanywhere_trust_anchor" "this" {
   count = local.phase2 ? 1 : 0
 

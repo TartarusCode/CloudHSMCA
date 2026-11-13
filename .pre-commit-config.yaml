@@ -1,0 +1,34 @@
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.6.0
+    hooks:
+      - id: check-merge-conflict
+      - id: end-of-file-fixer
+      - id: trailing-whitespace
+      - id: check-added-large-files
+        args: ["--maxkb=512"]
+      - id: check-yaml
+      - id: check-json
+      # A PKI repository should never accept a private key, even by accident.
+      - id: detect-private-key
+
+  - repo: https://github.com/antonbabenko/pre-commit-terraform
+    rev: v1.92.0
+    hooks:
+      - id: terraform_fmt
+      - id: terraform_validate
+        args:
+          - --hook-config=--retry-on-error=true
+          - --tf-init-args=-backend=false
+      - id: terraform_tflint
+        args:
+          - --args=--config=__GIT_WORKING_DIR__/.tflint.hcl
+
+  - repo: local
+    hooks:
+      - id: offline-harnesses
+        name: offline harnesses (crypto, lambda, ceremony)
+        entry: bash terraform-aws-rolesanywhere-hsm-ca/tests/run-all.sh
+        language: system
+        pass_filenames: false
+        files: '\.(tf|tftpl|py|sh)$'
