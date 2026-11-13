@@ -1,0 +1,290 @@
+#!/bin/bash
+# =============================================================================
+# AWS CloudHSM Root CA ceremony — cloud-init user data for the ephemeral
+# ceremony host (Amazon Linux 2023).
+#
+# Rendered by ceremony_hsm.tf. The ONLY Terraform interpolation in this file is
+# the single JSON document below; every shell expansion is written as $${...}
+# so that Terraform does not try to resolve it.
+#
+# What happens here, in order:
+#   1. install CloudHSM Client SDK 5 CLI (cloudhsm-cli), jq, OpenSSL, uv
+#   2. python venv with cryptography + boto3 (uv, no system packages mutated)
+#   3. point the CLI at the single HSM ENI, wait for the cluster
+#   4. activate the cluster, create the crypto user
+#   5. generate the Root CA key INSIDE the HSM: extractable=false, sign=true
+#   6. rebuild the Root public key from the HSM-reported EC point
+#   7. self-sign the Root CA certificate with `cloudhsm-cli crypto sign ecdsa`
+#   8. build the Intermediate CSR from the KMS key, sign it with the HSM
+#   9. verify the chain and the X.509 profile, publish certs to SSM + S3
+#
+# Nothing in step 5-8 ever writes a private key to disk. The Root key exists
+# only inside the HSM and, after the HSM is deleted in phase 2, only inside the
+# automatic encrypted cluster backup that the module denies deleting.
+#
+# Re-runs: cloud-init executes user data once. A copy is installed at
+# /opt/pki/hsm_ceremony.sh so it can be re-run over SSM Session Manager.
+# The SSM ceremony/state parameter short-circuits an already-complete ceremony.
+# =============================================================================
+set -euo pipefail
+
+# --- facts injected by Terraform --------------------------------------------
+readonly CONFIG_JSON=$(cat <<'CEREMONY_JSON'
+${ceremony_config}
+CEREMONY_JSON
+)
+
+# --- fixed paths ------------------------------------------------------------
+readonly PKI_DIR=/opt/pki
+readonly VENV=$PKI_DIR/venv
+readonly LOG=/var/log/pki-ceremony.log
+readonly CLI=/opt/cloudhsm/bin/cloudhsm-cli
+readonly TOOL=$PKI_DIR/kms_ca_tool.py
+
+mkdir -p "$PKI_DIR" "$PKI_DIR/logs" "$(dirname "$LOG")"
+chmod 700 "$PKI_DIR"
+
+log() { printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" | tee -a "$LOG" >&2; }
+die() { log "FATAL: $*"; mark_state FAILED || true; exit 1; }
+trap 'die "unexpected failure (line $LINENO, exit $?)"' ERR
+
+cfg() { printf '%s' "$CONFIG_JSON" | jq -r --arg k "$1" '.[$k]'; }
+
+NAME=$(cfg name)
+REGION=$(cfg region)
+CLUSTER_ID=$(cfg cluster_id)
+HSM_IP=$(cfg hsm_ip)
+BUCKET=$(cfg bucket)
+KMS_KEY_ARN=$(cfg kms_key_arn)
+ROOT_CURVE=$(cfg root_curve)
+ROOT_DIGEST=$(cfg root_digest)
+ROOT_LABEL=$(cfg root_label)
+PUB_DER=$(cfg public_key_der)
+ROOT_DAYS=$(cfg root_validity_days)
+INTER_DAYS=$(cfg inter_validity_days)
+SSM_ROOT=$(cfg ssm_root_ca_pem)
+SSM_INTER=$(cfg ssm_intermediate_pem)
+SSM_BUNDLE=$(cfg ssm_ca_bundle_pem)
+SSM_STATE=$(cfg ssm_ceremony_state)
+SSM_ADMIN_PW=$(cfg ssm_admin_password)
+SSM_CU_PW=$(cfg ssm_cu_password)
+S3_TOOL=$(cfg s3_kms_ca_tool)
+S3_ROOT_CNF=$(cfg s3_root_ca_cnf)
+S3_INTER_CNF=$(cfg s3_intermediate_cnf)
+CU_USER=$(cfg cu_username)
+CLI_RPM=$(cfg cloudhsm_cli_rpm)
+
+export AWS_REGION=$REGION
+export AWS_DEFAULT_REGION=$REGION
+export PATH="$HOME/.local/bin:$PATH"
+# Keep python's stdout in step with the tee'd log so the ceremony transcript
+# reads in the order things actually happened.
+export PYTHONUNBUFFERED=1
+
+mark_state() { aws ssm put-parameter --name "$SSM_STATE" --value "$1" \
+                 --type String --overwrite >/dev/null 2>&1 || true; }
+
+get_secret() {
+  aws ssm get-parameter --name "$1" --with-decryption \
+    --query Parameter.Value --output text
+}
+
+# CloudHSM CLI prints one JSON document per command; drop the prompt/banner
+# lines and keep the last complete document.
+pick_json() {
+  grep -E '^[[:space:]]*([][{}]|")' | jq -s -c 'last' 2>/dev/null || true
+}
+
+# Run one command in cloudhsm-cli interactive mode as the given role.
+hsm_as() { # hsm_as <role> <user> <password> <command>
+  printf 'login --username %s --role %s --password %s\n%s\nquit\n' \
+    "$2" "$1" "$3" "$4" | "$CLI" interactive 2>&1
+}
+
+hsm_admin() { hsm_as admin admin "$ADMIN_PW" "$1"; }
+hsm_cu()    { hsm_as crypto-user "$CU_USER" "$CU_PW" "$1"; }
+
+require_ok() { # require_ok <label> <output-file>
+  local code
+  code=$(pick_json < "$2" | jq -r '.error_code // "missing"')
+  if [ "$code" != "0" ]; then
+    log "--- $1 failed (error_code=$code) ---"
+    tee -a "$LOG" < "$2" >&2
+    die "$1 returned error_code=$code"
+  fi
+}
+
+log "ceremony start: name=$NAME cluster=$CLUSTER_ID hsm=$HSM_IP region=$REGION"
+
+# --- 0. short-circuit an already completed ceremony -------------------------
+if [ "$(aws ssm get-parameter --name "$SSM_STATE" --query Parameter.Value \
+        --output text 2>/dev/null || true)" = "COMPLETE" ]; then
+  log "ceremony already COMPLETE per $SSM_STATE — nothing to do"
+  exit 0
+fi
+
+mark_state IN_PROGRESS
+
+# --- 1. packages ------------------------------------------------------------
+log "installing jq, openssl, curl and the CloudHSM Client SDK 5 CLI"
+dnf install -y -q jq openssl ca-certificates curl tar gzip >/dev/null
+curl -fsSL -o /tmp/cloudhsm-cli.rpm "$CLI_RPM"
+dnf install -y -q /tmp/cloudhsm-cli.rpm >/dev/null
+[ -x "$CLI" ] || die "cloudhsm-cli not installed at $CLI"
+
+log "configuring cloudhsm-cli for HSM ENI $HSM_IP"
+/opt/cloudhsm/bin/configure-cli -a "$HSM_IP"
+if systemctl cat cloudhsm-cli >/dev/null 2>&1; then
+  systemctl enable --now cloudhsm-cli
+  log "cloudhsm-cli service restarted"
+else
+  log "no cloudhsm-cli systemd unit on this SDK build; the CLI starts its daemon on demand"
+fi
+
+# --- 2. python tooling (uv, isolated) ---------------------------------------
+if ! command -v uv >/dev/null 2>&1; then
+  log "installing uv"
+  curl -LsSf https://astral.sh/uv/install.sh | sh >/dev/null
+fi
+command -v uv >/dev/null 2>&1 || die "uv is unavailable; refusing to fall back to system pip"
+log "creating $VENV and installing cryptography + boto3"
+uv venv --python 3.11 "$VENV" >/dev/null
+uv pip install --python "$VENV/bin/python" "cryptography>=42" "boto3>=1.34" >/dev/null
+"$VENV/bin/python" - <<'PY' || die "python crypto stack is not usable"
+import boto3, cryptography
+print("cryptography", cryptography.__version__, "boto3", boto3.__version__)
+PY
+
+log "fetching the CA tooling and rendered OpenSSL profiles from s3://$BUCKET"
+aws s3api get-object --bucket "$BUCKET" --key "$S3_TOOL"      "$TOOL"           >/dev/null
+aws s3api get-object --bucket "$BUCKET" --key "$S3_ROOT_CNF"  "$PKI_DIR/root_ca.cnf"        >/dev/null
+aws s3api get-object --bucket "$BUCKET" --key "$S3_INTER_CNF" "$PKI_DIR/intermediate_ca.cnf" >/dev/null
+chmod 700 "$TOOL"
+
+# --- 3. wait for the cluster, then activate it ------------------------------
+STATE=""
+for _ in $(seq 1 40); do
+  STATE=$(aws cloudhsmv2 describe-clusters --filters clusterIds="$CLUSTER_ID" \
+            --query 'Clusters[0].State' --output text 2>/dev/null || echo UNKNOWN)
+  case "$STATE" in
+    ACTIVE|INITIALIZED) break ;;
+    *) log "cluster state=$STATE — waiting" ; sleep 30 ;;
+  esac
+done
+case "$STATE" in
+  ACTIVE|INITIALIZED) log "cluster state=$STATE" ;;
+  *) die "cluster never reached a usable state (last: $STATE)" ;;
+esac
+
+ADMIN_PW=$(get_secret "$SSM_ADMIN_PW")
+CU_PW=$(get_secret "$SSM_CU_PW")
+[ -n "$ADMIN_PW" ] && [ -n "$CU_PW" ] || die "ceremony passwords are missing from SSM"
+
+if [ "$STATE" = "INITIALIZED" ]; then
+  log "activating the cluster (sets the initial admin password)"
+  OUT=$PKI_DIR/logs/activate.json
+  "$CLI" cluster activate --password "$ADMIN_PW" > "$OUT" 2>&1 || true
+  require_ok "cluster activate" "$OUT"
+fi
+
+log "creating crypto user $CU_USER"
+OUT=$PKI_DIR/logs/user-create.json
+hsm_admin "user create --username $CU_USER --role crypto-user --password $CU_PW" > "$OUT" 2>&1 || true
+if ! pick_json < "$OUT" | jq -e 'select(.error_code == 0)' >/dev/null 2>&1; then
+  if grep -qi 'already exists' "$OUT"; then
+    log "crypto user already exists — continuing"
+  else
+    require_ok "user create" "$OUT"
+  fi
+fi
+
+# --- 4. Root CA key inside the HSM -----------------------------------------
+# extractable=false + sign=true are the two attributes that make this a CA key
+# that can never leave the HSM. (Some SDK builds also expose
+# never-extractable=true; it is stronger but not present on every 5.x build,
+# so the module asks for the portable subset.)
+log "generating the non-exportable Root CA key (label=$ROOT_LABEL curve=$ROOT_CURVE)"
+OUT=$PKI_DIR/logs/root-key.json
+hsm_cu "key generate-asymmetric-pair ec --curve $ROOT_CURVE \
+  --public-label $ROOT_LABEL --private-label $ROOT_LABEL \
+  --private-attributes extractable=false sign=true" > "$OUT" 2>&1 || true
+require_ok "key generate-asymmetric-pair" "$OUT"
+
+if [ "$(pick_json < "$OUT" | jq -r '.data.private_key.attributes.extractable // "unknown"')" != "false" ]; then
+  die "root private key is extractable — refusing to continue"
+fi
+log "root private key confirmed non-extractable"
+
+POINT=$(pick_json < "$OUT" | jq -r '.data.public_key.attributes."ec-point" // empty')
+[ -n "$POINT" ] || die "HSM did not report an EC point for the root public key"
+
+"$VENV/bin/python" "$TOOL" spki-from-point --curve "$ROOT_CURVE" \
+  --point "$POINT" --out "$PUB_DER" | tee -a "$LOG"
+
+# --- 5. Root CA certificate, signed by the HSM ------------------------------
+export CLOUDHSM_PIN="$CU_USER:$CU_PW"
+HSM_ARGS=(--signer hsm --hsm-key-label "$ROOT_LABEL" --hsm-public-key "$PUB_DER"
+          --hsm-curve "$ROOT_CURVE" --region "$REGION")
+
+log "self-signing the Root CA certificate ($${ROOT_DAYS}d, $${ROOT_DIGEST})"
+"$VENV/bin/python" "$TOOL" self-sign-root "$${HSM_ARGS[@]}" \
+  --cnf "$PKI_DIR/root_ca.cnf" --dn-section root_dn --extensions v3_root_ca \
+  --days "$ROOT_DAYS" --out "$PKI_DIR/root_ca.pem" | tee -a "$LOG"
+
+# --- 6. Intermediate CSR from KMS, certificate from the HSM -----------------
+log "building the Intermediate CSR from the KMS key $(basename "$KMS_KEY_ARN")"
+"$VENV/bin/python" "$TOOL" create-intermediate-csr --signer kms \
+  --kms-key-id "$KMS_KEY_ARN" --region "$REGION" \
+  --cnf "$PKI_DIR/intermediate_ca.cnf" --dn-section intermediate_dn \
+  --extensions v3_intermediate_ca --issuer-cert "$PKI_DIR/root_ca.pem" \
+  --out "$PKI_DIR/intermediate_ca.csr" | tee -a "$LOG"
+
+log "signing the Intermediate CA certificate with the HSM root ($${INTER_DAYS}d)"
+"$VENV/bin/python" "$TOOL" sign-csr "$${HSM_ARGS[@]}" \
+  --issuer-cert "$PKI_DIR/root_ca.pem" --csr "$PKI_DIR/intermediate_ca.csr" \
+  --cnf "$PKI_DIR/intermediate_ca.cnf" --extensions v3_intermediate_ca \
+  --days "$INTER_DAYS" --out "$PKI_DIR/intermediate_ca.pem" | tee -a "$LOG"
+
+# --- 7. verify chain AND profile ------------------------------------------
+log "verifying the certificate chain and the X.509 profile"
+openssl verify -CAfile "$PKI_DIR/root_ca.pem" "$PKI_DIR/root_ca.pem" | tee -a "$LOG"
+openssl verify -CAfile "$PKI_DIR/root_ca.pem" "$PKI_DIR/intermediate_ca.pem" | tee -a "$LOG"
+
+assert_ext() { # assert_ext <pem> <text>
+  openssl x509 -in "$1" -noout -text | grep -qF "$2" \
+    || die "$1 is missing the required extension text: $2"
+  log "  $1: found '$2'"
+}
+assert_ext "$PKI_DIR/root_ca.pem" "CA:TRUE"
+assert_ext "$PKI_DIR/root_ca.pem" "Certificate Sign, CRL Sign"
+assert_ext "$PKI_DIR/root_ca.pem" "X509v3 Subject Key Identifier"
+assert_ext "$PKI_DIR/root_ca.pem" "X509v3 Authority Key Identifier"
+assert_ext "$PKI_DIR/intermediate_ca.pem" "CA:TRUE, pathlen:0"
+assert_ext "$PKI_DIR/intermediate_ca.pem" "Certificate Sign, CRL Sign"
+openssl x509 -in "$PKI_DIR/root_ca.pem" -noout -checkend 86400 \
+  || die "root CA expires within a day"
+
+cat "$PKI_DIR/root_ca.pem" "$PKI_DIR/intermediate_ca.pem" > "$PKI_DIR/ca_bundle.pem"
+
+# --- 8. publish ------------------------------------------------------------
+log "publishing certificates to SSM and s3://$BUCKET/certs/"
+SSM_ARGS=(--type String --overwrite)
+aws ssm put-parameter --name "$SSM_ROOT"   --value "file://$PKI_DIR/root_ca.pem"        "$${SSM_ARGS[@]}"
+aws ssm put-parameter --name "$SSM_INTER"  --value "file://$PKI_DIR/intermediate_ca.pem" "$${SSM_ARGS[@]}"
+aws ssm put-parameter --name "$SSM_BUNDLE" --value "file://$PKI_DIR/ca_bundle.pem"       "$${SSM_ARGS[@]}"
+
+for f in root_ca.pem intermediate_ca.pem ca_bundle.pem intermediate_ca.csr; do
+  aws s3api put-object --bucket "$BUCKET" --key "certs/$f" --body "$PKI_DIR/$f" \
+    --server-side-encryption AES256 >/dev/null
+done
+
+install -m 700 /var/lib/cloud/instance/user-data.txt "$PKI_DIR/hsm_ceremony.sh"
+
+mark_state COMPLETE
+
+log "CEREMONY COMPLETE"
+log "root CA     : $(openssl x509 -in "$PKI_DIR/root_ca.pem" -noout -subject)"
+log "root sha256 : $(openssl x509 -in "$PKI_DIR/root_ca.pem" -noout -fingerprint -sha256)"
+log "inter sha256: $(openssl x509 -in "$PKI_DIR/intermediate_ca.pem" -noout -fingerprint -sha256)"
+log "next step   : set ceremony_mode = false and apply — this terminates the HSM,"
+log "              retaining the encrypted cluster backup that holds the root key."

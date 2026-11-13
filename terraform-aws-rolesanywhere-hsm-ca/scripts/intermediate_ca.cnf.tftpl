@@ -1,0 +1,37 @@
+# OpenSSL profile for the KMS-BACKED INTERMEDIATE CA.
+#
+# The subject key is an AWS KMS asymmetric key (SIGN_VERIFY, ${intermediate_key_spec});
+# it is never exportable, so this profile is never used with `openssl req -new
+# -key file`. It is consumed by:
+#
+#   scripts/kms_ca_tool.py create-intermediate-csr \
+#       --signer kms --kms-key-id <key> --cnf intermediate_ca.cnf \
+#       --dn-section ${intermediate_dn_section} --extensions v3_intermediate_ca
+#
+# and by `openssl x509 -req -extfile intermediate_ca.cnf -extensions
+# v3_intermediate_ca` when a reviewer wants to re-issue the identical profile
+# offline from a copy of the key (only possible with a local test key).
+#
+# pathlen:0 is mandatory for this design: the Intermediate CA may issue
+# workload leaves and CRLs, and nothing else.
+
+[ req ]
+default_md         = ${intermediate_digest}
+distinguished_name = ${intermediate_dn_section}
+prompt             = no
+x509_extensions    = v3_intermediate_ca
+string_mask        = utf8only
+
+[ ${intermediate_dn_section} ]
+C  = ${intermediate_subject.country}
+ST = ${intermediate_subject.state}
+L  = ${intermediate_subject.locality}
+O  = ${intermediate_subject.organization}
+OU = ${intermediate_subject.organizational_unit}
+CN = ${intermediate_subject.common_name}
+
+[ v3_intermediate_ca ]
+basicConstraints       = critical, CA:TRUE, pathlen:0
+keyUsage               = critical, keyCertSign, cRLSign
+subjectKeyIdentifier   = hash
+authorityKeyIdentifier = keyid:always, issuer

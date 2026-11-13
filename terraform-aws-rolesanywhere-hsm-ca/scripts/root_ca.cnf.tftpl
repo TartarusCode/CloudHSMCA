@@ -1,0 +1,39 @@
+# OpenSSL profile for the OFFLINE ROOT CA issued inside AWS CloudHSM.
+#
+# Rendered by Terraform onto the ephemeral ceremony host. Consumed twice:
+#   1. scripts/kms_ca_tool.py --cnf root_ca.cnf --extensions v3_root_ca
+#      (the Python side reads [${root_dn_section}] and [v3_root_ca] verbatim,
+#       so this file is the single definition of the Root CA profile)
+#   2. `openssl x509 -req -extfile root_ca.cnf -extensions v3_root_ca ...`
+#      for an independent cross-check of anything this module issues.
+#
+# Constraints enforced by IAM Roles Anywhere / RFC 5280:
+#   basicConstraints  critical, CA:TRUE
+#   keyUsage          critical, keyCertSign + cRLSign only
+#   subjectKeyIdentifier / authorityKeyIdentifier  required for chain building
+#
+# The private key never appears here: it is generated with
+#   cloudhsm-cli key generate-asymmetric-pair ec --curve ${root_curve}
+#       --private-attributes extractable=false sign=true
+# and is signed with `cloudhsm-cli crypto sign ecdsa`.
+
+[ req ]
+default_md         = ${root_digest}
+distinguished_name = ${root_dn_section}
+prompt             = no
+x509_extensions    = v3_root_ca
+string_mask        = utf8only
+
+[ ${root_dn_section} ]
+C  = ${root_subject.country}
+ST = ${root_subject.state}
+L  = ${root_subject.locality}
+O  = ${root_subject.organization}
+OU = ${root_subject.organizational_unit}
+CN = ${root_subject.common_name}
+
+[ v3_root_ca ]
+basicConstraints       = critical, CA:TRUE
+keyUsage               = critical, keyCertSign, cRLSign
+subjectKeyIdentifier   = hash
+authorityKeyIdentifier = keyid:always, issuer
