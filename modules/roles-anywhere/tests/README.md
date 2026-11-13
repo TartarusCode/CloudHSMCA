@@ -38,4 +38,4 @@ a real P-384 key. Asserts:
 | the handler refuses when `CRL_OWNER=awscc` | one owner for the CRL object |
 
 The CA tooling (`kms_ca_tool.py`) and the CloudHSM ceremony live in
-[`ceremony/tests/`](../../ceremony/tests) and are tested there.
+[`modules/pki-ceremony/tests/`](../../pki-ceremony/tests) and are tested there.

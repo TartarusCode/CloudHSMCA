@@ -6,7 +6,7 @@
 # point of the split — one apply, no phase flag, nothing deleted behind you.
 #
 #   terraform init
-#   terraform apply -var intermediate_kms_key_arn=<from ../complete>
+#   terraform apply -var intermediate_kms_key_arn=<from ../01-pki-ceremony>
 #
 # This example uses crl_management_mode = "lambda", so no CRL file has to exist
 # at apply time: the scheduled Lambda owns the CRL object and the module invokes
@@ -36,7 +36,7 @@ provider "awscc" {
 }
 
 module "pki" {
-  source = "../../terraform-aws-rolesanywhere-hsm-ca"
+  source = "../../modules/roles-anywhere"
 
   # Must match the ceremony stack's name: the chain is read from /<name>/pki/*.pem.
   name = "example-pki"

@@ -1,7 +1,7 @@
 ###############################################################################
-# Inputs for terraform-aws-rolesanywhere-hsm-ca
+# Inputs for modules/roles-anywhere
 #
-# A CA consumer: it takes the chain published by ceremony/ and the KMS
+# A CA consumer: it takes the chain published by modules/pki-ceremony and the KMS
 # Intermediate key created there, and builds the Roles Anywhere runtime in one
 # apply. No VPC, no HSM, no phase flag.
 ###############################################################################
@@ -20,7 +20,7 @@ variable "name" {
 variable "intermediate_kms_key_arn" {
   description = <<-EOT
     The asymmetric SIGN_VERIFY key that signs workload certificates and CRLs.
-    ceremony/ creates it, and its key policy allows this module's CRL role
+    modules/pki-ceremony creates it, and its key policy allows this module's CRL role
     (`<name>-crl-issuer`) to sign with it, so pass
     `terraform output -raw intermediate_kms_key_arn` from that stack.
   EOT
@@ -43,7 +43,7 @@ variable "workload_profiles" {
     aws:PrincipalTag/x509Subject/OU and aws:PrincipalTag/x509Subject/CN.
   EOT
   type = map(object({
-    description                = optional(string, "Managed by terraform-aws-rolesanywhere-hsm-ca")
+    description                = optional(string, "Managed by roles-anywhere")
     session_duration_seconds   = optional(number, 3600)
     managed_policy_arns        = optional(list(string), [])
     session_policy_json        = optional(string) # Roles Anywhere session policy (JSON)
@@ -97,7 +97,7 @@ variable "crl_pem_path" {
     ImportCrl takes PEM, and Terraform cannot sign, so the CRL is produced
     before apply, from the repository root:
 
-      python3 ceremony/scripts/kms_ca_tool.py generate-crl --signer kms \
+      python3 modules/pki-ceremony/scripts/kms_ca_tool.py generate-crl --signer kms \
         --kms-key-id <intermediate_kms_key_arn> \
         --issuer-cert intermediate_ca.pem \
         --revoked-file revoked.json --out crl.pem

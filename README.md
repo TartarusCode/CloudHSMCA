@@ -21,32 +21,33 @@ the Intermediate key only inside KMS.
 ## Repository layout
 
 ```
-terraform-aws-rolesanywhere-hsm-ca/   the runtime — consumes a CA chain, one apply
-  ├── versions.tf variables.tf main.tf roles_anywhere.tf
-  ├── crl_issuer_lambda.tf outputs.tf
-  └── tests/    two offline harnesses (see tests/README.md)
-ceremony/                             the foundation + the ceremony (Step Functions)
-  ├── main.tf variables.tf outputs.tf
-  ├── statemachine.asl.json.tftpl     bootstrap, rotation, cleanup
-  ├── scripts/  kms_ca_tool.py, hsm_ceremony.sh.tftpl, rotate_intermediate.sh.tftpl, *.cnf.tftpl
-  └── tests/    ASL graph, CA chain, ceremony script (see ceremony/README.md)
+modules/
+  ├── pki-ceremony/      the foundation + the ceremony (Step Functions)
+  │   ├── main.tf variables.tf outputs.tf
+  │   ├── statemachine.asl.json.tftpl   bootstrap, rotation, cleanup
+  │   ├── scripts/       kms_ca_tool.py, hsm_ceremony.sh.tftpl,
+  │   │                  rotate_intermediate.sh.tftpl, *.cnf.tftpl
+  │   └── tests/         ASL graph, CA chain, ceremony script (see its README)
+  └── roles-anywhere/    the runtime — consumes a CA chain, one apply
+      ├── versions.tf variables.tf main.tf roles_anywhere.tf
+      ├── crl_issuer_lambda.tf outputs.tf
+      └── tests/         plan-locals smoke, CRL handler (see its README)
 examples/
-  ├── complete/    step 1: cluster shell, KMS key, state machine
-  └── runtime/     step 2: trust anchor, profiles, roles, CRL
+  ├── 01-pki-ceremony/     step 1: cluster shell, KMS key, state machine
+  └── 02-roles-anywhere/   step 2: trust anchor, profiles, roles, CRL
 .github/workflows/ci.yml   fmt, validate, tflint, python, harnesses, examples
 ```
 
 One way to produce the chain, and one way to consume it:
 
-1. **`ceremony/`** (the foundation, one apply) creates the CloudHSM cluster shell,
-   the KMS Intermediate key, the artifact bucket, the SSM hand-over parameters and
-   a Step Functions workflow. No HSM exists after apply.
+1. **`modules/pki-ceremony`** (the foundation, one apply) creates the CloudHSM
+   cluster shell, the KMS Intermediate key, the artifact bucket, the SSM hand-over
+   parameters and a Step Functions workflow. No HSM exists after apply.
 2. **The workflow** creates an HSM (restoring the cluster backup on a rotation),
    runs the ceremony on an ephemeral host, deletes the HSM, and returns only after
    confirming the HSM is gone and a READY backup exists.
-3. **`terraform-aws-rolesanywhere-hsm-ca`** (the runtime, one apply) reads the
-   published chain from SSM and builds the trust anchor, workload roles, profiles
-   and CRL.
+3. **`modules/roles-anywhere`** (the runtime, one apply) reads the published chain
+   from SSM and builds the trust anchor, workload roles, profiles and CRL.
 
 Nothing deletes what an earlier step created, and no apply has to be re-run
 because a later step exists.
@@ -58,7 +59,7 @@ the runtime that consumes what it published.
 
 ```bash
 # 1. foundation + state machine (no HSM is created by apply)
-cd examples/complete
+cd examples/01-pki-ceremony
 $EDITOR main.tf            # your VPC + private subnet, subjects, tags
 terraform init && terraform apply
 
@@ -67,18 +68,18 @@ eval "$(terraform output -raw start_bootstrap_command)"
 aws stepfunctions describe-execution --execution-arn <arn>   # until SUCCEEDED
 
 # 3. the runtime, one apply, consuming the chain
-cd ../runtime
+cd ../02-roles-anywhere
 terraform init && terraform apply \
-  -var intermediate_kms_key_arn="$(terraform -chdir=../complete output -raw intermediate_kms_key_arn)"
+  -var intermediate_kms_key_arn="$(terraform -chdir=../01-pki-ceremony output -raw intermediate_kms_key_arn)"
 ```
 
-Both examples point at their stack by path (`../../ceremony`,
-`../../terraform-aws-rolesanywhere-hsm-ca`), so clone the repo and work in place,
-or replace the `source` with a git ref once the stacks are tagged.
+Both examples point at their module by path (`../../modules/pki-ceremony`,
+`../../modules/roles-anywhere`), so clone the repo and work in place, or replace
+the `source` with a git ref once the modules are tagged.
 
 ```bash
 # issue a workload certificate with the KMS Intermediate CA
-python3 ../../ceremony/scripts/kms_ca_tool.py sign-leaf-csr \
+python3 ../../modules/pki-ceremony/scripts/kms_ca_tool.py sign-leaf-csr \
   --signer kms --kms-key-id "$(terraform output -raw intermediate_kms_key_arn)" \
   --issuer-cert intermediate_ca.pem --csr workload.csr --days 90 --out workload.pem
 ```
@@ -89,11 +90,11 @@ Five offline harnesses in two suites, **no AWS account required**:
 
 | suite | harness | proves |
 |---|---|---|
-| `ceremony/` | `tests/crypto` | the X.509 chain — root, Intermediate, leaf, CRL — built with local stand-ins for KMS and CloudHSM and verified by `openssl` |
-| `ceremony/` | `tests/ceremony` | the HSM ceremony script, rendered by Terraform and executed against a stub `cloudhsm-cli` that really signs (base64 `r\|\|s`, exactly as Client SDK 5 returns) |
-| `ceremony/` | `tests/asl_invariants.py` | the rendered state machine, walked as a graph: cleanup on `States.ALL`, cause preservation, SSM readiness, the backup gate |
-| `terraform-…-hsm-ca/` | `tests/module` | the module's locals evaluated the way `terraform plan` does — the only gate for a local that raises when computed |
-| `terraform-…-hsm-ca/` | `tests/lambda` | the CRL handler extracted from its Terraform heredoc, signed with a real key and verified by `openssl` |
+| `modules/pki-ceremony/` | `tests/crypto` | the X.509 chain — root, Intermediate, leaf, CRL — built with local stand-ins for KMS and CloudHSM and verified by `openssl` |
+| `modules/pki-ceremony/` | `tests/ceremony` | the HSM ceremony script, rendered by Terraform and executed against a stub `cloudhsm-cli` that really signs (base64 `r\|\|s`, exactly as Client SDK 5 returns) |
+| `modules/pki-ceremony/` | `tests/asl_invariants.py` | the rendered state machine, walked as a graph: cleanup on `States.ALL`, cause preservation, SSM readiness, the backup gate |
+| `modules/roles-anywhere/` | `tests/module` | the module's locals evaluated the way `terraform plan` does — the only gate for a local that raises when computed |
+| `modules/roles-anywhere/` | `tests/lambda` | the CRL handler extracted from its Terraform heredoc, signed with a real key and verified by `openssl` |
 
 ```bash
 make test          # module suite     (or tests/run-all.sh in that directory)

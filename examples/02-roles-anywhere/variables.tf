@@ -1,5 +1,5 @@
 variable "intermediate_kms_key_arn" {
-  description = "Intermediate CA key created by ../complete: `terraform -chdir=../complete output -raw intermediate_kms_key_arn`."
+  description = "Intermediate CA key created by ../01-pki-ceremony: `terraform -chdir=../01-pki-ceremony output -raw intermediate_kms_key_arn`."
   type        = string
   # Placeholder so `terraform validate` works without the other stack applied.
   default = "arn:aws:kms:us-east-1:111122223333:key/1234abcd-12ab-34cd-56ef-1234567890ab"

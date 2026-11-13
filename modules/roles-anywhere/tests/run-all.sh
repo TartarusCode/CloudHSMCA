@@ -6,8 +6,8 @@
 #   tests/lambda  — the CRL handler extracted from crl_issuer_lambda.tf, signed
 #                   with a real P-384 key and verified with openssl.
 #
-# The CA tooling (chain, CRL signing, the CloudHSM ceremony) lives in ceremony/
-# and is tested there.
+# The CA tooling (chain, CRL signing, the CloudHSM ceremony) lives in
+# modules/pki-ceremony and is tested there.
 #
 # usage: tests/run-all.sh [module-dir]
 set -uo pipefail

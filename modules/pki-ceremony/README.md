@@ -1,9 +1,9 @@
-# ceremony/ — the Root CA ceremony as a workflow
+# pki-ceremony — the Root CA ceremony as a workflow
 
-The runtime module (`terraform-aws-rolesanywhere-hsm-ca`) is a CA *consumer*: it
-reads a certificate chain and provisions IAM Roles Anywhere. This stack is the
-CA *producer*: a Step Functions state machine that borrows an HSM for the length
-of one ceremony, publishes the chain, and gives the HSM back.
+The runtime module ([`modules/roles-anywhere`](../roles-anywhere)) is a CA
+*consumer*: it reads a certificate chain and provisions IAM Roles Anywhere. This
+module is the CA *producer*: a Step Functions state machine that borrows an HSM
+for the length of one ceremony, publishes the chain, and gives the HSM back.
 
 Keeping the ceremony out of Terraform state is the point. An HSM and a signing
 host declared in Terraform would have to be created and destroyed across two
@@ -46,7 +46,7 @@ issuance pipeline) go in `additional_signer_principal_arns`.
 
 ```bash
 # once
-cd ceremony
+cd modules/pki-ceremony
 terraform init
 terraform apply \
   -var vpc_id=vpc-… \
@@ -57,16 +57,16 @@ terraform apply \
 eval "$(terraform output -raw start_bootstrap_command)"
 aws stepfunctions describe-execution --execution-arn <arn>   # until SUCCEEDED
 
-# then the runtime stack, once, with the chain now present in SSM
-cd ../terraform-aws-rolesanywhere-hsm-ca
-terraform apply -var intermediate_kms_key_arn="$(terraform -chdir=../ceremony output -raw intermediate_kms_key_arn)"
+# then the runtime module, once, with the chain now present in SSM
+cd ../roles-anywhere
+terraform apply -var intermediate_kms_key_arn="$(terraform -chdir=../pki-ceremony output -raw intermediate_kms_key_arn)"
 
 # five years later: new Intermediate from the same Root
-cd ../ceremony && eval "$(terraform output -raw start_rotation_command)"
+cd ../pki-ceremony && eval "$(terraform output -raw start_rotation_command)"
 ```
 
-The finished end-to-end walkthrough is `examples/complete` → run the execution →
-`examples/runtime`.
+The finished end-to-end walkthrough is `examples/01-pki-ceremony` → run the
+execution → `examples/02-roles-anywhere`.
 
 ## The three sharp edges, and where they live
 

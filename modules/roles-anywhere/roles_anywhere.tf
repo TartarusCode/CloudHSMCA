@@ -194,7 +194,7 @@ resource "awscc_rolesanywhere_crl" "this" {
         (var.crl_pem_path = "${var.crl_pem_path}"). Roles Anywhere accepts a CRL
         only in PEM format and Terraform cannot sign one, so produce it first:
 
-          python3 ../ceremony/scripts/kms_ca_tool.py generate-crl --signer kms \
+          python3 ../pki-ceremony/scripts/kms_ca_tool.py generate-crl --signer kms \
             --kms-key-id ${var.intermediate_kms_key_arn} \
             --issuer-cert intermediate_ca.pem \
             --revoked-file revoked.json --out crl.pem

@@ -18,7 +18,7 @@ output "workload_role_arns" {
 }
 
 output "certificate_parameters" {
-  description = "The SSM parameters this module reads (published by ceremony/)."
+  description = "The SSM parameters this module reads (published by modules/pki-ceremony)."
   value = {
     root_ca_pem         = local.ssm_root_ca_pem
     intermediate_ca_pem = local.ssm_intermediate_ca_pem

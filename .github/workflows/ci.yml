@@ -15,7 +15,8 @@ concurrency:
 env:
   TF_VERSION: "1.9.8"
   TFLINT_VERSION: "v0.53.0"
-  MODULE: terraform-aws-rolesanywhere-hsm-ca
+  MODULE: modules/roles-anywhere
+  CEREMONY: modules/pki-ceremony
 
   # One provider cache for every configuration. `make init` populates it once,
   # so aws and awscc are downloaded and stored a single time per lock file
@@ -87,12 +88,12 @@ jobs:
 
       - name: compile python
         run: |
-          python -m compileall -q "$MODULE/tests" ceremony/scripts ceremony/tests
+          python -m compileall -q "$MODULE/tests" "$CEREMONY/scripts" "$CEREMONY/tests"
 
       - name: python syntax check the shell tools
         run: |
-          for f in ceremony/scripts/*.sh.tftpl "$MODULE"/tests/*.sh "$MODULE"/tests/*/*.sh \
-                   ceremony/tests/*.sh ceremony/tests/*/*.sh; do
+          for f in "$CEREMONY"/scripts/*.sh.tftpl "$MODULE"/tests/*.sh "$MODULE"/tests/*/*.sh \
+                   "$CEREMONY"/tests/*.sh "$CEREMONY"/tests/*/*.sh; do
             [ -f "$f" ] || continue
             bash -n "$f"
           done

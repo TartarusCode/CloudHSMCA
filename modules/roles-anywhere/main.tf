@@ -1,8 +1,8 @@
 ###############################################################################
-# Runtime foundation for terraform-aws-rolesanywhere-hsm-ca
+# Runtime foundation for modules/roles-anywhere
 #
 # This module CONSUMES a certificate chain; it never creates one. The Root CA
-# ceremony is ceremony/ (a Step Functions workflow with a CloudHSM), which
+# ceremony is modules/pki-ceremony (a Step Functions workflow with a CloudHSM), which
 # publishes /<name>/pki/*.pem to SSM Parameter Store and creates the KMS
 # Intermediate CA key. Nothing here waits for an earlier phase of itself, so a
 # single apply produces a complete runtime.
@@ -23,7 +23,7 @@ locals {
   region     = data.aws_region.current.region
 
   tags = merge(var.tags, {
-    Module   = "terraform-aws-rolesanywhere-hsm-ca"
+    Module   = "roles-anywhere"
     Workload = var.name
   })
 

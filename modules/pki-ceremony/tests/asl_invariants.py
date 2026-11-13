@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Structural checks for ceremony/statemachine.asl.json.tftpl.
+Structural checks for modules/pki-ceremony/statemachine.asl.json.tftpl.
 
 The ASL is the ceremony: a wrong Next, a Catch that leaks the HSM, or a missing
 backup check costs real money and can lose the Root CA. None of that is
@@ -21,7 +21,7 @@ make those properties meaningful:
   backup       the success path confirms the HSM is gone and a READY backup
                exists before it terminates the host and succeeds
 
-usage: python3 ceremony/tests/asl_invariants.py [stack-dir]
+usage: python3 modules/pki-ceremony/tests/asl_invariants.py [stack-dir]
 """
 import json
 import os
@@ -32,7 +32,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 STACK = sys.argv[1] if len(sys.argv) > 1 else os.path.abspath(os.path.join(HERE, ".."))
 TEMPLATE = "statemachine.asl.json.tftpl"
 
-# Mirrors the locals in ceremony/main.tf. Values are placeholders: the checks
+# Mirrors the locals in modules/pki-ceremony/main.tf. Values are placeholders: the checks
 # are structural, and a real cluster id would make the output unreadable.
 RENDER_VARS = {
     "name": "corp-pki",

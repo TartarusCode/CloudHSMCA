@@ -1,19 +1,19 @@
-# terraform-aws-rolesanywhere-hsm-ca
+# roles-anywhere
 
 The **runtime** half of a hardware-backed PKI for IAM Roles Anywhere: it takes a
 certificate chain that already exists and builds the trust anchor, the per-workload
 IAM roles and profiles, and the CRL machinery — in **one apply**.
 
 It does not create a CA. The chain and the KMS Intermediate key come from
-[`ceremony/`](../ceremony), a Step Functions workflow that borrows a CloudHSM for
-the length of one ceremony. That split is why this module has no phase flag: a
-boolean toggle would make Terraform a temporal state machine, with
+[`pki-ceremony/`](../pki-ceremony), a Step Functions workflow that borrows a
+CloudHSM for the length of one ceremony. That split is why this module has no
+phase flag: a boolean toggle would make Terraform a temporal state machine, with
 `count = … ? 1 : 0` guards, `[0]` index guards, and a second apply that deletes
 what the first created.
 
 | | cost |
 |---|---|
-| KMS asymmetric key (`SIGN_VERIFY`, ECC) | ~$1/month — created by `ceremony/` |
+| KMS asymmetric key (`SIGN_VERIFY`, ECC) | ~$1/month — created by `pki-ceremony` |
 | IAM Roles Anywhere, Lambda, S3, SSM | cents |
 | CloudHSM | **$0/hr** — no HSM exists outside a ceremony run |
 
@@ -33,7 +33,7 @@ intermediate_kms_key_arn           `terraform output -raw intermediate_kms_key_a
 
 ```hcl
 module "pki" {
-  source = "…/terraform-aws-rolesanywhere-hsm-ca"
+  source = "…/modules/roles-anywhere"
 
   name                     = "corp-pki"
   intermediate_kms_key_arn = "arn:aws:kms:…:key/…"
@@ -58,7 +58,7 @@ terraform apply     # one pass: trust anchor, roles, profiles, CRL
 Issuing a leaf, with the ceremony stack's tooling:
 
 ```bash
-python3 ../ceremony/scripts/kms_ca_tool.py sign-leaf-csr \
+python3 ../pki-ceremony/scripts/kms_ca_tool.py sign-leaf-csr \
   --signer kms --kms-key-id "$(terraform output -raw …)" \
   --issuer-cert intermediate_ca.pem --csr workload.csr --days 90 --out workload.pem
 ```
@@ -135,4 +135,4 @@ make test     # or: tests/run-all.sh
 
 Two offline harnesses, no AWS account — see [`tests/README.md`](tests/README.md).
 The CA tooling and the ceremony are tested in
-[`ceremony/tests/`](../ceremony/tests).
+[`modules/pki-ceremony/tests/`](../pki-ceremony/tests).

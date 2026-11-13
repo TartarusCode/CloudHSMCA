@@ -9,7 +9,7 @@
 #   terraform output -raw start_bootstrap_command | bash
 #   aws stepfunctions describe-execution --execution-arn <arn>   # until SUCCEEDED
 #
-# Then ../runtime, which consumes the chain this publishes.
+# Then examples/02-roles-anywhere, which consumes the chain this publishes.
 
 terraform {
   required_version = ">= 1.6.0"
@@ -31,7 +31,7 @@ provider "aws" {
 }
 
 module "ceremony" {
-  source = "../../ceremony"
+  source = "../../modules/pki-ceremony"
 
   name = "example-pki"
 
@@ -57,7 +57,7 @@ output "start_bootstrap_command" {
 }
 
 output "intermediate_kms_key_arn" {
-  description = "Pass this to ../runtime as intermediate_kms_key_arn."
+  description = "Pass this to examples/02-roles-anywhere as intermediate_kms_key_arn."
   value       = module.ceremony.intermediate_kms_key_arn
 }
 

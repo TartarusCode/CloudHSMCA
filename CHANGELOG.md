@@ -7,7 +7,9 @@ semantic versioning once it is tagged.
 ## [0.2.0] - 2026-11-13
 
 Breaking: the two-phase `ceremony_mode` toggle is gone. The ceremony is its own
-stack and the module is a pure consumer, applied once.
+module and the runtime module is a pure consumer, applied once. The repository is
+laid out as `modules/pki-ceremony` + `modules/roles-anywhere`, with
+`examples/01-pki-ceremony` and `examples/02-roles-anywhere` in deployment order.
 
 ### Removed
 
@@ -15,21 +17,22 @@ stack and the module is a pure consumer, applied once.
   `aws_instance`, the ceremony host IAM/SG/profile, and every
   `count = var.ceremony_mode ? … : 0` guard and `[0]` index in the module.
 - The module's `aws_kms_key`, CloudHSM cluster, VPC inputs, certificate SSM
-  parameters, and `scripts/` directory — all moved to `ceremony/`.
+  parameters, and `scripts/` directory — all moved to `modules/pki-ceremony`.
 - `examples/hsm-ceremony` and `examples/steady-state`.
 
 ### Added
 
-- `ceremony/`: the foundation (cluster shell, **KMS Intermediate key**, artifact
-  bucket, SSM hand-over, IAM) plus a Step Functions workflow that creates an HSM,
-  runs the ceremony, deletes the HSM, and verifies a READY backup before
-  succeeding. Its key policy grants the ceremony host and the runtime module's
-  CRL role by deterministic name, so neither stack depends on the other's apply
-  order.
-- `ceremony/tests/`: ASL graph invariants, the CA-chain harness and the ceremony
-  script harness (moved from the module's tests), plus `run-all.sh`.
-- `examples/complete` (foundation + state machine) and `examples/runtime`
-  (single-apply consumer).
+- `modules/pki-ceremony`: the foundation (cluster shell, **KMS Intermediate
+  key**, artifact bucket, SSM hand-over, IAM) plus a Step Functions workflow that
+  creates an HSM, runs the ceremony, deletes the HSM, and verifies a READY backup
+  before succeeding. Its key policy matches the ceremony host and the runtime
+  module's CRL role by `aws:PrincipalArn` under the account root, so neither
+  module depends on the other's apply order and KMS never has to resolve a role
+  that does not exist yet.
+- `modules/pki-ceremony/tests/`: ASL graph invariants, the CA-chain harness and
+  the ceremony script harness (moved from the module's tests), plus `run-all.sh`.
+- `examples/01-pki-ceremony` (foundation + state machine) and
+  `examples/02-roles-anywhere` (single-apply consumer).
 
 ### Changed
 

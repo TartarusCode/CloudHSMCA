@@ -1,8 +1,11 @@
 # Default owners for everything in the repository.
 * @BGarber42
 
-# The certificate profile and the ceremony are the highest-risk files: the
-# extensions here decide who can obtain AWS credentials.
-/terraform-aws-rolesanywhere-hsm-ca/scripts/ @BGarber42
-/terraform-aws-rolesanywhere-hsm-ca/ceremony_hsm.tf @BGarber42
-/terraform-aws-rolesanywhere-hsm-ca/roles_anywhere.tf @BGarber42
+# The certificate profiles, the CA tooling and the ceremony are the highest-risk
+# files: the extensions there decide who can obtain AWS credentials, and the KMS
+# key policy decides who can sign with the Intermediate.
+/modules/pki-ceremony/scripts/ @BGarber42
+/modules/pki-ceremony/main.tf @BGarber42
+/modules/pki-ceremony/statemachine.asl.json.tftpl @BGarber42
+/modules/roles-anywhere/roles_anywhere.tf @BGarber42
+/modules/roles-anywhere/crl_issuer_lambda.tf @BGarber42

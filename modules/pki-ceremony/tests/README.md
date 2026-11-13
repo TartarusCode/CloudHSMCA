@@ -4,7 +4,7 @@ Offline harnesses for the ceremony stack. None of them needs an AWS account, an
 HSM, or credentials.
 
 ```bash
-make ceremony-test        # or: ceremony/tests/run-all.sh
+make ceremony-test        # or: modules/pki-ceremony/tests/run-all.sh
 ```
 
 ## `asl_invariants.py`

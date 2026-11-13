@@ -1,5 +1,5 @@
 ###############################################################################
-# ceremony/ — the Root CA ceremony as an imperative workflow (Shape B)
+# modules/pki-ceremony/ — the Root CA ceremony as an imperative workflow
 #
 # Terraform owns the durable half: the CloudHSM cluster shell, the artifact
 # bucket, the SSM hand-over parameters, IAM, and the state machine. Step
@@ -8,8 +8,8 @@
 # ec2:TerminateInstances — so no HSM or ceremony host ever exists in Terraform
 # state and nothing can drift.
 #
-# The runtime stack (terraform-aws-rolesanywhere-hsm-ca) consumes the chain this
-# publishes, which is what makes it a single deterministic apply.
+# The runtime module (modules/roles-anywhere) consumes the chain this publishes,
+# which is what makes it a single deterministic apply.
 ###############################################################################
 
 data "aws_caller_identity" "current" {}

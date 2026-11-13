@@ -1,7 +1,7 @@
 version: 2
 updates:
   - package-ecosystem: terraform
-    directory: /terraform-aws-rolesanywhere-hsm-ca
+    directory: /modules/roles-anywhere
     schedule:
       interval: weekly
     open-pull-requests-limit: 5
@@ -9,14 +9,14 @@ updates:
       prefix: "chore(deps)"
 
   - package-ecosystem: terraform
-    directory: /examples/complete
+    directory: /examples/01-pki-ceremony
     schedule:
       interval: weekly
     commit-message:
       prefix: "chore(deps)"
 
   - package-ecosystem: terraform
-    directory: /examples/runtime
+    directory: /examples/02-roles-anywhere
     schedule:
       interval: weekly
     commit-message:
