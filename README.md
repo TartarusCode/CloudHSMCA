@@ -102,6 +102,15 @@ each one proves and what it cannot.
 `make check` runs the format check, `terraform validate`, tflint and the
 harnesses — the same set CI runs.
 
+```bash
+make init        # one init per configuration, into one shared provider cache
+make -j4 check   # ~40 s: init once, then the independent gates in parallel
+```
+
+`TF_PLUGIN_CACHE_DIR` defaults to `.terraform-plugin-cache` in the working tree
+(gitignored) so the four configurations share one copy of `aws` + `awscc`
+(~900 MB) instead of four. `make clean` keeps it; `make cache-clean` drops it.
+
 ## Requirements
 
 - Terraform >= 1.6, providers: `hashicorp/aws >= 5.67`, `hashicorp/awscc`,

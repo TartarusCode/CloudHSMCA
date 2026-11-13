@@ -17,7 +17,8 @@
 # One expression per variable set, not one per assertion: `terraform console`
 # starts every provider in the configuration and aws + awscc cost ~7 s, so the
 # original thirteen invocations made this harness 97 s. Each set is now a single
-# jsonencode(...) object, compared in one pass.
+# jsonencode(...) object, and all three variable-validation cases share one
+# invocation, which brings it to four.
 #
 # usage: tests/module/smoke.sh [module-dir]
 # =============================================================================
@@ -98,27 +99,25 @@ snapshot missing "$BASE -var crl_pem_path=/nonexistent/crl.pem" \
   '{"crl_pem": ""}'
 
 echo
-echo "variable validation:"
-check_rejected() { # check_rejected <var args> <expression> <label>
-  local varargs="$1" expr="$2" label="$3" got
-  # shellcheck disable=SC2086
-  got=$(printf '%s\n' "$expr" | console $varargs 2>&1) || true
-  # `terraform console` prints "Error: Invalid value for variable" and still
-  # exits 0, so the exit status cannot be the gate here: match the error marker.
-  # Validation also only runs for the variables an expression references, so the
-  # expression has to touch the variable under test.
-  if ! grep -qE 'Invalid value for variable|Error:' <<<"$got"; then
-    echo "FAIL: $label was accepted ($got)" >&2
-    return 1
+echo "variable validation (one process: console reports every invalid variable it evaluates):"
+# One invocation, not one per variable: console evaluates all the variables an
+# expression references and prints a separate "Invalid value for variable" for
+# each. The exit status is not a gate (see below), so the messages are matched.
+rejected=$(
+  printf 'jsonencode({a = var.intermediate_kms_key_arn, b = local.crl_owned_by_awscc, c = var.name, d = var.crl_pem_path})\n' \
+    | console -var intermediate_kms_key_arn=not-an-arn \
+      -var crl_management_mode=bogus \
+      -var name=Bad_Name 2>&1 || true
+)
+for want in 'must be a KMS key ARN' 'must be awscc or lambda' 'must be 2-24 chars'; do
+  if grep -qF "$want" <<<"$rejected"; then
+    printf '  rejected %-32s -> ok\n' "$want"
+  else
+    echo "FAIL: no validation message containing '$want'; console said:" >&2
+    printf '%s\n' "$rejected" >&2
+    fail=1
   fi
-  printf '  rejected %-30s -> ok\n' "$label"
-}
-check_rejected '-var intermediate_kms_key_arn=not-an-arn' \
-  'var.intermediate_kms_key_arn' 'intermediate_kms_key_arn=not-an-arn' || fail=1
-check_rejected "$BASE -var crl_management_mode=bogus" \
-  'local.crl_owned_by_awscc' 'crl_management_mode=bogus' || fail=1
-check_rejected "$BASE -var name=Bad_Name" \
-  'local.tags' 'name=Bad_Name' || fail=1
+done
 
 echo
 if [ "$fail" -ne 0 ]; then

@@ -1,6 +1,9 @@
 # Local .terraform directories
 .terraform/
 
+# Shared provider cache (see TF_PLUGIN_CACHE_DIR in the Makefile)
+.terraform-plugin-cache/
+
 # .tfstate files
 *.tfstate
 *.tfstate.*

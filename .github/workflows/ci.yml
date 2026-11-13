@@ -17,6 +17,12 @@ env:
   TFLINT_VERSION: "v0.53.0"
   MODULE: terraform-aws-rolesanywhere-hsm-ca
 
+  # One provider cache for every configuration. `make init` populates it once,
+  # so aws and awscc are downloaded and stored a single time per lock file
+  # instead of once per directory, and the cache action below carries it
+  # between runs. Without it a cold run downloads ~900 MB four times.
+  TF_PLUGIN_CACHE_DIR: ${{ github.workspace }}/.terraform-plugin-cache
+
 jobs:
   terraform:
     name: fmt, validate, examples
@@ -29,29 +35,15 @@ jobs:
           terraform_version: ${{ env.TF_VERSION }}
           terraform_wrapper: false
 
-      - name: terraform fmt -check
-        run: terraform fmt -recursive -check -diff
+      - uses: actions/cache@v4
+        with:
+          path: ${{ env.TF_PLUGIN_CACHE_DIR }}
+          key: tf-providers-${{ runner.os }}-${{ env.TF_VERSION }}-${{ hashFiles('**/.terraform.lock.hcl') }}
+          restore-keys: |
+            tf-providers-${{ runner.os }}-${{ env.TF_VERSION }}-
 
-      - name: terraform validate
-        run: |
-          terraform -chdir="$MODULE" init -backend=false -input=false -no-color
-          terraform -chdir="$MODULE" validate -no-color
-
-      - name: terraform validate examples
-        run: |
-          set -euo pipefail
-          for f in examples/*/main.tf; do
-            dir="$(dirname "$f")"
-            echo "::group::$dir"
-            terraform -chdir="$dir" init -backend=false -input=false -no-color >/dev/null
-            terraform -chdir="$dir" validate -no-color
-            echo "::endgroup::"
-          done
-
-      - name: terraform validate ceremony stack
-        run: |
-          terraform -chdir=ceremony init -backend=false -input=false -no-color
-          terraform -chdir=ceremony validate -no-color
+      - name: gates (one init, then the independent checks in parallel)
+        run: make -j4 fmt-check validate examples ceremony-validate
 
   tflint:
     name: tflint
@@ -64,9 +56,7 @@ jobs:
           tflint_version: ${{ env.TFLINT_VERSION }}
 
       - name: tflint
-        run: |
-          tflint --init
-          tflint --recursive --format compact
+        run: make lint
 
   tests:
     name: offline harnesses
@@ -82,6 +72,13 @@ jobs:
       - uses: actions/setup-python@v7
         with:
           python-version: "3.11"
+
+      - uses: actions/cache@v4
+        with:
+          path: ${{ env.TF_PLUGIN_CACHE_DIR }}
+          key: tf-providers-${{ runner.os }}-${{ env.TF_VERSION }}-${{ hashFiles('**/.terraform.lock.hcl') }}
+          restore-keys: |
+            tf-providers-${{ runner.os }}-${{ env.TF_VERSION }}-
 
       - name: python dependencies
         run: |
@@ -100,14 +97,12 @@ jobs:
             bash -n "$f"
           done
 
-      - name: terraform init (the ceremony harness renders the template with it)
-        run: terraform -chdir="$MODULE" init -backend=false -input=false -no-color
-
-      - name: offline harnesses
-        run: bash "$MODULE/tests/run-all.sh"
-
-      - name: ceremony stack harnesses (ASL graph, CA chain, ceremony script)
-        run: bash ceremony/tests/run-all.sh
+      # Both suites need providers (`terraform console` renders the profiles and
+      # the ceremony script), so `test` and `ceremony-test` depend on `init`;
+      # make runs it once and then the two suites concurrently. They work in
+      # different directories, so the shared cache is only read.
+      - name: offline harnesses (both suites, in parallel)
+        run: make -j4 test ceremony-test
 
   hygiene:
     name: repository hygiene
@@ -131,5 +126,13 @@ jobs:
           set -euo pipefail
           if git ls-files | grep -E '\.(tfstate|tfplan|tfvars|pem|key|csr)$'; then
             echo "::error::generated or secret material must not be tracked"
+            exit 1
+          fi
+
+      - name: the provider cache is not tracked
+        run: |
+          set -euo pipefail
+          if git ls-files | grep -q '^.terraform-plugin-cache/'; then
+            echo "::error::the shared provider cache must stay out of the repository"
             exit 1
           fi
