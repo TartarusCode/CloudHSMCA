@@ -1,0 +1,48 @@
+#!/bin/bash
+# Emulates only the AWS CLI calls the ceremony script makes.
+set -uo pipefail
+HARNESS="${HARNESS:?}"; STUB="$HARNESS/stub"
+echo "aws $*" >> "$STUB/aws.log"
+
+val() { # val <flag> <args...>  -> value after <flag>
+  local flag="$1"; shift
+  while [ "$#" -gt 0 ]; do
+    if [ "$1" = "$flag" ]; then printf '%s' "${2:-}"; return 0; fi
+    shift
+  done
+  printf ''
+}
+
+svc="$1 $2"; shift 2
+case "$svc" in
+  "ssm get-parameter")
+    name=$(val --name "$@")
+    case "$name" in
+      *hsm-admin-password) echo "AdminPass-123" ;;
+      *hsm-cu-password)    echo "CuPass-456" ;;
+      *ceremony/state)     cat "$STUB/state" 2>/dev/null || echo "NOT_STARTED" ;;
+      *)                   echo "PENDING-CEREMONY" ;;
+    esac
+    ;;
+  "ssm put-parameter")
+    name=$(val --name "$@"); value=$(val --value "$@")
+    case "$value" in file://*) value=$(cat "${value#file://}");; esac
+    printf '%s=%s\n' "$name" "$(printf '%s' "$value" | head -3 | tr '\n' ' ')" >> "$STUB/ssm-puts.log"
+    case "$name" in */ceremony/state) printf '%s' "$value" > "$STUB/state" ;; esac
+    ;;
+  "cloudhsmv2 describe-clusters")
+    if [ ! -f "$STUB/activated" ]; then echo INITIALIZED; touch "$STUB/activated"; else echo ACTIVE; fi
+    ;;
+  "s3api get-object")
+    key=$(val --key "$@"); out="${!#}"
+    cp "$HARNESS/scripts/$(basename "$key")" "$out"
+    ;;
+  "s3api put-object")
+    key=$(val --key "$@"); body=$(val --body "$@")
+    printf '%s %s\n' "$key" "$(wc -c < "$body")" >> "$STUB/s3-puts.log"
+    ;;
+  *)
+    echo "aws stub: unhandled $svc $*" >&2
+    exit 1
+    ;;
+esac
