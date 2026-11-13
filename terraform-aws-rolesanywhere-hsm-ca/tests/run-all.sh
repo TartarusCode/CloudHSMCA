@@ -29,6 +29,7 @@ run() {
   fi
 }
 
+run "module (locals evaluated like plan)" bash "$HERE/module/smoke.sh" "$MODULE"
 run "crypto (kms_ca_tool.py)" bash "$HERE/crypto/test_kms_ca_tool.sh" "$MODULE"
 run "lambda (crl handler)" python3 "$HERE/lambda/test_lambda.py" "$MODULE"
 run "ceremony (hsm_ceremony.sh)" bash "$HERE/ceremony/run.sh" "$MODULE"

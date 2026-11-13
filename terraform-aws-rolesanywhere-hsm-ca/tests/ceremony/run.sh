@@ -93,19 +93,33 @@ cfg = {
     "s3_intermediate_cnf": "scripts/intermediate_ca.cnf",
     "cu_username": "pki-cu", "cloudhsm_cli_rpm": "https://example/rpm",
 }
-expr = 'templatefile("scripts/hsm_ceremony.sh.tftpl", {ceremony_config = %s})' % (
+expr = 'jsonencode(templatefile("scripts/hsm_ceremony.sh.tftpl", {ceremony_config = %s}))' % (
     json.dumps(json.dumps(cfg)))
 res = subprocess.run(["terraform", "console"], cwd=module, input=expr,
                      capture_output=True, text=True)
 if res.returncode != 0:
     sys.exit("terraform console failed: %s\n%s" % (res.stdout, res.stderr))
-lines = res.stdout.split("\n")
-assert lines[0].startswith("<<"), lines[0]
-end = max(i for i, l in enumerate(lines) if l.strip() == "EOT")
-body = "\n".join(lines[1:end]) + "\n"
+
+
+def decode_console_string(raw):
+    """Terraform console quoted a string value one extra time in some releases."""
+    body = raw.strip()
+    for _ in range(3):
+        try:
+            nxt = json.loads(body)
+        except json.JSONDecodeError:
+            return body
+        if not isinstance(nxt, str) or nxt == body:
+            return body
+        body = nxt
+    return body
+
+
+body = decode_console_string(res.stdout)
 # Every $${...} in the template is a shell expansion and must still be one
 # after rendering; the JSON document must have arrived intact.
-assert '"cluster_id": "cluster-abc123"' in body, "config JSON missing from render"
+assert '"cluster_id": "cluster-abc123"' in body, \
+    "config JSON missing from render: %r" % body[:200]
 open(out_path, "w").write(body)
 print("rendered ceremony: %d bytes" % len(body))
 PY
@@ -131,13 +145,25 @@ vars_ = {
 }
 for tpl, name in (("scripts/root_ca.cnf.tftpl", "root_ca.cnf"),
                   ("scripts/intermediate_ca.cnf.tftpl", "intermediate_ca.cnf")):
-    expr = "templatefile(%s, %s)" % (json.dumps(tpl), json.dumps(vars_))
+    expr = "jsonencode(templatefile(%s, %s))" % (json.dumps(tpl), json.dumps(vars_))
     res = subprocess.run(["terraform", "console"], cwd=module, input=expr,
-                         capture_output=True, text=True, check=True)
-    lines = res.stdout.split("\n")
-    end = max(i for i, l in enumerate(lines) if l.strip() == "EOT")
-    body = "\n".join(lines[1:end]) + "\n"
+                         capture_output=True, text=True)
+    if res.returncode != 0:
+        sys.exit("terraform console failed for %s:\n%s\n%s"
+                 % (tpl, res.stdout, res.stderr))
+    # The console quotes a string value once more in some releases (1.9.x);
+    # decode until the value stops being a quoted JSON string.
+    body = res.stdout.strip()
+    for _ in range(3):
+        try:
+            nxt = json.loads(body)
+        except json.JSONDecodeError:
+            break
+        if not isinstance(nxt, str) or nxt == body:
+            break
+        body = nxt
     assert "${" not in body, [l for l in body.splitlines() if "${" in l]
+    assert body.lstrip().startswith("#"), body[:80]
     open("%s/%s" % (out_dir, name), "w").write(body)
     print("rendered %s: %d bytes" % (name, len(body)))
 PY

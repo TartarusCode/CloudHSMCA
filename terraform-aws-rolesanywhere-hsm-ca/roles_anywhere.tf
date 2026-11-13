@@ -38,7 +38,11 @@ locals {
 
   crl_owned_by_awscc = local.phase2 && var.crl_management_mode == "awscc"
 
-  crl_pem = local.crl_owned_by_awscc && var.crl_pem_path != "" && fileexists(var.crl_pem_path) ? file(var.crl_pem_path) : ""
+  # `fileexists("")` raises "'.' is a directory, not a file" the moment this
+  # local is evaluated (plan, or `terraform console`), so the empty-path case
+  # must never reach a filesystem function. try(file(...)) also covers a path
+  # that does not exist yet; the awscc resource's precondition reports it.
+  crl_pem = local.crl_owned_by_awscc && var.crl_pem_path != "" ? try(file(var.crl_pem_path), "") : ""
 }
 
 data "aws_ssm_parameter" "ca_bundle" {
