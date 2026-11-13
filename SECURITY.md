@@ -17,9 +17,10 @@ vulnerability* on this repository. Do not open a public issue for:
   policy,
 - a dependency or supply-chain issue in the ceremony tooling.
 
-Include the affected file (and line), the Terraform phase (`ceremony` or
-`steady-state`) and what an attacker gains. A working `terraform plan` diff or a
-failing harness case is the most useful evidence.
+Include the affected file (and line), the stack (`ceremony/`,
+`terraform-aws-rolesanywhere-hsm-ca/`, or an example) and what an attacker
+gains. A working `terraform plan` diff or a failing harness case is the most
+useful evidence.
 
 ## Scope and design claims worth testing
 

@@ -48,14 +48,13 @@ One way to produce the chain, and one way to consume it:
    published chain from SSM and builds the trust anchor, workload roles, profiles
    and CRL.
 
-Nothing deletes what it created in an earlier phase, and no apply has to be
-re-run because a later step exists.
+Nothing deletes what an earlier step created, and no apply has to be re-run
+because a later step exists.
 
 ## Quick start
 
-The runbook for both stacks lives in
-[`ceremony/README.md`](ceremony/README.md) and
-[`terraform-aws-rolesanywhere-hsm-ca/README.md`](terraform-aws-rolesanywhere-hsm-ca/README.md).
+Three steps, in the order they run: the foundation, one ceremony execution, then
+the runtime that consumes what it published.
 
 ```bash
 # 1. foundation + state machine (no HSM is created by apply)
@@ -86,21 +85,26 @@ python3 ../../ceremony/scripts/kms_ca_tool.py sign-leaf-csr \
 
 ## Testing
 
+Five offline harnesses in two suites, **no AWS account required**:
+
+| suite | harness | proves |
+|---|---|---|
+| `ceremony/` | `tests/crypto` | the X.509 chain — root, Intermediate, leaf, CRL — built with local stand-ins for KMS and CloudHSM and verified by `openssl` |
+| `ceremony/` | `tests/ceremony` | the HSM ceremony script, rendered by Terraform and executed against a stub `cloudhsm-cli` that really signs (base64 `r\|\|s`, exactly as Client SDK 5 returns) |
+| `ceremony/` | `tests/asl_invariants.py` | the rendered state machine, walked as a graph: cleanup on `States.ALL`, cause preservation, SSM readiness, the backup gate |
+| `terraform-…-hsm-ca/` | `tests/module` | the module's locals evaluated the way `terraform plan` does — the only gate for a local that raises when computed |
+| `terraform-…-hsm-ca/` | `tests/lambda` | the CRL handler extracted from its Terraform heredoc, signed with a real key and verified by `openssl` |
+
 ```bash
-make test      # or: terraform-aws-rolesanywhere-hsm-ca/tests/run-all.sh
+make test          # module suite     (or tests/run-all.sh in that directory)
+make ceremony-test # ceremony suite
 ```
 
-Three harnesses, **no AWS account required**: the X.509 chain built with local
-stand-ins for KMS/CloudHSM, the CRL Lambda extracted from its Terraform heredoc
-and run against a real key, and the whole HSM ceremony script rendered by
-Terraform and executed against a stub `cloudhsm-cli` that really signs
-(base64 `r||s`, exactly as Client SDK 5 returns). Every certificate and CRL they
-produce is verified with `openssl`. See
-[`tests/README.md`](terraform-aws-rolesanywhere-hsm-ca/tests/README.md) for what
-each one proves and what it cannot.
+What each one proves, and what it cannot (CloudHSM control-plane timing, KMS
+policy enforcement, service-side CRL acceptance), is in the two `tests/README.md`.
 
-`make check` runs the format check, `terraform validate`, tflint and the
-harnesses — the same set CI runs.
+`make check` runs the format check, `terraform validate`, tflint and both suites —
+the same set CI runs.
 
 ```bash
 make init        # one init per configuration, into one shared provider cache
@@ -121,17 +125,10 @@ make -j4 check   # ~40 s: init once, then the independent gates in parallel
 - For the ceremony host: nothing but a private subnet — no NAT, no bastion, no
   SSH. Access is SSM Session Manager only.
 
-## Conventions
+## Contributing
 
-- **Signed commits.** `commit.gpgsign = true`; history is the operators' work, so
-  no tool or agent attribution in messages.
-- **No secrets in the tree.** No `.pem`, `.key`, `.csr`, `.tfvars` or state files
-  are tracked; `.gitignore` covers them. `crl.pem` is an input, not an artifact
-  of this repo.
-- **Comments describe the current behaviour**, never the previous one.
-- **Every claim in a README is a test** where the environment allows it; where it
-  does not (CloudHSM control-plane timing, service-side CRL acceptance), the
-  README says so instead of implying coverage.
+Conventions, the local gate and how to run each harness: see
+[CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
 

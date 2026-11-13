@@ -5,21 +5,22 @@ reads a certificate chain and provisions IAM Roles Anywhere. This stack is the
 CA *producer*: a Step Functions state machine that borrows an HSM for the length
 of one ceremony, publishes the chain, and gives the HSM back.
 
-That split is the whole point. A boolean `ceremony_mode` inside the module made
-Terraform act as a temporal state machine: `count = var.ceremony_mode ? 1 : 0`
-on the HSM and the signing host, `[0]` index guards wherever a phase-2 local
-touched them, and a two-apply dance whose second apply deleted what the first
-created. Here nothing about the ceremony is in Terraform state, so nothing can
-drift, and the runtime module applies once.
+Keeping the ceremony out of Terraform state is the point. An HSM and a signing
+host declared in Terraform would have to be created and destroyed across two
+applies of one configuration: every reference to them would need a `count` guard
+and an index guard, an interrupted run would leave the HSM billing until someone
+noticed, and the consumer could not apply until a human had flipped that state.
+Here nothing about the ceremony is in Terraform state, so nothing can drift, and
+the runtime module applies once.
 
-| | runtime module (`ceremony_mode`) | this stack |
-|---|---|---|
-| who owns `aws_cloudhsm_v2_hsm` | Terraform | Step Functions (`cloudhsmv2:CreateHsm/DeleteHsm`) |
-| who owns the signing host | Terraform | Step Functions (`ec2:RunInstances/TerminateInstances`) |
-| failed ceremony | HSM keeps billing until a human notices | `Catch` deletes it and terminates the host |
-| how many `terraform apply`s | two | one, ever |
-| audit trail | apply history | execution history + CloudWatch, with the ceremony transcript |
-| approval gate | a human flips a variable | input, and optionally `waitForTaskToken` |
+| | here |
+|---|---|
+| `aws_cloudhsm_v2_hsm` | Step Functions (`cloudhsmv2:CreateHsm/DeleteHsm`) |
+| the signing host | Step Functions (`ec2:RunInstances/TerminateInstances`) |
+| a failed ceremony | `Catch` deletes the HSM and terminates the host |
+| how many `terraform apply`s | one for this stack, one for the runtime — never to progress a phase |
+| audit trail | execution history + CloudWatch, with the ceremony transcript |
+| approval gate | an execution input, optionally `waitForTaskToken` |
 
 ## What each side owns
 
@@ -33,11 +34,13 @@ scripts they run.
 
 Creating the Intermediate key here is what makes the foundation a single stack:
 the workflow needs `GetPublicKey`/`Sign` to build the Intermediate CSR, and the
-runtime module needs `Sign` for CRLs and leaf issuance. The key policy grants
-both, naming the runtime module's role deterministically (`<name>-crl-issuer`),
-so neither stack has to be applied before the other. Extra principals (an
-issuance pipeline) go in `additional_signer_principal_arns`, and always under
-the `kms:MessageType=DIGEST` + single-algorithm conditions.
+runtime module needs `Sign` for CRLs and leaf issuance. The key policy matches
+both roles by `aws:PrincipalArn` under the account-root principal, naming the
+runtime module's role deterministically (`<name>-crl-issuer`), so neither stack
+has to be applied before the other and KMS never has to resolve a role that does
+not exist yet. Each signer also carries its own identity-policy grant, under the
+same `kms:MessageType=DIGEST` + single-algorithm conditions. Extra principals (an
+issuance pipeline) go in `additional_signer_principal_arns`.
 
 ## Runbook
 
