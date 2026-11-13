@@ -90,11 +90,12 @@ jobs:
 
       - name: compile python
         run: |
-          python -m compileall -q "$MODULE/scripts" "$MODULE/tests"
+          python -m compileall -q "$MODULE/tests" ceremony/scripts ceremony/tests
 
       - name: python syntax check the shell tools
         run: |
-          for f in "$MODULE"/scripts/*.sh.tftpl "$MODULE"/tests/*.sh "$MODULE"/tests/*/*.sh; do
+          for f in ceremony/scripts/*.sh.tftpl "$MODULE"/tests/*.sh "$MODULE"/tests/*/*.sh \
+                   ceremony/tests/*.sh ceremony/tests/*/*.sh; do
             [ -f "$f" ] || continue
             bash -n "$f"
           done
@@ -105,8 +106,8 @@ jobs:
       - name: offline harnesses
         run: bash "$MODULE/tests/run-all.sh"
 
-      - name: ceremony stack invariants (ASL graph + script syntax)
-        run: python3 ceremony/tests/asl_invariants.py
+      - name: ceremony stack harnesses (ASL graph, CA chain, ceremony script)
+        run: bash ceremony/tests/run-all.sh
 
   hygiene:
     name: repository hygiene

@@ -2,73 +2,9 @@
 # Outputs
 ###############################################################################
 
-output "ceremony_ssm_connect_command" {
-  description = "SSM Session Manager command for the ephemeral ceremony host (empty in steady state)."
-  value = var.ceremony_mode ? join(" ", [
-    "aws ssm start-session --target",
-    aws_instance.ceremony[0].id,
-    "--region",
-    local.region,
-  ]) : "ceremony_mode is false — set ceremony_mode = true to re-run the Root CA ceremony"
-}
-
-output "ceremony_instance_id" {
-  description = "Instance id of the ceremony host (null in steady state)."
-  value       = var.ceremony_mode ? aws_instance.ceremony[0].id : null
-}
-
-output "cloudhsm_cluster_id" {
-  description = "CloudHSM cluster id. The cluster (and its retained encrypted backup) outlives the HSM."
-  value       = aws_cloudhsm_v2_cluster.this.cluster_id
-}
-
-output "cloudhsm_cluster_state" {
-  description = "CloudHSM cluster state at apply time."
-  value       = aws_cloudhsm_v2_cluster.this.cluster_state
-}
-
-output "hsm_instance_id" {
-  description = "Ceremony HSM id (null in steady state; the encrypted backup is what remains)."
-  value       = var.ceremony_mode ? aws_cloudhsm_v2_hsm.ceremony[0].hsm_id : null
-}
-
-output "intermediate_kms_key_arn" {
-  description = "KMS asymmetric key that signs workload certificates and CRLs."
-  value       = aws_kms_key.intermediate_ca.arn
-}
-
-output "intermediate_kms_key_alias" {
-  description = "Alias of the Intermediate CA key."
-  value       = aws_kms_alias.intermediate_ca.name
-}
-
-output "certificate_parameters" {
-  description = "SSM parameters holding the certificate chain (written by the ceremony host)."
-  value = {
-    root_ca_pem         = local.ssm_root_ca_pem
-    intermediate_ca_pem = local.ssm_intermediate_ca_pem
-    ca_bundle_pem       = local.ssm_ca_bundle_pem
-    ceremony_state      = local.ssm_ceremony_state
-  }
-}
-
-output "artifact_bucket" {
-  description = "S3 bucket holding certificates, CSRs, CRLs and revocation input."
-  value       = aws_s3_bucket.artifacts.id
-}
-
-output "artifact_prefixes" {
-  description = "Where the ceremony, the Lambda and operators read and write artifacts."
-  value = {
-    certs       = "s3://${aws_s3_bucket.artifacts.id}/certs/"
-    crl         = "s3://${aws_s3_bucket.artifacts.id}/crl/"
-    revocations = "s3://${aws_s3_bucket.artifacts.id}/${var.revocations_s3_key}"
-  }
-}
-
 output "trust_anchor_arn" {
-  description = "IAM Roles Anywhere trust anchor ARN (null in ceremony mode)."
-  value       = local.phase2 ? aws_rolesanywhere_trust_anchor.this[0].arn : null
+  description = "IAM Roles Anywhere trust anchor ARN."
+  value       = aws_rolesanywhere_trust_anchor.this.arn
 }
 
 output "profile_arns" {
@@ -79,6 +15,29 @@ output "profile_arns" {
 output "workload_role_arns" {
   description = "Map of workload key -> IAM role ARN assumable through Roles Anywhere."
   value       = { for key, role in aws_iam_role.workload : key => role.arn }
+}
+
+output "certificate_parameters" {
+  description = "The SSM parameters this module reads (published by ceremony/)."
+  value = {
+    root_ca_pem         = local.ssm_root_ca_pem
+    intermediate_ca_pem = local.ssm_intermediate_ca_pem
+    ca_bundle_pem       = local.ssm_ca_bundle_pem
+    ceremony_state      = local.ssm_ceremony_state
+  }
+}
+
+output "artifact_bucket" {
+  description = "S3 bucket holding CRLs, revocation input and audit copies."
+  value       = aws_s3_bucket.artifacts.id
+}
+
+output "artifact_prefixes" {
+  description = "Where the Lambda and operators read and write CRL artifacts."
+  value = {
+    crl         = "s3://${aws_s3_bucket.artifacts.id}/crl/"
+    revocations = "s3://${aws_s3_bucket.artifacts.id}/${var.revocations_s3_key}"
+  }
 }
 
 output "crl_id" {
@@ -96,6 +55,11 @@ output "crl_issuer_function_name" {
   value       = aws_lambda_function.crl_issuer.function_name
 }
 
+output "crl_issuer_role_arn" {
+  description = "Role the ceremony stack's KMS key policy must allow to sign (its name is <name>-crl-issuer)."
+  value       = aws_iam_role.crl_issuer.arn
+}
+
 output "crl_revoke_preconditions_met" {
   description = "False when CRL ownership is declarative but no PEM was supplied — workloads are rejected until a CRL exists."
   value       = !local.crl_owned_by_awscc || can(regex("-----BEGIN X509 CRL-----", local.crl_pem))
@@ -107,15 +71,15 @@ output "cloudhsm_backup_guard_policy_arn" {
 }
 
 output "rolesanywhere_update_env" {
-  description = "Values for the aws_signing_helper: no long-lived credentials, just the endpoint and profile ARN."
+  description = "Values for the aws_signing_helper: no long-lived credentials, just the ARNs."
   value = {
-    trust_anchor_arn = local.phase2 ? aws_rolesanywhere_trust_anchor.this[0].arn : null
+    trust_anchor_arn = aws_rolesanywhere_trust_anchor.this.arn
     region           = local.region
     example_command = try(join(" ", [
       "aws_signing_helper credential-process",
       "--certificate /etc/pki/workload.pem",
       "--private-key /etc/pki/workload.key",
-      "--trust-anchor-arn", aws_rolesanywhere_trust_anchor.this[0].arn,
+      "--trust-anchor-arn", aws_rolesanywhere_trust_anchor.this.arn,
       "--profile-arn", values(aws_rolesanywhere_profile.this)[0].arn,
       "--role-arn", values(aws_iam_role.workload)[0].arn,
     ]), null)

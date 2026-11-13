@@ -11,6 +11,9 @@
 # It refuses to import when awscc owns the object, so the two paths cannot fork
 # into two enabled CRLs with different nextUpdate values.
 #
+# The chain this Lambda revokes against is published by the ceremony stack; the
+# key it signs with is that stack's KMS Intermediate CA key.
+#
 # The handler is stdlib-only on purpose (the Python runtime has no
 # `cryptography`): DER is encoded by hand, the signature is over the DER
 # TBSCertList, and the API gets PEM as documented. After ImportCrl the stored
@@ -522,9 +525,9 @@ resource "aws_lambda_function" "crl_issuer" {
 
   environment {
     variables = {
-      TRUST_ANCHOR_ARN   = local.phase2 ? aws_rolesanywhere_trust_anchor.this[0].arn : ""
+      TRUST_ANCHOR_ARN   = aws_rolesanywhere_trust_anchor.this.arn
       ISSUER_CERT_PARAM  = local.ssm_intermediate_ca_pem
-      KMS_KEY_ARN        = aws_kms_key.intermediate_ca.arn
+      KMS_KEY_ARN        = var.intermediate_kms_key_arn
       REVOCATIONS_S3_URI = "s3://${aws_s3_bucket.artifacts.id}/${var.revocations_s3_key}"
       CRL_OUTPUT_PREFIX  = "s3://${aws_s3_bucket.artifacts.id}/crl"
       CRL_VALIDITY_DAYS  = tostring(var.crl_validity_days)
@@ -547,7 +550,7 @@ resource "aws_lambda_function" "crl_issuer" {
 ###############################################################################
 
 resource "aws_cloudwatch_event_rule" "crl_refresh" {
-  count = local.phase2 && var.crl_management_mode == "lambda" ? 1 : 0
+  count = var.crl_management_mode == "lambda" ? 1 : 0
 
   name                = "${var.name}-crl-refresh"
   description         = "Refresh the IAM Roles Anywhere CRL every 24 hours"
@@ -556,7 +559,7 @@ resource "aws_cloudwatch_event_rule" "crl_refresh" {
 }
 
 resource "aws_cloudwatch_event_target" "crl_refresh" {
-  count = local.phase2 && var.crl_management_mode == "lambda" ? 1 : 0
+  count = var.crl_management_mode == "lambda" ? 1 : 0
 
   rule      = aws_cloudwatch_event_rule.crl_refresh[0].name
   target_id = "crl-issuer"
@@ -566,7 +569,7 @@ resource "aws_cloudwatch_event_target" "crl_refresh" {
 }
 
 resource "aws_lambda_permission" "crl_refresh" {
-  count = local.phase2 && var.crl_management_mode == "lambda" ? 1 : 0
+  count = var.crl_management_mode == "lambda" ? 1 : 0
 
   statement_id  = "AllowEventBridgeCrlRefresh"
   action        = "lambda:InvokeFunction"

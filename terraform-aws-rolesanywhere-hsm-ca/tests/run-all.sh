@@ -1,12 +1,13 @@
 #!/bin/bash
-# Runs every offline harness. No AWS account, no HSM, no credentials.
+# Runs this module's offline harnesses. No AWS account needed.
 #
-#   tests/crypto   — kms_ca_tool.py chain: root, CSR, intermediate, leaf, CRL,
-#                    plus the refusal paths (the signers are local stand-ins).
-#   tests/lambda   — the CRL handler extracted from crl_issuer_lambda.tf,
-#                    signed with a real P-384 key, verified with openssl.
-#   tests/ceremony — hsm_ceremony.sh.tftpl rendered by Terraform and executed
-#                    against a stub cloudhsm-cli, AWS CLI and KMS.
+#   tests/module  — evaluates the variable-only locals the way `terraform plan`
+#                   does (the CRL-path cases, the variable validations).
+#   tests/lambda  — the CRL handler extracted from crl_issuer_lambda.tf, signed
+#                   with a real P-384 key and verified with openssl.
+#
+# The CA tooling (chain, CRL signing, the CloudHSM ceremony) lives in ceremony/
+# and is tested there.
 #
 # usage: tests/run-all.sh [module-dir]
 set -uo pipefail
@@ -30,9 +31,7 @@ run() {
 }
 
 run "module (locals evaluated like plan)" bash "$HERE/module/smoke.sh" "$MODULE"
-run "crypto (kms_ca_tool.py)" bash "$HERE/crypto/test_kms_ca_tool.sh" "$MODULE"
 run "lambda (crl handler)" python3 "$HERE/lambda/test_lambda.py" "$MODULE"
-run "ceremony (hsm_ceremony.sh)" bash "$HERE/ceremony/run.sh" "$MODULE"
 
 echo
 if [ "$fail" -eq 0 ]; then

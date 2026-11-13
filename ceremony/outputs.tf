@@ -23,8 +23,18 @@ output "start_rotation_command" {
   ])
 }
 
+output "intermediate_kms_key_arn" {
+  description = "The Intermediate CA key this stack created. Pass it to the runtime module as `intermediate_kms_key_arn`."
+  value       = aws_kms_key.intermediate_ca.arn
+}
+
+output "intermediate_kms_key_alias" {
+  description = "Alias of the Intermediate CA key."
+  value       = aws_kms_alias.intermediate_ca.name
+}
+
 output "ceremony_host_role_arn" {
-  description = "Add this to the runtime module's `intermediate_signer_principal_arns` so the ceremony may sign with the Intermediate key."
+  description = "Role that runs the ceremony. Give it to the runtime module's `backup_guard_role_names` (its name is <name>-ceremony-host) so the backup deny covers it."
   value       = aws_iam_role.ceremony_host.arn
 }
 

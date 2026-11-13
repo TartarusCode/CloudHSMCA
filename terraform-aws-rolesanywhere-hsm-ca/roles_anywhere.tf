@@ -1,11 +1,15 @@
 ###############################################################################
-# Phase 2 — IAM Roles Anywhere
+# IAM Roles Anywhere
 #
 #   trust anchor  CERTIFICATE_BUNDLE (Root CA + Intermediate CA, from SSM)
 #   profiles      one per var.workload_profiles entry
 #   roles         assumption restricted to rolesanywhere.amazonaws.com, this
 #                 trust anchor (aws:SourceArn) and, optionally, the x509 subject
 #                 fields Roles Anywhere puts in the session principal tags
+#
+# The chain is an INPUT: ceremony/ published it. There is no phase here — the
+# module applies once, and a missing or half-written chain fails at the trust
+# anchor's precondition with the command that produces it.
 #
 # CRL note — important
 # --------------------
@@ -30,13 +34,9 @@
 ###############################################################################
 
 locals {
-  # Empty in ceremony mode: nothing Roles Anywhere-shaped exists until the
-  # certificate chain has been produced by the HSM ceremony.
-  workload_profiles = var.ceremony_mode ? {} : var.workload_profiles
+  trust_anchor_bundle = data.aws_ssm_parameter.ca_bundle.value
 
-  trust_anchor_bundle = local.phase2 ? data.aws_ssm_parameter.ca_bundle[0].value : ""
-
-  crl_owned_by_awscc = local.phase2 && var.crl_management_mode == "awscc"
+  crl_owned_by_awscc = var.crl_management_mode == "awscc"
 
   # `fileexists("")` raises "'.' is a directory, not a file" the moment this
   # local is evaluated (plan, or `terraform console`), so the empty-path case
@@ -46,13 +46,10 @@ locals {
 }
 
 data "aws_ssm_parameter" "ca_bundle" {
-  count = local.phase2 ? 1 : 0
-  name  = local.ssm_ca_bundle_pem
+  name = local.ssm_ca_bundle_pem
 }
 
 resource "aws_rolesanywhere_trust_anchor" "this" {
-  count = local.phase2 ? 1 : 0
-
   name    = "${var.name}-trust-anchor"
   enabled = true
   tags    = local.tags
@@ -75,9 +72,9 @@ resource "aws_rolesanywhere_trust_anchor" "this" {
         !can(regex("PENDING-CEREMONY", local.trust_anchor_bundle))
       )
       error_message = <<-EOT
-        The CA bundle at ${local.ssm_ca_bundle_pem} does not contain a usable
-        Root + Intermediate chain. Run the ceremony with ceremony_mode = true
-        first, and confirm the ceremony SSM parameter reports COMPLETE.
+        ${local.ssm_ca_bundle_pem} does not contain a usable Root + Intermediate
+        chain. Run the ceremony first (its own stack), confirm the ceremony SSM
+        parameter reports COMPLETE, then apply this module.
       EOT
     }
   }
@@ -88,7 +85,7 @@ resource "aws_rolesanywhere_trust_anchor" "this" {
 ###############################################################################
 
 data "aws_iam_policy_document" "workload_assume" {
-  for_each = local.workload_profiles
+  for_each = var.workload_profiles
 
   statement {
     sid = "RolesAnywhereAssumeRole"
@@ -107,7 +104,7 @@ data "aws_iam_policy_document" "workload_assume" {
     condition {
       test     = "ArnEquals"
       variable = "aws:SourceArn"
-      values   = [aws_rolesanywhere_trust_anchor.this[0].arn]
+      values   = [aws_rolesanywhere_trust_anchor.this.arn]
     }
 
     # Optional second lock: the certificate subject must carry the expected
@@ -130,7 +127,7 @@ data "aws_iam_policy_document" "workload_assume" {
 }
 
 resource "aws_iam_role" "workload" {
-  for_each = local.workload_profiles
+  for_each = var.workload_profiles
 
   name                 = "${var.name}-${each.key}"
   description          = each.value.description
@@ -141,7 +138,7 @@ resource "aws_iam_role" "workload" {
 
 locals {
   workload_policy_attachments = merge([
-    for profile_key, profile in local.workload_profiles : {
+    for profile_key, profile in var.workload_profiles : {
       for arn in profile.managed_policy_arns : "${profile_key}|${arn}" => {
         profile = profile_key
         arn     = arn
@@ -162,7 +159,7 @@ resource "aws_iam_role_policy_attachment" "workload" {
 ###############################################################################
 
 resource "aws_rolesanywhere_profile" "this" {
-  for_each = local.workload_profiles
+  for_each = var.workload_profiles
 
   name                        = "${var.name}-${each.key}"
   enabled                     = true
@@ -183,7 +180,7 @@ resource "awscc_rolesanywhere_crl" "this" {
   count = local.crl_owned_by_awscc ? 1 : 0
 
   name             = "${var.name}-crl"
-  trust_anchor_arn = aws_rolesanywhere_trust_anchor.this[0].arn
+  trust_anchor_arn = aws_rolesanywhere_trust_anchor.this.arn
   enabled          = true
   crl_data         = trimspace(local.crl_pem)
 
@@ -197,8 +194,8 @@ resource "awscc_rolesanywhere_crl" "this" {
         (var.crl_pem_path = "${var.crl_pem_path}"). Roles Anywhere accepts a CRL
         only in PEM format and Terraform cannot sign one, so produce it first:
 
-          python3 scripts/kms_ca_tool.py generate-crl --signer kms \
-            --kms-key-id ${aws_kms_key.intermediate_ca.arn} \
+          python3 ../ceremony/scripts/kms_ca_tool.py generate-crl --signer kms \
+            --kms-key-id ${var.intermediate_kms_key_arn} \
             --issuer-cert intermediate_ca.pem \
             --revoked-file revoked.json --out crl.pem
 
@@ -217,11 +214,11 @@ resource "awscc_rolesanywhere_crl" "this" {
 ###############################################################################
 
 resource "terraform_data" "bootstrap_crl" {
-  count = local.phase2 && var.crl_management_mode == "lambda" && var.auto_bootstrap_crl ? 1 : 0
+  count = var.crl_management_mode == "lambda" && var.auto_bootstrap_crl ? 1 : 0
 
   triggers_replace = [
     var.crl_bootstrap_generation,
-    aws_rolesanywhere_trust_anchor.this[0].id,
+    aws_rolesanywhere_trust_anchor.this.id,
   ]
 
   provisioner "local-exec" {

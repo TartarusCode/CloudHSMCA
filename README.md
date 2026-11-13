@@ -21,56 +21,65 @@ the Intermediate key only inside KMS.
 ## Repository layout
 
 ```
-terraform-aws-rolesanywhere-hsm-ca/   the runtime module — consumes a CA chain
-  ├── versions.tf variables.tf main.tf
-  ├── ceremony_hsm.tf roles_anywhere.tf crl_issuer_lambda.tf outputs.tf
-  ├── scripts/  kms_ca_tool.py, hsm_ceremony.sh.tftpl, *.cnf.tftpl
-  └── tests/    three offline harnesses (see tests/README.md)
-ceremony/                             produces the CA chain (Step Functions)
+terraform-aws-rolesanywhere-hsm-ca/   the runtime — consumes a CA chain, one apply
+  ├── versions.tf variables.tf main.tf roles_anywhere.tf
+  ├── crl_issuer_lambda.tf outputs.tf
+  └── tests/    two offline harnesses (see tests/README.md)
+ceremony/                             the foundation + the ceremony (Step Functions)
   ├── main.tf variables.tf outputs.tf
-  ├── statemachine.asl.json.tftpl     the ceremony: bootstrap, rotation, cleanup
-  ├── scripts/  bootstrap + Intermediate rotation entrypoints
-  └── tests/    ASL graph invariants (see ceremony/README.md)
+  ├── statemachine.asl.json.tftpl     bootstrap, rotation, cleanup
+  ├── scripts/  kms_ca_tool.py, hsm_ceremony.sh.tftpl, rotate_intermediate.sh.tftpl, *.cnf.tftpl
+  └── tests/    ASL graph, CA chain, ceremony script (see ceremony/README.md)
 examples/
-  ├── hsm-ceremony/    phase 1: HSM + ephemeral signing host
-  └── steady-state/    phase 2: trust anchor, profiles, roles, CRL
+  ├── complete/    step 1: cluster shell, KMS key, state machine
+  └── runtime/     step 2: trust anchor, profiles, roles, CRL
 .github/workflows/ci.yml   fmt, validate, tflint, python, harnesses, examples
 ```
 
-Two ways to produce the chain exist in this repository, deliberately:
+One way to produce the chain, and one way to consume it:
 
-* `terraform-aws-rolesanywhere-hsm-ca` with `ceremony_mode` — the module creates
-  the HSM and host itself, in two applies. Simple, but Terraform acts as a state
-  machine and an interrupted ceremony leaves an HSM billing.
-* `ceremony/` — Step Functions borrows the HSM, runs the ceremony, deletes it,
-  and publishes the chain. The runtime module then applies once, as a consumer.
-  This is the recommended shape; see [`ceremony/README.md`](ceremony/README.md).
+1. **`ceremony/`** (the foundation, one apply) creates the CloudHSM cluster shell,
+   the KMS Intermediate key, the artifact bucket, the SSM hand-over parameters and
+   a Step Functions workflow. No HSM exists after apply.
+2. **The workflow** creates an HSM (restoring the cluster backup on a rotation),
+   runs the ceremony on an ephemeral host, deletes the HSM, and returns only after
+   confirming the HSM is gone and a READY backup exists.
+3. **`terraform-aws-rolesanywhere-hsm-ca`** (the runtime, one apply) reads the
+   published chain from SSM and builds the trust anchor, workload roles, profiles
+   and CRL.
+
+Nothing deletes what it created in an earlier phase, and no apply has to be
+re-run because a later step exists.
 
 ## Quick start
 
-The module is a two-phase state machine; `ceremony_mode` decides which phase you
-are in, and the full runbook lives in
+The runbook for both stacks lives in
+[`ceremony/README.md`](ceremony/README.md) and
 [`terraform-aws-rolesanywhere-hsm-ca/README.md`](terraform-aws-rolesanywhere-hsm-ca/README.md).
 
 ```bash
-# 1. ceremony: ~$1.50/hr for a few hours
-cd examples/hsm-ceremony
+# 1. foundation + state machine (no HSM is created by apply)
+cd examples/complete
 $EDITOR main.tf            # your VPC + private subnet, subjects, tags
 terraform init && terraform apply
-terraform output -raw ceremony_ssm_connect_command | bash   # watch it finish
 
-# 2. steady state: destroys the HSM, brings up Roles Anywhere
-cd ../steady-state
-terraform init && terraform apply
+# 2. the ceremony itself: ~$1.50/hr for the length of one execution
+eval "$(terraform output -raw start_bootstrap_command)"
+aws stepfunctions describe-execution --execution-arn <arn>   # until SUCCEEDED
+
+# 3. the runtime, one apply, consuming the chain
+cd ../runtime
+terraform init && terraform apply \
+  -var intermediate_kms_key_arn="$(terraform -chdir=../complete output -raw intermediate_kms_key_arn)"
 ```
 
-Both examples point at the module by path (`../../terraform-aws-rolesanywhere-hsm-ca`),
-so clone the repo and work in place, or replace the `source` with a git ref once
-the module is tagged.
+Both examples point at their stack by path (`../../ceremony`,
+`../../terraform-aws-rolesanywhere-hsm-ca`), so clone the repo and work in place,
+or replace the `source` with a git ref once the stacks are tagged.
 
 ```bash
 # issue a workload certificate with the KMS Intermediate CA
-python3 ../../terraform-aws-rolesanywhere-hsm-ca/scripts/kms_ca_tool.py sign-leaf-csr \
+python3 ../../ceremony/scripts/kms_ca_tool.py sign-leaf-csr \
   --signer kms --kms-key-id "$(terraform output -raw intermediate_kms_key_arn)" \
   --issuer-cert intermediate_ca.pem --csr workload.csr --days 90 --out workload.pem
 ```

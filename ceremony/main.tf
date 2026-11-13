@@ -44,7 +44,7 @@ locals {
     cluster_id           = aws_cloudhsm_v2_cluster.this.cluster_id
     hsm_ip               = ""
     bucket               = aws_s3_bucket.artifacts.id
-    kms_key_arn          = var.intermediate_kms_key_arn
+    kms_key_arn          = aws_kms_key.intermediate_ca.arn
     root_curve           = var.root_key_curve
     root_digest          = local.root_digest
     root_label           = local.hsm_root_key_label
@@ -69,7 +69,7 @@ locals {
     region               = local.region
     cluster_id           = aws_cloudhsm_v2_cluster.this.cluster_id
     bucket               = aws_s3_bucket.artifacts.id
-    kms_key_arn          = var.intermediate_kms_key_arn
+    kms_key_arn          = aws_kms_key.intermediate_ca.arn
     root_curve           = var.root_key_curve
     root_digest          = local.root_digest
     root_label           = local.hsm_root_key_label
@@ -110,6 +110,21 @@ locals {
   }
 
   hsm_root_key_label = "root-ca-${var.name}"
+
+  ca_signing_algorithm = {
+    ECC_NIST_P256 = "ECDSA_SHA_256"
+    ECC_NIST_P384 = "ECDSA_SHA_384"
+    ECC_NIST_P521 = "ECDSA_SHA_512"
+  }[var.intermediate_key_spec]
+
+  # The runtime module names its CRL role deterministically, so the key policy
+  # can grant it without an apply-order dependency between the two stacks.
+  runtime_crl_role_arn = "arn:${local.partition}:iam::${local.account_id}:role/${var.name}-crl-issuer"
+
+  ca_key_principals = compact(concat(
+    [aws_iam_role.ceremony_host.arn, local.runtime_crl_role_arn],
+    var.additional_signer_principal_arns,
+  ))
 
   statemachine_definition = templatefile("${path.module}/statemachine.asl.json.tftpl", {
     name                       = var.name
@@ -237,9 +252,9 @@ resource "aws_s3_bucket_public_access_block" "artifacts" {
 resource "aws_s3_object" "kms_ca_tool" {
   bucket                 = aws_s3_bucket.artifacts.id
   key                    = "scripts/kms_ca_tool.py"
-  content                = file("${path.module}/../terraform-aws-rolesanywhere-hsm-ca/scripts/kms_ca_tool.py")
+  content                = file("${path.module}/scripts/kms_ca_tool.py")
   content_type           = "text/x-python"
-  etag                   = filemd5("${path.module}/../terraform-aws-rolesanywhere-hsm-ca/scripts/kms_ca_tool.py")
+  etag                   = filemd5("${path.module}/scripts/kms_ca_tool.py")
   server_side_encryption = "AES256"
   tags                   = local.tags
 }
@@ -247,7 +262,7 @@ resource "aws_s3_object" "kms_ca_tool" {
 resource "aws_s3_object" "root_ca_cnf" {
   bucket                 = aws_s3_bucket.artifacts.id
   key                    = "scripts/root_ca.cnf"
-  content                = templatefile("${path.module}/../terraform-aws-rolesanywhere-hsm-ca/scripts/root_ca.cnf.tftpl", local.cnf_vars)
+  content                = templatefile("${path.module}/scripts/root_ca.cnf.tftpl", local.cnf_vars)
   content_type           = "text/plain"
   server_side_encryption = "AES256"
   tags                   = local.tags
@@ -256,7 +271,7 @@ resource "aws_s3_object" "root_ca_cnf" {
 resource "aws_s3_object" "intermediate_ca_cnf" {
   bucket                 = aws_s3_bucket.artifacts.id
   key                    = "scripts/intermediate_ca.cnf"
-  content                = templatefile("${path.module}/../terraform-aws-rolesanywhere-hsm-ca/scripts/intermediate_ca.cnf.tftpl", local.cnf_vars)
+  content                = templatefile("${path.module}/scripts/intermediate_ca.cnf.tftpl", local.cnf_vars)
   content_type           = "text/plain"
   server_side_encryption = "AES256"
   tags                   = local.tags
@@ -269,7 +284,7 @@ resource "aws_s3_object" "bootstrap_script" {
 
   bucket                 = aws_s3_bucket.artifacts.id
   key                    = "scripts/hsm_ceremony.sh"
-  content                = templatefile("${path.module}/../terraform-aws-rolesanywhere-hsm-ca/scripts/hsm_ceremony.sh.tftpl", { ceremony_config = jsonencode(local.bootstrap_config) })
+  content                = templatefile("${path.module}/scripts/hsm_ceremony.sh.tftpl", { ceremony_config = jsonencode(local.bootstrap_config) })
   content_type           = "text/x-shellscript"
   server_side_encryption = "AES256"
   tags                   = local.tags
@@ -467,7 +482,7 @@ data "aws_iam_policy_document" "ceremony_host" {
   statement {
     sid       = "IntermediateKeyUsage"
     actions   = ["kms:GetPublicKey", "kms:DescribeKey"]
-    resources = [var.intermediate_kms_key_arn]
+    resources = [aws_kms_key.intermediate_ca.arn]
   }
 
   statement {
@@ -489,11 +504,85 @@ resource "aws_iam_instance_profile" "ceremony_host" {
   tags = local.tags
 }
 
-# The ceremony signs the Intermediate CSR with the runtime module's KMS key
-# (MessageType=DIGEST, one algorithm). The key policy is owned by that module:
-# pass this role into its `intermediate_signer_principal_arns` so the grant
-# keeps the digest-only conditions. A cross-stack `aws_kms_grant` would work too
-# but cannot express those conditions, which is why it is not used here.
+###############################################################################
+# Intermediate CA key (KMS asymmetric, never exportable)
+#
+# The ceremony stack creates it, so the "foundation" is one apply: the workflow
+# needs GetPublicKey + Sign to build the Intermediate CSR, and the runtime
+# module needs Sign for CRLs and leaf issuance. The policy grants both, naming
+# the runtime module's role deterministically (<name>-crl-issuer), so neither
+# stack has to be applied before the other.
+###############################################################################
+
+data "aws_iam_policy_document" "intermediate_ca_key" {
+  statement {
+    sid       = "AccountAdministration"
+    actions   = ["kms:*"]
+    resources = ["*"]
+
+    principals {
+      type        = "AWS"
+      identifiers = ["arn:${local.partition}:iam::${local.account_id}:root"]
+    }
+  }
+
+  # Signing is restricted to raw-digest requests with the single algorithm that
+  # matches the key spec, so this key cannot be repurposed as a general signer.
+  statement {
+    sid       = "CaSignDigestOnly"
+    actions   = ["kms:Sign"]
+    resources = ["*"]
+
+    principals {
+      type        = "AWS"
+      identifiers = local.ca_key_principals
+    }
+
+    condition {
+      test     = "StringEquals"
+      variable = "kms:MessageType"
+      values   = ["DIGEST"]
+    }
+
+    condition {
+      test     = "StringEquals"
+      variable = "kms:SigningAlgorithm"
+      values   = [local.ca_signing_algorithm]
+    }
+  }
+
+  # Read/metadata actions are a separate statement on purpose: the condition
+  # keys above do not exist on GetPublicKey, so folding them together would
+  # deny every non-signing call.
+  statement {
+    sid       = "CaPublicKeyRead"
+    actions   = ["kms:GetPublicKey", "kms:DescribeKey"]
+    resources = ["*"]
+
+    principals {
+      type        = "AWS"
+      identifiers = local.ca_key_principals
+    }
+  }
+}
+
+resource "aws_kms_key" "intermediate_ca" {
+  description = "${var.name} IAM Roles Anywhere Intermediate CA (${var.intermediate_key_spec})"
+  key_usage   = "SIGN_VERIFY"
+  # `key_spec` exists in aws 5.x but is gone in 6.x; `customer_master_key_spec`
+  # is accepted by both, which the declared range needs.
+  customer_master_key_spec = var.intermediate_key_spec
+  policy                   = data.aws_iam_policy_document.intermediate_ca_key.json
+  deletion_window_in_days  = var.kms_deletion_window_in_days
+  enable_key_rotation      = false # asymmetric KMS keys cannot be rotated
+  multi_region             = false
+  tags                     = local.tags
+}
+
+resource "aws_kms_alias" "intermediate_ca" {
+  name          = "alias/${var.name}-intermediate-ca"
+  target_key_id = aws_kms_key.intermediate_ca.key_id
+}
 
 ###############################################################################
 # Step Functions: role + log group + state machine

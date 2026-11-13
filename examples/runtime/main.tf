@@ -1,14 +1,16 @@
-# Phase 2: steady state.
+# Step 2 of 2: the runtime — trust anchor, profiles, workload roles, CRL.
 #
-# Destroys the HSM and the ceremony host (the CloudHSM backup survives), reads
-# the certificate chain from SSM, and creates the Roles Anywhere trust anchor,
-# one IAM role + profile per workload, and the CRL.
+# Apply this only after the ceremony execution has reached SUCCEEDED: the chain
+# is an input here, and a missing or incomplete chain fails at the trust
+# anchor's precondition with the command that produces it. That is the whole
+# point of the split — one apply, no phase flag, nothing deleted behind you.
+#
+#   terraform init
+#   terraform apply -var intermediate_kms_key_arn=<from ../complete>
 #
 # This example uses crl_management_mode = "lambda", so no CRL file has to exist
 # at apply time: the scheduled Lambda owns the CRL object and the module invokes
 # it once during the apply.
-#
-#   terraform init && terraform apply
 
 terraform {
   required_version = ">= 1.6.0"
@@ -36,15 +38,16 @@ provider "awscc" {
 module "pki" {
   source = "../../terraform-aws-rolesanywhere-hsm-ca"
 
-  name          = "example-pki"
-  ceremony_mode = false
+  # Must match the ceremony stack's name: the chain is read from /<name>/pki/*.pem.
+  name = "example-pki"
 
-  # Only used by the phase-1 resources; kept so the same configuration can be
-  # flipped back to true for a Root CA rotation.
-  vpc_id             = "vpc-0123456789abcdef0"
-  private_subnet_ids = ["subnet-0123456789abcdef0"]
+  intermediate_kms_key_arn = var.intermediate_kms_key_arn
 
   crl_management_mode = "lambda"
+
+  # The deny-list that protects the Root CA backup, applied to the role that
+  # runs the ceremony (its name is deterministic).
+  backup_guard_role_names = ["example-pki-ceremony-host"]
 
   workload_profiles = {
     # A batch service: certificates must carry OU=platform and CN=batch-*, and

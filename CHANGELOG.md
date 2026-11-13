@@ -4,6 +4,39 @@ All notable changes to this repository are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the module follows
 semantic versioning once it is tagged.
 
+## [0.2.0] - 2026-11-13
+
+Breaking: the two-phase `ceremony_mode` toggle is gone. The ceremony is its own
+stack and the module is a pure consumer, applied once.
+
+### Removed
+
+- `var.ceremony_mode`, `aws_cloudhsm_v2_hsm`, the ephemeral ceremony
+  `aws_instance`, the ceremony host IAM/SG/profile, and every
+  `count = var.ceremony_mode ? … : 0` guard and `[0]` index in the module.
+- The module's `aws_kms_key`, CloudHSM cluster, VPC inputs, certificate SSM
+  parameters, and `scripts/` directory — all moved to `ceremony/`.
+- `examples/hsm-ceremony` and `examples/steady-state`.
+
+### Added
+
+- `ceremony/`: the foundation (cluster shell, **KMS Intermediate key**, artifact
+  bucket, SSM hand-over, IAM) plus a Step Functions workflow that creates an HSM,
+  runs the ceremony, deletes the HSM, and verifies a READY backup before
+  succeeding. Its key policy grants the ceremony host and the runtime module's
+  CRL role by deterministic name, so neither stack depends on the other's apply
+  order.
+- `ceremony/tests/`: ASL graph invariants, the CA-chain harness and the ceremony
+  script harness (moved from the module's tests), plus `run-all.sh`.
+- `examples/complete` (foundation + state machine) and `examples/runtime`
+  (single-apply consumer).
+
+### Changed
+
+- The runtime module takes `intermediate_kms_key_arn` and reads the chain from
+  SSM unconditionally: no phases, one apply, and a `precondition` that fails with
+  the ceremony command when the chain is missing.
+
 ## [0.1.0] - 2026-11-13
 
 First cut of the module and its offline verification harnesses.

@@ -52,18 +52,8 @@ variable "availability_zone" {
   type        = string
 }
 
-variable "intermediate_kms_key_arn" {
-  description = <<-EOT
-    The runtime module's Intermediate CA key (asymmetric SIGN_VERIFY). The
-    ceremony host needs kms:GetPublicKey + kms:Sign on it, so add this stack's
-    `ceremony_host_role_arn` output to that module's
-    `intermediate_signer_principal_arns`.
-  EOT
-  type        = string
-}
-
 variable "intermediate_key_spec" {
-  description = "Key spec of the Intermediate CA key, used only to derive the digest for the OpenSSL profiles."
+  description = "Key spec of the Intermediate CA key, which this stack creates. Also drives the digest in the OpenSSL profiles."
   type        = string
   default     = "ECC_NIST_P384"
 
@@ -71,6 +61,18 @@ variable "intermediate_key_spec" {
     condition     = contains(["ECC_NIST_P256", "ECC_NIST_P384", "ECC_NIST_P521"], var.intermediate_key_spec)
     error_message = "Only ECC_NIST_P256, ECC_NIST_P384 and ECC_NIST_P521 are supported."
   }
+}
+
+variable "kms_deletion_window_in_days" {
+  description = "Waiting period before the Intermediate CA key can be destroyed."
+  type        = number
+  default     = 30
+}
+
+variable "additional_signer_principal_arns" {
+  description = "Extra IAM principals (e.g. your issuance pipeline role) allowed to Sign with the Intermediate CA key under the digest-only conditions."
+  type        = list(string)
+  default     = []
 }
 
 variable "root_key_curve" {

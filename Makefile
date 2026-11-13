@@ -54,8 +54,8 @@ ceremony-init: ## terraform init the ceremony stack (no backend, no credentials)
 ceremony-validate: ceremony-init ## terraform validate the ceremony stack
 	$(TF) -chdir=ceremony validate -no-color
 
-ceremony-test: ceremony-init ## ASL invariants, cleanup/cause checks, script syntax
-	python3 ceremony/tests/asl_invariants.py
+ceremony-test: ceremony-init ## ASL invariants, CA chain, ceremony script (offline)
+	bash ceremony/tests/run-all.sh
 
 check: fmt-check validate examples ceremony-validate lint test ceremony-test ## Everything CI runs
 	@echo

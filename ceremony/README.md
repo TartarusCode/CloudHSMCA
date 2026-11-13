@@ -23,12 +23,21 @@ drift, and the runtime module applies once.
 
 ## What each side owns
 
-Terraform (durable, this stack): the cluster shell, the artifact bucket, the SSM
-hand-over parameters, IAM, the log group, and the state machine.
-Terraform (durable, runtime module): the KMS Intermediate key, the Roles Anywhere
-trust anchor, profiles, workload roles, and the CRL.
+Terraform (durable, this stack): the cluster shell, the artifact bucket, the
+**KMS Intermediate CA key**, the SSM hand-over parameters, IAM, the log group,
+and the state machine.
+Terraform (durable, runtime module): the trust anchor, profiles, workload roles,
+the CRL, and the backup deny-list — one apply, reading the chain from SSM.
 Step Functions (ephemeral, exclusive): the HSM, the ceremony host, and the two
 scripts they run.
+
+Creating the Intermediate key here is what makes the foundation a single stack:
+the workflow needs `GetPublicKey`/`Sign` to build the Intermediate CSR, and the
+runtime module needs `Sign` for CRLs and leaf issuance. The key policy grants
+both, naming the runtime module's role deterministically (`<name>-crl-issuer`),
+so neither stack has to be applied before the other. Extra principals (an
+issuance pipeline) go in `additional_signer_principal_arns`, and always under
+the `kms:MessageType=DIGEST` + single-algorithm conditions.
 
 ## Runbook
 
@@ -39,25 +48,22 @@ terraform init
 terraform apply \
   -var vpc_id=vpc-… \
   -var 'private_subnet_ids=["subnet-…"]' \
-  -var availability_zone=us-west-2a \
-  -var intermediate_kms_key_arn="$(terraform -chdir=../terraform-aws-rolesanywhere-hsm-ca output -raw intermediate_kms_key_arn)"
+  -var availability_zone=us-west-2a
 
 # bootstrap: creates the Root key, self-signs the Root CA, signs the Intermediate
 eval "$(terraform output -raw start_bootstrap_command)"
 aws stepfunctions describe-execution --execution-arn <arn>   # until SUCCEEDED
 
 # then the runtime stack, once, with the chain now present in SSM
-cd ../terraform-aws-rolesanywhere-hsm-ca && terraform apply
+cd ../terraform-aws-rolesanywhere-hsm-ca
+terraform apply -var intermediate_kms_key_arn="$(terraform -chdir=../ceremony output -raw intermediate_kms_key_arn)"
 
 # five years later: new Intermediate from the same Root
 cd ../ceremony && eval "$(terraform output -raw start_rotation_command)"
 ```
 
-The ceremony host role must be allowed to sign with the Intermediate key: add
-`ceremony_host_role_arn` to the runtime module's
-`intermediate_signer_principal_arns`. The alternative — an `aws_kms_grant` from
-this stack — cannot express the `kms:MessageType=DIGEST` condition, so the key
-policy stays the single place that hardens it.
+The finished end-to-end walkthrough is `examples/complete` → run the execution →
+`examples/runtime`.
 
 ## The three sharp edges, and where they live
 
@@ -110,16 +116,20 @@ implementation, whether it is driven by Terraform or by Step Functions.
 
 ## Verified offline, and what is not
 
-`tests/asl_invariants.py` renders the definition with the same `templatefile`
-call Terraform makes, then walks it as a graph: 58 states, 16 tasks. It asserts
-every Task catches `States.ALL`, that cleanup reaches both `deleteHsm` and
-`terminateInstances` and ends in a `Fail` that reads `$.error`, that no cleanup
-task writes `$.error`, that `describeInstanceInformation` precedes both
-`sendCommand` states, that a bootstrap `CreateHsm` carries no `BackupId` while a
-rotation one does, that an explicit mode is honoured and an unknown one refused,
-and that a READY backup gates both the restore and the completion. It also
-renders both script templates and runs `bash -n` on them. `terraform validate`
-covers the stack itself.
+`tests/run-all.sh` runs three harnesses. `tests/asl_invariants.py` renders the
+definition with the same `templatefile` call Terraform makes and walks it as a
+graph (58 states, 16 tasks): every Task catches `States.ALL`, cleanup reaches both
+`deleteHsm` and `terminateInstances` and ends in a `Fail` that reads `$.error`, no
+cleanup task writes `$.error`, `describeInstanceInformation` precedes both
+`sendCommand` states, a bootstrap `CreateHsm` carries no `BackupId` while a
+rotation one does, an explicit mode is honoured and an unknown one refused, and a
+READY backup gates both the restore and the completion.
+
+`tests/crypto` drives `kms_ca_tool.py` through the whole chain with local
+signers and verifies every artifact with `openssl`; `tests/ceremony` renders
+`hsm_ceremony.sh.tftpl` — the script the workflow runs — and executes it against a
+stub `cloudhsm-cli` that really signs. Both script templates are also `bash -n`'d
+as part of the ASL harness. `terraform validate` covers the stack itself.
 
 Not verified here: the live control plane. Nothing in this environment can create
 a CloudHSM cluster, so the API shapes and timings (HSM ACTIVE, deletion, backup
