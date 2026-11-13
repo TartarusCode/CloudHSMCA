@@ -48,7 +48,16 @@ docs: ## Regenerate the module's input/output tables (needs terraform-docs)
 test: init ## Run the offline harnesses (no AWS account needed)
 	bash $(MODULE)/tests/run-all.sh
 
-check: fmt-check validate lint test ## Everything CI runs
+ceremony-init: ## terraform init the ceremony stack (no backend, no credentials)
+	$(TF) -chdir=ceremony init -backend=false -input=false -no-color
+
+ceremony-validate: ceremony-init ## terraform validate the ceremony stack
+	$(TF) -chdir=ceremony validate -no-color
+
+ceremony-test: ceremony-init ## ASL invariants, cleanup/cause checks, script syntax
+	python3 ceremony/tests/asl_invariants.py
+
+check: fmt-check validate examples ceremony-validate lint test ceremony-test ## Everything CI runs
 	@echo
 	@echo "check: OK"
 

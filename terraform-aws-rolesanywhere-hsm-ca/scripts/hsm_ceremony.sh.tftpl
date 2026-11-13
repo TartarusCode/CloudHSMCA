@@ -53,7 +53,7 @@ cfg() { printf '%s' "$CONFIG_JSON" | jq -r --arg k "$1" '.[$k]'; }
 NAME=$(cfg name)
 REGION=$(cfg region)
 CLUSTER_ID=$(cfg cluster_id)
-HSM_IP=$(cfg hsm_ip)
+HSM_IP=$${CEREMONY_HSM_IP:-$(cfg hsm_ip)}
 BUCKET=$(cfg bucket)
 KMS_KEY_ARN=$(cfg kms_key_arn)
 ROOT_CURVE=$(cfg root_curve)

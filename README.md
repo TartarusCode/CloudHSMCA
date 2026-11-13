@@ -21,16 +21,30 @@ the Intermediate key only inside KMS.
 ## Repository layout
 
 ```
-terraform-aws-rolesanywhere-hsm-ca/   the module — start with its README
+terraform-aws-rolesanywhere-hsm-ca/   the runtime module — consumes a CA chain
   ├── versions.tf variables.tf main.tf
   ├── ceremony_hsm.tf roles_anywhere.tf crl_issuer_lambda.tf outputs.tf
   ├── scripts/  kms_ca_tool.py, hsm_ceremony.sh.tftpl, *.cnf.tftpl
   └── tests/    three offline harnesses (see tests/README.md)
+ceremony/                             produces the CA chain (Step Functions)
+  ├── main.tf variables.tf outputs.tf
+  ├── statemachine.asl.json.tftpl     the ceremony: bootstrap, rotation, cleanup
+  ├── scripts/  bootstrap + Intermediate rotation entrypoints
+  └── tests/    ASL graph invariants (see ceremony/README.md)
 examples/
   ├── hsm-ceremony/    phase 1: HSM + ephemeral signing host
   └── steady-state/    phase 2: trust anchor, profiles, roles, CRL
 .github/workflows/ci.yml   fmt, validate, tflint, python, harnesses, examples
 ```
+
+Two ways to produce the chain exist in this repository, deliberately:
+
+* `terraform-aws-rolesanywhere-hsm-ca` with `ceremony_mode` — the module creates
+  the HSM and host itself, in two applies. Simple, but Terraform acts as a state
+  machine and an interrupted ceremony leaves an HSM billing.
+* `ceremony/` — Step Functions borrows the HSM, runs the ceremony, deletes it,
+  and publishes the chain. The runtime module then applies once, as a consumer.
+  This is the recommended shape; see [`ceremony/README.md`](ceremony/README.md).
 
 ## Quick start
 

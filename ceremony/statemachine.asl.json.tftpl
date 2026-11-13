@@ -1,0 +1,824 @@
+{
+  "Comment": "CloudHSM Root CA ceremony for IAM Roles Anywhere. BOOTSTRAP creates the non-exportable Root key and signs the Intermediate; ROTATE_INTERMEDIATE restores the cluster backup and re-signs only the Intermediate. Every failure path deletes the HSM, terminates the host, and re-raises the original cause.",
+  "StartAt": "InitializeRun",
+  "TimeoutSeconds": 21600,
+  "States": {
+    "InitializeRun": {
+      "Type": "Pass",
+      "Comment": "Seed the fields every branch and every Fail state reads, so a failure in the first API call cannot raise States.Runtime while reporting itself.",
+      "Assign": {
+        "mode": "unset",
+        "hsmPoll": 0,
+        "ssmPoll": 0,
+        "commandPoll": 0,
+        "teardownPoll": 0,
+        "backupPoll": 0
+      },
+      "Next": "DescribeCluster"
+    },
+    "DescribeCluster": {
+      "Type": "Task",
+      "Comment": "Infer the mode from whether this cluster has ever been initialized.",
+      "Resource": "arn:aws:states:::aws-sdk:cloudhsmv2:describeClusters",
+      "Parameters": {
+        "Filters": {
+          "clusterIds": ["${cluster_id}"]
+        }
+      },
+      "ResultPath": "$.cluster",
+      "Retry": [
+        {
+          "ErrorEquals": ["CloudHSMV2.ThrottlingException", "States.TaskFailed"],
+          "IntervalSeconds": 5,
+          "MaxAttempts": 6,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "CleanupHsmOnFailure"
+        }
+      ],
+      "Next": "ListBackups"
+    },
+    "ListBackups": {
+      "Type": "Task",
+      "Comment": "Newest first: the READY one at index 0 is what a rotation restores from.",
+      "Resource": "arn:aws:states:::aws-sdk:cloudhsmv2:describeBackups",
+      "Parameters": {
+        "Filters": {
+          "clusterIds": ["${cluster_id}"]
+        },
+        "SortBy": "time",
+        "SortOrder": "desc"
+      },
+      "ResultPath": "$.backups",
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "CleanupHsmOnFailure"
+        }
+      ],
+      "Next": "ChooseMode"
+    },
+    "ChooseMode": {
+      "Type": "Choice",
+      "Comment": "An explicit {\"mode\":\"BOOTSTRAP\"|\"ROTATE_INTERMEDIATE\"} in the execution input wins; otherwise infer it from the cluster state.",
+      "Choices": [
+        {
+          "And": [
+            {
+              "Variable": "$.mode",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.mode",
+              "StringEquals": "BOOTSTRAP"
+            }
+          ],
+          "Next": "SetBootstrapMode"
+        },
+        {
+          "And": [
+            {
+              "Variable": "$.mode",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.mode",
+              "StringEquals": "ROTATE_INTERMEDIATE"
+            }
+          ],
+          "Next": "SetRotateModeRequested"
+        },
+        {
+          "Comment": "A mode was supplied but is not one of the two values: refuse rather than guess.",
+          "And": [
+            {
+              "Variable": "$.mode",
+              "IsPresent": true
+            },
+            {
+              "Not": {
+                "Variable": "$.mode",
+                "StringEquals": "unset"
+              }
+            }
+          ],
+          "Next": "FailInvalidMode"
+        },
+        {
+          "Comment": "Never initialized: no key material exists, so this run creates the Root CA.",
+          "Variable": "$.cluster.Clusters[0].State",
+          "StringEquals": "UNINITIALIZED",
+          "Next": "SetBootstrapMode"
+        }
+      ],
+      "Default": "RequireReadyBackupInferred"
+    },
+    "SetBootstrapMode": {
+      "Type": "Pass",
+      "Assign": {
+        "mode": "BOOTSTRAP"
+      },
+      "Next": "CreateHsmNoBackup"
+    },
+    "SetRotateModeRequested": {
+      "Type": "Pass",
+      "Comment": "Requested explicitly: still require a READY backup before restoring it.",
+      "Assign": {
+        "mode": "ROTATE_INTERMEDIATE"
+      },
+      "Next": "RequireReadyBackupRequested"
+    },
+    "RequireReadyBackupInferred": {
+      "Type": "Pass",
+      "Assign": {
+        "mode": "ROTATE_INTERMEDIATE"
+      },
+      "Next": "RequireReadyBackupRequested"
+    },
+    "RequireReadyBackupRequested": {
+      "Type": "Choice",
+      "Comment": "Rotation restores the existing Root key, so a READY backup must exist. Never create an HSM without one: that would produce an empty HSM and a Root key nobody can restore.",
+      "Choices": [
+        {
+          "And": [
+            {
+              "Variable": "$.backups.Backups[0].BackupId",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.backups.Backups[0].State",
+              "StringEquals": "READY"
+            }
+          ],
+          "Next": "CreateHsmFromBackup"
+        }
+      ],
+      "Default": "FailNoReadyBackup"
+    },
+    "CreateHsmNoBackup": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:cloudhsmv2:createHsm",
+      "Parameters": {
+        "ClusterId": "${cluster_id}",
+        "AvailabilityZone": "${availability_zone}"
+      },
+      "ResultPath": "$.hsm",
+      "Retry": [
+        {
+          "ErrorEquals": ["CloudHSMV2.ThrottlingException"],
+          "IntervalSeconds": 10,
+          "MaxAttempts": 6,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "CleanupHsmOnFailure"
+        }
+      ],
+      "Next": "CheckHsmState"
+    },
+    "CreateHsmFromBackup": {
+      "Type": "Task",
+      "Comment": "Restores the Root key material from the cluster backup into the new HSM.",
+      "Resource": "arn:aws:states:::aws-sdk:cloudhsmv2:createHsm",
+      "Parameters": {
+        "ClusterId": "${cluster_id}",
+        "AvailabilityZone": "${availability_zone}",
+        "BackupId.$": "$.backups.Backups[0].BackupId"
+      },
+      "ResultPath": "$.hsm",
+      "Retry": [
+        {
+          "ErrorEquals": ["CloudHSMV2.ThrottlingException"],
+          "IntervalSeconds": 10,
+          "MaxAttempts": 6,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "CleanupHsmOnFailure"
+        }
+      ],
+      "Next": "CheckHsmState"
+    },
+    "CheckHsmState": {
+      "Type": "Task",
+      "Comment": "The cluster stays INITIALIZED until the ceremony activates it, so poll the HSM's own state.",
+      "Resource": "arn:aws:states:::aws-sdk:cloudhsmv2:describeClusters",
+      "Parameters": {
+        "Filters": {
+          "clusterIds": ["${cluster_id}"]
+        }
+      },
+      "ResultPath": "$.hsmPoll",
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "CleanupHsmOnFailure"
+        }
+      ],
+      "Next": "IsHsmActive"
+    },
+    "IsHsmActive": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "And": [
+            {
+              "Variable": "$.hsmPoll.Clusters[0].Hsms[0].HsmId",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.hsmPoll.Clusters[0].Hsms[0].HsmId",
+              "StringEqualsPath": "$.hsm.Hsm.HsmId"
+            },
+            {
+              "Variable": "$.hsmPoll.Clusters[0].Hsms[0].State",
+              "StringEquals": "ACTIVE"
+            }
+          ],
+          "Next": "LaunchCeremonyHost"
+        }
+      ],
+      "Default": "GuardHsmPolls"
+    },
+    "GuardHsmPolls": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.hsmPoll",
+          "NumericLessThan": 90,
+          "Next": "WaitForHsm"
+        }
+      ],
+      "Default": "FailHsmNotReady"
+    },
+    "WaitForHsm": {
+      "Type": "Wait",
+      "Seconds": 60,
+      "Next": "IncrementHsmPoll"
+    },
+    "IncrementHsmPoll": {
+      "Type": "Pass",
+      "Assign": {
+        "hsmPoll": "States.MathAdd($.hsmPoll, 1)"
+      },
+      "Next": "CheckHsmState"
+    },
+    "LaunchCeremonyHost": {
+      "Type": "Task",
+      "Comment": "Ephemeral, no inbound rules; the workflow drives it through SSM only.",
+      "Resource": "arn:aws:states:::aws-sdk:ec2:runInstances",
+      "Parameters": {
+        "ImageId": "${ami_id}",
+        "InstanceType": "${instance_type}",
+        "MinCount": 1,
+        "MaxCount": 1,
+        "SubnetId": "${subnet_id}",
+        "SecurityGroupIds": ["${ceremony_security_group_id}"],
+        "IamInstanceProfile": {
+          "Arn": "${instance_profile_arn}"
+        },
+        "MetadataOptions": {
+          "HttpTokens": "required",
+          "HttpEndpoint": "enabled",
+          "HttpPutResponseHopLimit": 1
+        },
+        "BlockDeviceMappings": [
+          {
+            "DeviceName": "/dev/xvda",
+            "Ebs": {
+              "VolumeSize": 30,
+              "VolumeType": "gp3",
+              "Encrypted": true,
+              "DeleteOnTermination": true
+            }
+          }
+        ],
+        "TagSpecifications": [
+          {
+            "ResourceType": "instance",
+            "Tags": [
+              {
+                "Key": "Name",
+                "Value": "${name}-ceremony-host"
+              },
+              {
+                "Key": "Purpose",
+                "Value": "rolesanywhere-root-ceremony"
+              }
+            ]
+          }
+        ]
+      },
+      "ResultPath": "$.host",
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "CleanupHsmOnFailure"
+        }
+      ],
+      "Next": "DescribeSsmInstance"
+    },
+    "DescribeSsmInstance": {
+      "Type": "Task",
+      "Comment": "EC2 'running' precedes SSM agent registration; sendCommand would fail with InvalidInstanceId.",
+      "Resource": "arn:aws:states:::aws-sdk:ssm:describeInstanceInformation",
+      "Parameters": {
+        "Filters": [
+          {
+            "Key": "InstanceIds",
+            "Values": ["$.host.Instances[0].InstanceId"]
+          }
+        ]
+      },
+      "ResultPath": "$.ssm",
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "CleanupHsmOnFailure"
+        }
+      ],
+      "Next": "IsSsmOnline"
+    },
+    "IsSsmOnline": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "And": [
+            {
+              "Variable": "$.ssm.InstanceInformationList[0].PingStatus",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.ssm.InstanceInformationList[0].PingStatus",
+              "StringEquals": "Online"
+            }
+          ],
+          "Next": "ChooseCeremonyScript"
+        }
+      ],
+      "Default": "GuardSsmPolls"
+    },
+    "GuardSsmPolls": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.ssmPoll",
+          "NumericLessThan": 60,
+          "Next": "WaitForSsm"
+        }
+      ],
+      "Default": "FailSsmAgentNotOnline"
+    },
+    "WaitForSsm": {
+      "Type": "Wait",
+      "Seconds": 15,
+      "Next": "IncrementSsmPoll"
+    },
+    "IncrementSsmPoll": {
+      "Type": "Pass",
+      "Assign": {
+        "ssmPoll": "States.MathAdd($.ssmPoll, 1)"
+      },
+      "Next": "DescribeSsmInstance"
+    },
+    "ChooseCeremonyScript": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.mode",
+          "StringEquals": "BOOTSTRAP",
+          "Next": "RunBootstrapCeremony"
+        }
+      ],
+      "Default": "RunRotationCeremony"
+    },
+    "RunBootstrapCeremony": {
+      "Type": "Task",
+      "Comment": "Initializes the cluster (cloudhsm-cli cluster activate), generates the non-exportable Root key, self-signs the Root CA and signs the Intermediate.",
+      "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
+      "Parameters": {
+        "InstanceIds": ["$.host.Instances[0].InstanceId"],
+        "DocumentName": "AWS-RunShellScript",
+        "Comment": "${name} bootstrap ceremony",
+        "TimeoutSeconds": 3600,
+        "Parameters": {
+          "executionTimeout": ["3600"],
+          "commands.$": "States.Array('set -euo pipefail', 'mkdir -p /opt/ceremony', States.Format('export CEREMONY_HSM_IP={}', $.hsm.Hsm.EniIp), 'export CEREMONY_MODE=BOOTSTRAP', States.Format('aws s3api get-object --bucket ${bucket} --key ${bootstrap_key} /opt/ceremony/bootstrap.sh'), 'bash /opt/ceremony/bootstrap.sh 2>&1 | tee -a /var/log/ceremony.log')"
+        }
+      },
+      "ResultPath": "$.command",
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "CleanupHsmOnFailure"
+        }
+      ],
+      "Next": "PollCommandInvocation"
+    },
+    "RunRotationCeremony": {
+      "Type": "Task",
+      "Comment": "Signs a new Intermediate CSR with the restored Root key. No Root generation, no re-activation.",
+      "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
+      "Parameters": {
+        "InstanceIds": ["$.host.Instances[0].InstanceId"],
+        "DocumentName": "AWS-RunShellScript",
+        "Comment": "${name} intermediate rotation",
+        "TimeoutSeconds": 3600,
+        "Parameters": {
+          "executionTimeout": ["3600"],
+          "commands.$": "States.Array('set -euo pipefail', 'mkdir -p /opt/ceremony', States.Format('export CEREMONY_HSM_IP={}', $.hsm.Hsm.EniIp), 'export CEREMONY_MODE=ROTATE_INTERMEDIATE', States.Format('aws s3api get-object --bucket ${bucket} --key ${rotate_key} /opt/ceremony/rotate.sh'), 'bash /opt/ceremony/rotate.sh 2>&1 | tee -a /var/log/ceremony.log')"
+        }
+      },
+      "ResultPath": "$.command",
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "CleanupHsmOnFailure"
+        }
+      ],
+      "Next": "PollCommandInvocation"
+    },
+    "PollCommandInvocation": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:ssm:getCommandInvocation",
+      "Parameters": {
+        "CommandId.$": "$.command.Command.CommandId",
+        "InstanceId.$": "$.host.Instances[0].InstanceId"
+      },
+      "ResultPath": "$.invocation",
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "CleanupHsmOnFailure"
+        }
+      ],
+      "Next": "IsCommandFinished"
+    },
+    "IsCommandFinished": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.invocation.Status",
+          "StringEquals": "Success",
+          "Next": "RecordCeremonyResult"
+        },
+        {
+          "Or": [
+            {
+              "Variable": "$.invocation.Status",
+              "StringEquals": "Failed"
+            },
+            {
+              "Variable": "$.invocation.Status",
+              "StringEquals": "TimedOut"
+            },
+            {
+              "Variable": "$.invocation.Status",
+              "StringEquals": "Cancelled"
+            }
+          ],
+          "Next": "FailCeremonyCommand"
+        }
+      ],
+      "Default": "GuardCommandPolls"
+    },
+    "GuardCommandPolls": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.commandPoll",
+          "NumericLessThan": 240,
+          "Next": "WaitForCommand"
+        }
+      ],
+      "Default": "FailCommandTimeout"
+    },
+    "WaitForCommand": {
+      "Type": "Wait",
+      "Seconds": 20,
+      "Next": "IncrementCommandPoll"
+    },
+    "IncrementCommandPoll": {
+      "Type": "Pass",
+      "Assign": {
+        "commandPoll": "States.MathAdd($.commandPoll, 1)"
+      },
+      "Next": "PollCommandInvocation"
+    },
+    "RecordCeremonyResult": {
+      "Type": "Pass",
+      "Comment": "Keeps the ceremony's transcript in the execution history and in the success payload.",
+      "Assign": {
+        "ceremonyOutput": "$.invocation.StandardOutputContent"
+      },
+      "Next": "DeleteHsmAfterSuccess"
+    },
+    "DeleteHsmAfterSuccess": {
+      "Type": "Task",
+      "Comment": "Deleting the HSM is what stops the hourly billing, and it is the moment AWS takes the encrypted backup.",
+      "Resource": "arn:aws:states:::aws-sdk:cloudhsmv2:deleteHsm",
+      "Parameters": {
+        "ClusterId": "${cluster_id}",
+        "HsmId.$": "$.hsm.Hsm.HsmId"
+      },
+      "ResultPath": "$.deletedHsm",
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.deleteHsmError",
+          "Next": "FailHsmDelete"
+        }
+      ],
+      "Next": "PollHsmGone"
+    },
+    "PollHsmGone": {
+      "Type": "Task",
+      "Comment": "The API returns before the HSM is actually gone; the ENI and the billing stop only at deletion.",
+      "Resource": "arn:aws:states:::aws-sdk:cloudhsmv2:describeClusters",
+      "Parameters": {
+        "Filters": {
+          "clusterIds": ["${cluster_id}"]
+        }
+      },
+      "ResultPath": "$.teardown",
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.teardownError",
+          "Next": "FailBackupNotReady"
+        }
+      ],
+      "Next": "IsHsmGone"
+    },
+    "IsHsmGone": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Comment": "No HSMs left in the cluster: deletion has completed.",
+          "Variable": "$.teardown.Clusters[0].Hsms[0].HsmId",
+          "IsPresent": false,
+          "Next": "PollBackup"
+        }
+      ],
+      "Default": "GuardTeardownPolls"
+    },
+    "GuardTeardownPolls": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.teardownPoll",
+          "NumericLessThan": 60,
+          "Next": "WaitForTeardown"
+        }
+      ],
+      "Default": "FailHsmDeletionIncomplete"
+    },
+    "WaitForTeardown": {
+      "Type": "Wait",
+      "Seconds": 30,
+      "Next": "IncrementTeardownPoll"
+    },
+    "IncrementTeardownPoll": {
+      "Type": "Pass",
+      "Assign": {
+        "teardownPoll": "States.MathAdd($.teardownPoll, 1)"
+      },
+      "Next": "PollHsmGone"
+    },
+    "PollBackup": {
+      "Type": "Task",
+      "Comment": "The Root key is escrowed only once a READY backup exists. Never report success before this.",
+      "Resource": "arn:aws:states:::aws-sdk:cloudhsmv2:describeBackups",
+      "Parameters": {
+        "Filters": {
+          "clusterIds": ["${cluster_id}"]
+        },
+        "SortBy": "time",
+        "SortOrder": "desc"
+      },
+      "ResultPath": "$.finalBackups",
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.backupError",
+          "Next": "FailBackupNotReady"
+        }
+      ],
+      "Next": "IsBackupReady"
+    },
+    "IsBackupReady": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "And": [
+            {
+              "Variable": "$.finalBackups.Backups[0].State",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.finalBackups.Backups[0].State",
+              "StringEquals": "READY"
+            },
+            {
+              "Comment": "The newest backup must postdate this run, otherwise a stale backup would satisfy the check.",
+              "Variable": "$.finalBackups.Backups[0].BackupId",
+              "IsPresent": true
+            }
+          ],
+          "Next": "TerminateHostAfterSuccess"
+        }
+      ],
+      "Default": "GuardBackupPolls"
+    },
+    "GuardBackupPolls": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.backupPoll",
+          "NumericLessThan": 120,
+          "Next": "WaitForBackup"
+        }
+      ],
+      "Default": "FailBackupNotReady"
+    },
+    "WaitForBackup": {
+      "Type": "Wait",
+      "Seconds": 30,
+      "Next": "IncrementBackupPoll"
+    },
+    "IncrementBackupPoll": {
+      "Type": "Pass",
+      "Assign": {
+        "backupPoll": "States.MathAdd($.backupPoll, 1)"
+      },
+      "Next": "PollBackup"
+    },
+    "TerminateHostAfterSuccess": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:ec2:terminateInstances",
+      "Parameters": {
+        "InstanceIds": ["$.host.Instances[0].InstanceId"]
+      },
+      "ResultPath": "$.hostTerminated",
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.terminateError",
+          "Next": "FailHostTerminate"
+        }
+      ],
+      "Next": "CeremonySucceeded"
+    },
+    "CeremonySucceeded": {
+      "Type": "Succeed"
+    },
+    "CleanupHsmOnFailure": {
+      "Type": "Choice",
+      "Comment": "Single cleanup entry for every Catch. Neither cleanup step may overwrite $.error.",
+      "Choices": [
+        {
+          "Variable": "$.hsm.Hsm.HsmId",
+          "IsPresent": true,
+          "Next": "DeleteHsmOnFailure"
+        }
+      ],
+      "Default": "CleanupHostOnFailure"
+    },
+    "DeleteHsmOnFailure": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:cloudhsmv2:deleteHsm",
+      "Parameters": {
+        "ClusterId": "${cluster_id}",
+        "HsmId.$": "$.hsm.Hsm.HsmId"
+      },
+      "ResultPath": "$.cleanupHsm",
+      "Retry": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "IntervalSeconds": 10,
+          "MaxAttempts": 3,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.cleanupHsmError",
+          "Next": "CleanupHostOnFailure"
+        }
+      ],
+      "Next": "CleanupHostOnFailure"
+    },
+    "CleanupHostOnFailure": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.host.Instances[0].InstanceId",
+          "IsPresent": true,
+          "Next": "TerminateHostOnFailure"
+        }
+      ],
+      "Default": "FailOriginalCause"
+    },
+    "TerminateHostOnFailure": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:ec2:terminateInstances",
+      "Parameters": {
+        "InstanceIds": ["$.host.Instances[0].InstanceId"]
+      },
+      "ResultPath": "$.cleanupHost",
+      "Retry": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "IntervalSeconds": 10,
+          "MaxAttempts": 3,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.cleanupHostError",
+          "Next": "FailOriginalCause"
+        }
+      ],
+      "Next": "FailOriginalCause"
+    },
+    "FailOriginalCause": {
+      "Type": "Fail",
+      "Comment": "Cleanup finished: re-raise the error that started it, never the cleanup outcome.",
+      "Error": "CeremonyFailed",
+      "CausePath": "States.Format('{} | mode={} : {}', $.error.Error, $.mode, $.error.Cause)"
+    },
+    "FailInvalidMode": {
+      "Type": "Fail",
+      "Error": "InvalidMode",
+      "CausePath": "States.Format('mode must be BOOTSTRAP or ROTATE_INTERMEDIATE, got {}', $.mode)"
+    },
+    "FailNoReadyBackup": {
+      "Type": "Fail",
+      "Error": "NoReadyBackup",
+      "Cause": "The cluster is initialized but has no READY backup to restore the Root key from. A rotation that created an HSM without one would start from an empty HSM and lose the Root CA."
+    },
+    "FailHsmNotReady": {
+      "Type": "Fail",
+      "Error": "HsmNotReady",
+      "Cause": "The HSM did not reach ACTIVE within 90 polls (about 90 minutes)."
+    },
+    "FailSsmAgentNotOnline": {
+      "Type": "Fail",
+      "Error": "SsmAgentNotOnline",
+      "Cause": "The ceremony host never reported PingStatus Online (60 polls, 15 minutes). Check the instance profile and the ssm/ssmmessages endpoints."
+    },
+    "FailCeremonyCommand": {
+      "Type": "Fail",
+      "Error": "CeremonyCommandFailed",
+      "CausePath": "States.JsonToString($.invocation)"
+    },
+    "FailCommandTimeout": {
+      "Type": "Fail",
+      "Error": "CeremonyCommandTimedOut",
+      "Cause": "No terminal command status after 240 polls (80 minutes)."
+    },
+    "FailHsmDelete": {
+      "Type": "Fail",
+      "Error": "HsmDeleteFailed",
+      "CausePath": "States.Format('could not delete HSM after a successful ceremony: {}', $.deleteHsmError.Cause)"
+    },
+    "FailHsmDeletionIncomplete": {
+      "Type": "Fail",
+      "Error": "HsmDeletionIncomplete",
+      "Cause": "The HSM was asked to delete but is still present after 30 minutes: check the CloudHSM backup quota and the cluster state before assuming the billing stopped."
+    },
+    "FailBackupNotReady": {
+      "Type": "Fail",
+      "Error": "BackupNotReady",
+      "Cause": "The HSM is gone but no READY backup appeared within 60 minutes. The Root key is not escrowed: investigate before re-running."
+    },
+    "FailHostTerminate": {
+      "Type": "Fail",
+      "Error": "HostTerminateFailed",
+      "CausePath": "States.Format('ceremony succeeded and the HSM is gone, but the host could not be terminated: {}', $.terminateError.Cause)"
+    }
+  }
+}

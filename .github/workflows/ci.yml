@@ -48,6 +48,11 @@ jobs:
             echo "::endgroup::"
           done
 
+      - name: terraform validate ceremony stack
+        run: |
+          terraform -chdir=ceremony init -backend=false -input=false -no-color
+          terraform -chdir=ceremony validate -no-color
+
   tflint:
     name: tflint
     runs-on: ubuntu-latest
@@ -99,6 +104,9 @@ jobs:
 
       - name: offline harnesses
         run: bash "$MODULE/tests/run-all.sh"
+
+      - name: ceremony stack invariants (ASL graph + script syntax)
+        run: python3 ceremony/tests/asl_invariants.py
 
   hygiene:
     name: repository hygiene

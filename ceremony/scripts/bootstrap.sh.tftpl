@@ -1,0 +1,26 @@
+#!/bin/bash
+# =============================================================================
+# Bootstrap entrypoint on the ephemeral ceremony host.
+#
+# The workflow passes CEREMONY_HSM_IP and CEREMONY_MODE in the SSM command.
+# This script only fetches the runtime module's own ceremony script and runs it,
+# so a bootstrap driven by Step Functions and a bootstrap driven by
+# `terraform apply` execute exactly the same code.
+# =============================================================================
+set -euo pipefail
+
+BUCKET='${artifact_bucket}'
+
+mkdir -p /opt/pki
+exec > >(tee -a /var/log/ceremony.log) 2>&1
+trap 'echo "FATAL: bootstrap entrypoint failed at line $LINENO"; tail -40 /var/log/ceremony.log' ERR
+
+echo "bootstrap entrypoint: mode=$${CEREMONY_MODE:-BOOTSTRAP} hsm=$${CEREMONY_HSM_IP:-unset}"
+
+aws s3api get-object --bucket "$BUCKET" --key scripts/hsm_ceremony.sh \
+  /opt/pki/hsm_ceremony.sh >/dev/null
+chmod 700 /opt/pki/hsm_ceremony.sh
+
+# The ceremony script reads the same config document Terraform rendered; it only
+# needs the runtime HSM address, which the workflow supplies.
+exec bash /opt/pki/hsm_ceremony.sh

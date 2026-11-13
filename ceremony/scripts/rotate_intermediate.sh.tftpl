@@ -1,0 +1,140 @@
+#!/bin/bash
+# =============================================================================
+# Intermediate CA rotation, on the ephemeral ceremony host.
+#
+# The HSM was created with BackupId, so the Root CA key (and the crypto user)
+# came back from the cluster backup. Nothing here generates key material in the
+# HSM: it builds a fresh Intermediate CSR from the KMS key and signs it with the
+# restored Root key.
+#
+# The Root public key is taken from the published root_ca.pem rather than from
+# the HSM, because rotation never sees the key's EC point: `key generate` is
+# what reports it, and rotation does not generate.
+# =============================================================================
+set -euo pipefail
+
+readonly CONFIG_JSON=$(cat <<'ROTATE_JSON'
+${rotate_config}
+ROTATE_JSON
+)
+
+readonly PKI_DIR=/opt/pki
+readonly VENV=$PKI_DIR/venv
+readonly LOG=/var/log/ceremony.log
+readonly CLI=/opt/cloudhsm/bin/cloudhsm-cli
+
+mkdir -p "$PKI_DIR" "$(dirname "$LOG")"
+chmod 700 "$PKI_DIR"
+exec > >(tee -a "$LOG") 2>&1
+trap 'echo "FATAL: rotation failed at line $LINENO"; tail -40 "$LOG"' ERR
+
+cfg() { printf '%s' "$CONFIG_JSON" | jq -r --arg k "$1" '.[$k]'; }
+
+NAME=$(cfg name)
+REGION=$(cfg region)
+CLUSTER_ID=$(cfg cluster_id)
+BUCKET=$(cfg bucket)
+KMS_KEY_ARN=$(cfg kms_key_arn)
+ROOT_CURVE=$(cfg root_curve)
+ROOT_DIGEST=$(cfg root_digest)
+ROOT_LABEL=$(cfg root_label)
+INTER_DAYS=$(cfg inter_validity_days)
+SSM_ROOT=$(cfg ssm_root_ca_pem)
+SSM_INTER=$(cfg ssm_intermediate_pem)
+SSM_BUNDLE=$(cfg ssm_ca_bundle_pem)
+SSM_STATE=$(cfg ssm_ceremony_state)
+SSM_CU_PW=$(cfg ssm_cu_password)
+S3_TOOL=$(cfg s3_kms_ca_tool)
+S3_INTER_CNF=$(cfg s3_intermediate_cnf)
+CU_USER=$(cfg cu_username)
+CLI_RPM=$(cfg cloudhsm_cli_rpm)
+
+export AWS_REGION=$REGION
+export AWS_DEFAULT_REGION=$REGION
+export PATH="$HOME/.local/bin:$PATH"
+export PYTHONUNBUFFERED=1
+
+echo "rotation: cluster=$CLUSTER_ID key=$KMS_KEY_ARN root_label=$ROOT_LABEL"
+
+mark_state() { aws ssm put-parameter --name "$SSM_STATE" --value "$1" --type String --overwrite >/dev/null 2>&1 || true; }
+mark_state IN_PROGRESS
+
+# --- tooling ---------------------------------------------------------------
+dnf install -y -q jq openssl ca-certificates curl tar gzip >/dev/null
+curl -fsSL -o /tmp/cloudhsm-cli.rpm "$CLI_RPM"
+dnf install -y -q /tmp/cloudhsm-cli.rpm >/dev/null
+[ -x "$CLI" ] || { echo "cloudhsm-cli missing at $CLI"; exit 1; }
+
+# The workflow supplies the HSM's ENI address; the config document cannot, it
+# was rendered before the HSM existed.
+[ -n "$${CEREMONY_HSM_IP:-}" ] || { echo "CEREMONY_HSM_IP is required"; exit 1; }
+/opt/cloudhsm/bin/configure-cli -a "$CEREMONY_HSM_IP"
+if systemctl cat cloudhsm-cli >/dev/null 2>&1; then
+  systemctl enable --now cloudhsm-cli
+fi
+
+if ! command -v uv >/dev/null 2>&1; then
+  curl -LsSf https://astral.sh/uv/install.sh | sh >/dev/null
+fi
+uv venv --python 3.11 "$VENV" >/dev/null
+uv pip install --python "$VENV/bin/python" "cryptography>=42" "boto3>=1.34" >/dev/null
+
+aws s3api get-object --bucket "$BUCKET" --key "$S3_TOOL" "$PKI_DIR/kms_ca_tool.py" >/dev/null
+aws s3api get-object --bucket "$BUCKET" --key "$S3_INTER_CNF" "$PKI_DIR/intermediate_ca.cnf" >/dev/null
+chmod 700 "$PKI_DIR/kms_ca_tool.py"
+
+# --- inputs ----------------------------------------------------------------
+CU_PW=$(aws ssm get-parameter --name "$SSM_CU_PW" --with-decryption --query Parameter.Value --output text)
+ROOT_PEM=$(aws ssm get-parameter --name "$SSM_ROOT" --query Parameter.Value --output text)
+case "$ROOT_PEM" in
+  *"BEGIN CERTIFICATE"*) ;;
+  *) echo "the published Root CA is not a certificate: $ROOT_PEM"; exit 1 ;;
+esac
+printf '%s\n' "$ROOT_PEM" > "$PKI_DIR/root_ca.pem"
+openssl x509 -in "$PKI_DIR/root_ca.pem" -noout -subject -fingerprint -sha256
+
+# The mechanism the HSM will use: derived from the restored key, not guessed.
+ROOT_BITS=$(openssl x509 -in "$PKI_DIR/root_ca.pem" -noout -text \
+  | awk '/Public-Key:/{print $2; exit}')
+case "$ROOT_BITS" in
+  256|384|521) ;;
+  *) echo "unexpected Root CA key size: $ROOT_BITS"; exit 1 ;;
+esac
+openssl x509 -in "$PKI_DIR/root_ca.pem" -pubkey -noout \
+  | openssl pkey -pubin -outform DER -out "$PKI_DIR/root_pub.der"
+
+export CLOUDHSM_PIN="$CU_USER:$CU_PW"
+
+# --- new Intermediate: CSR from KMS, signature from the restored Root key ---
+"$VENV/bin/python" "$PKI_DIR/kms_ca_tool.py" create-intermediate-csr --signer kms \
+  --kms-key-id "$KMS_KEY_ARN" --region "$REGION" \
+  --cnf "$PKI_DIR/intermediate_ca.cnf" --dn-section intermediate_dn \
+  --extensions v3_intermediate_ca --issuer-cert "$PKI_DIR/root_ca.pem" \
+  --out "$PKI_DIR/intermediate_ca.csr"
+
+"$VENV/bin/python" "$PKI_DIR/kms_ca_tool.py" sign-csr --signer hsm \
+  --hsm-key-label "$ROOT_LABEL" --hsm-public-key "$PKI_DIR/root_pub.der" \
+  --hsm-curve "$ROOT_CURVE" --region "$REGION" \
+  --issuer-cert "$PKI_DIR/root_ca.pem" --csr "$PKI_DIR/intermediate_ca.csr" \
+  --cnf "$PKI_DIR/intermediate_ca.cnf" --extensions v3_intermediate_ca \
+  --days "$INTER_DAYS" --out "$PKI_DIR/intermediate_ca.pem"
+
+# --- verify, then publish --------------------------------------------------
+openssl verify -CAfile "$PKI_DIR/root_ca.pem" "$PKI_DIR/intermediate_ca.pem"
+openssl x509 -in "$PKI_DIR/intermediate_ca.pem" -noout -text | grep -qF "CA:TRUE, pathlen:0" \
+  || { echo "rotated intermediate is missing pathlen:0"; exit 1; }
+[ "$(openssl x509 -in "$PKI_DIR/intermediate_ca.pem" -noout -text | awk '/Public-Key:/{print $2; exit}')" = "$ROOT_BITS" ] \
+  || echo "note: intermediate key size differs from the root, as expected"
+
+cat "$PKI_DIR/root_ca.pem" "$PKI_DIR/intermediate_ca.pem" > "$PKI_DIR/ca_bundle.pem"
+
+aws ssm put-parameter --name "$SSM_INTER" --value "file://$PKI_DIR/intermediate_ca.pem" --type String --overwrite
+aws ssm put-parameter --name "$SSM_BUNDLE" --value "file://$PKI_DIR/ca_bundle.pem" --type String --overwrite
+for f in intermediate_ca.pem ca_bundle.pem intermediate_ca.csr; do
+  aws s3api put-object --bucket "$BUCKET" --key "certs/$f" --body "$PKI_DIR/$f" \
+    --server-side-encryption AES256 >/dev/null
+done
+
+mark_state COMPLETE
+echo "ROTATION COMPLETE"
+openssl x509 -in "$PKI_DIR/intermediate_ca.pem" -noout -subject -issuer -dates -fingerprint -sha256
