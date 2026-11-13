@@ -11,7 +11,7 @@ is verified with `openssl crl -verify` against its issuer.
 Proves: TBSCertList encoding, the v2/SEQUENCE-OF shape, AKI lifted from the CA
 certificate, digest signing, PEM encoding for ImportCrl (the API rejects raw
 DER: "a CRL must be in PEM format"), the GetCrl round-trip comparison, and the
-refusal to run when awscc owns the CRL object.
+refusal to run without a trust anchor to import against.
 
 usage: python3 tests/lambda/test_lambda.py [module-dir]
 """
@@ -184,7 +184,6 @@ def main():
         "CRL_OUTPUT_PREFIX": "s3://bucket/crl",
         "CRL_VALIDITY_DAYS": "7",
     })
-    os.environ.pop("CRL_OWNER", None)
 
     handler_module, source = load_handler()
     print("handler extracted from crl_issuer_lambda.tf (%d bytes)" % len(source))
@@ -226,19 +225,18 @@ def main():
     print("revoked serials:", [hex(s) for s in serials])
     print("AKI matches the issuer SKI")
 
-    # 4. the awscc path must be refused, so the two owners cannot fork
-    os.environ["CRL_OWNER"] = "awscc"
+    # 4. a missing trust anchor must be refused, not quietly signed and dropped
+    saved_anchor = os.environ.pop("TRUST_ANCHOR_ARN")
     try:
         handler_module.handler({}, None)
     except RuntimeError as exc:
-        assert "awscc" in str(exc), exc
-        print("refuses to import when CRL_OWNER=awscc:", str(exc)[:60], "...")
+        print("refuses to run without a trust anchor:", str(exc)[:60], "...")
     else:
-        sys.exit("FAIL: handler imported a CRL while awscc owns the object")
+        sys.exit("FAIL: handler signed a CRL with no trust anchor to import it against")
+    os.environ["TRUST_ANCHOR_ARN"] = saved_anchor
 
     # 5. the empty-revocation-set variant must still be a valid CRL
     os.environ.pop("REVOCATIONS_S3_URI")
-    os.environ.pop("CRL_OWNER")
     sink.clear()
     handler_module.handler({}, None)
     empty = x509.load_pem_x509_crl(sink["crlData"])

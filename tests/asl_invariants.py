@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Structural checks for modules/pki-ceremony/statemachine.asl.json.tftpl.
+Structural checks for statemachine.asl.json.tftpl.
 
 The ASL is the ceremony: a wrong Next, a Catch that leaks the HSM, or a missing
 backup check costs real money and can lose the Root CA. None of that is
@@ -21,7 +21,7 @@ make those properties meaningful:
   backup       the success path confirms the HSM is gone and a READY backup
                exists before it terminates the host and succeeds
 
-usage: python3 modules/pki-ceremony/tests/asl_invariants.py [stack-dir]
+usage: python3 tests/asl_invariants.py [module-dir]
 """
 import json
 import os
@@ -32,8 +32,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 STACK = sys.argv[1] if len(sys.argv) > 1 else os.path.abspath(os.path.join(HERE, ".."))
 TEMPLATE = "statemachine.asl.json.tftpl"
 
-# Mirrors the locals in modules/pki-ceremony/main.tf. Values are placeholders: the checks
-# are structural, and a real cluster id would make the output unreadable.
+# Mirrors the locals in ceremony.tf. Values are placeholders: the checks are
+# structural, and a real cluster id would make the output unreadable.
 RENDER_VARS = {
     "name": "corp-pki",
     "cluster_id": "cluster-abc123",
@@ -46,6 +46,10 @@ RENDER_VARS = {
     "bucket": "corp-pki-ceremony-artifacts",
     "bootstrap_key": "scripts/bootstrap.sh",
     "rotate_key": "scripts/rotate_intermediate.sh",
+    "trust_anchor_id": "6f5c0e2a-1b3d-4e5f-8a9b-0c1d2e3f4a5b",
+    "trust_anchor_arn": "arn:aws:rolesanywhere:us-west-2:111122223333:trust-anchor/6f5c0e2a",
+    "ssm_ca_bundle_pem": "/corp-pki/pki/ca_bundle.pem",
+    "crl_function_name": "corp-pki-crl-issuer",
 }
 
 TASK_TYPES = {"Task"}
@@ -296,6 +300,50 @@ def main():
     hsms_gone = [n for n, s in states.items()
                  if "Hsms[0].HsmId" in json.dumps(s) and '"IsPresent": false' in json.dumps(s)]
     check(bool(hsms_gone), "a poll confirms the HSM is gone before success", str(hsms_gone))
+
+    # --- 5. activation tail -----------------------------------------------
+    # The trust anchor is created DISABLED with a placeholder bundle, so the
+    # workflow is what makes the PKI usable. A success that skips these states
+    # leaves an anchor that accepts nothing, and nothing else would notice.
+    print("\nactivation tail (install the chain, enable the anchor, import a CRL):")
+    for required in ("UpdateTrustAnchor", "EnableTrustAnchor", "ImportOrUpdateCrl", "ReadCaBundle"):
+        check(required in states, "%s exists" % required)
+
+    if "UpdateTrustAnchor" in states:
+        params = json.dumps(states["UpdateTrustAnchor"].get("Parameters", {}))
+        check("CERTIFICATE_BUNDLE" in params, "UpdateTrustAnchor sets SourceType=CERTIFICATE_BUNDLE", params)
+        check("$.bundle.caBundlePem" in params,
+              "UpdateTrustAnchor installs the chain the ceremony published", params)
+        check("trust-anchor/6f5c0e2a" in params or "$.bundle" in params,
+              "UpdateTrustAnchor targets this module's trust anchor", params)
+        check(path_exists(defn, "UpdateTrustAnchor",
+                          lambda n, s: s.get("Type") == "Succeed"),
+              "UpdateTrustAnchor precedes the Succeed state")
+
+    if "EnableTrustAnchor" in states:
+        params = json.dumps(states["EnableTrustAnchor"].get("Parameters", {}))
+        check("TrustAnchorId" in params, "EnableTrustAnchor passes TrustAnchorId", params)
+        check(path_exists(defn, "EnableTrustAnchor",
+                          lambda n, s: s.get("Type") == "Succeed"),
+              "EnableTrustAnchor precedes the Succeed state")
+        check(path_exists(defn, "UpdateTrustAnchor",
+                          lambda n, s: n == "EnableTrustAnchor"),
+              "the anchor is enabled only after the real chain is installed")
+
+    if "ImportOrUpdateCrl" in states:
+        resource = states["ImportOrUpdateCrl"].get("Resource", "")
+        check(resource.endswith(":lambda:invoke"),
+              "ImportOrUpdateCrl invokes the CRL issuer", resource)
+
+    # Every state after the HSM exists must still reach the teardown on failure.
+    for name in ("ReadCaBundle", "UpdateTrustAnchor", "EnableTrustAnchor", "ImportOrUpdateCrl"):
+        if name not in states:
+            continue
+        catches = states[name].get("Catch", [])
+        check(bool(catches), "%s catches failures instead of stalling" % name)
+        check(path_exists(defn, name,
+                          lambda n, s: s.get("Resource", "").endswith(":cloudhsmv2:deleteHsm")),
+              "%s can still reach deleteHsm on failure" % name)
 
     print()
     failures.extend(check_scripts())

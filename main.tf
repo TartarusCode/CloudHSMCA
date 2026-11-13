@@ -1,43 +1,21 @@
 ###############################################################################
-# Runtime foundation for modules/roles-anywhere
+# The durable foundation
 #
-# This module CONSUMES a certificate chain; it never creates one. The Root CA
-# ceremony is modules/pki-ceremony (a Step Functions workflow with a CloudHSM), which
-# publishes /<name>/pki/*.pem to SSM Parameter Store and creates the KMS
-# Intermediate CA key. Nothing here waits for an earlier phase of itself, so a
-# single apply produces a complete runtime.
+# Everything the PKI needs that outlives a ceremony, in the same module as the
+# ceremony and the Roles Anywhere runtime — one apply, no cross-stack hand-over:
 #
-#  * data aws_ssm_parameter  the published chain (Root + Intermediate)
-#  * aws_s3_bucket           CRLs and revocation input, versioned, Object-Locked
+#  * aws_s3_bucket           tooling, issued certificates, CRLs and revocation
+#                            input. Versioned, Object-Locked, TLS-only.
 #  * aws_iam_policy          deny-list protecting the CloudHSM backup that
-#                            escrows the offline Root CA key
+#                            escrows the offline Root CA private key
+#
+# The cluster shell, KMS Intermediate key and state machine live in ceremony.tf;
+# the trust anchor and workload roles in roles_anywhere.tf; the CRL machinery in
+# crl_issuer_lambda.tf. Shared locals are declared once, in ceremony.tf.
 ###############################################################################
 
-data "aws_caller_identity" "current" {}
-data "aws_partition" "current" {}
-data "aws_region" "current" {}
-
-locals {
-  account_id = data.aws_caller_identity.current.account_id
-  partition  = data.aws_partition.current.partition
-  region     = data.aws_region.current.region
-
-  tags = merge(var.tags, {
-    Module   = "roles-anywhere"
-    Workload = var.name
-  })
-
-  # The hand-over contract with ceremony/: fixed paths, published by the
-  # workflow, read here. Both stacks derive them from the same `name`.
-  ssm_prefix              = "/${var.name}/pki"
-  ssm_root_ca_pem         = "${local.ssm_prefix}/root_ca.pem"
-  ssm_intermediate_ca_pem = "${local.ssm_prefix}/intermediate_ca.pem"
-  ssm_ca_bundle_pem       = "${local.ssm_prefix}/ca_bundle.pem"
-  ssm_ceremony_state      = "${local.ssm_prefix}/ceremony/state"
-}
-
 ###############################################################################
-# Artifact bucket (CRLs, revocation input, audit copies)
+# Artifact bucket
 ###############################################################################
 
 resource "aws_s3_bucket" "artifacts" {
@@ -76,7 +54,8 @@ resource "aws_s3_bucket_server_side_encryption_configuration" "artifacts" {
   rule {
     apply_server_side_encryption_by_default {
       # SSE-S3, not the CA key: losing that key must never make the audit
-      # artifacts unreadable (and an asymmetric key could not encrypt anyway).
+      # artifacts or the published chain unreadable, and an asymmetric key could
+      # not encrypt anyway.
       sse_algorithm = "AES256"
     }
     bucket_key_enabled = true
@@ -142,11 +121,12 @@ resource "aws_s3_bucket_lifecycle_configuration" "artifacts" {
 # The offline Root CA private key exists in exactly one place after a ceremony:
 # the automatic, encrypted cluster backup. Deleting that backup destroys the
 # ability to issue a new Intermediate CA without a new key ceremony, so the deny
-# is unconditional and account-wide (backup IDs do not exist at plan time, and a
-# scoped resource would be bypassed by any new backup).
+# is unconditional and account-wide — backup ids do not exist at plan time, and a
+# scoped resource would be bypassed by any new backup.
 #
-# The cluster itself belongs to ceremony/; this policy protects it from the
-# credentials that merely manage the account.
+# The two principals in this module that can manage CloudHSM are attached here by
+# resource reference. Anyone else who can must attach it themselves; the policy
+# ARN is an output.
 ###############################################################################
 
 data "aws_iam_policy_document" "cloudhsm_backup_guard" {
@@ -168,13 +148,12 @@ resource "aws_iam_policy" "cloudhsm_backup_guard" {
   tags        = local.tags
 }
 
-data "aws_iam_role" "extra_backup_guard_roles" {
-  for_each = toset(var.backup_guard_role_names)
-  name     = each.value
-}
+resource "aws_iam_role_policy_attachment" "cloudhsm_backup_guard" {
+  for_each = {
+    ceremony_host = aws_iam_role.ceremony_host.name
+    state_machine = aws_iam_role.sfn.name
+  }
 
-resource "aws_iam_role_policy_attachment" "extra_backup_guard" {
-  for_each   = data.aws_iam_role.extra_backup_guard_roles
-  role       = each.value.name
+  role       = each.value
   policy_arn = aws_iam_policy.cloudhsm_backup_guard.arn
 }

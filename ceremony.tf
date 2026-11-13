@@ -1,5 +1,5 @@
 ###############################################################################
-# modules/pki-ceremony/ — the Root CA ceremony as an imperative workflow
+# ceremony.tf — the Root CA ceremony as an imperative workflow
 #
 # Terraform owns the durable half: the CloudHSM cluster shell, the artifact
 # bucket, the SSM hand-over parameters, IAM, and the state machine. Step
@@ -8,8 +8,9 @@
 # ec2:TerminateInstances — so no HSM or ceremony host ever exists in Terraform
 # state and nothing can drift.
 #
-# The runtime module (modules/roles-anywhere) consumes the chain this publishes,
-# which is what makes it a single deterministic apply.
+# The workflow also activates the runtime this module creates: UpdateTrustAnchor
+# installs the real chain, EnableTrustAnchor flips the placeholder anchor on, and
+# ImportOrUpdateCrl gives it a CRL — see the tail of statemachine.asl.json.tftpl.
 ###############################################################################
 
 data "aws_caller_identity" "current" {}
@@ -21,8 +22,12 @@ locals {
   partition  = data.aws_partition.current.partition
   region     = data.aws_region.current.region
 
+  # One identity for every resource this module creates, so Cost Explorer and
+  # Resource Groups do not have to know about the repository layout.
+  module_tag = "cloudhsmca"
+
   tags = merge(var.tags, {
-    Module = "pki-ceremony"
+    Module = local.module_tag
     Tier   = "root-of-trust"
   })
 
@@ -36,7 +41,7 @@ locals {
 
   pending = "PENDING-CEREMONY"
 
-  # The bootstrap script is the runtime module's own ceremony script, rendered
+  # The bootstrap script is the ceremony script itself, rendered
   # here so both paths execute one implementation.
   bootstrap_config = {
     name                 = var.name
@@ -117,12 +122,11 @@ locals {
     ECC_NIST_P521 = "ECDSA_SHA_512"
   }[var.intermediate_key_spec]
 
-  # Both roles exist only in the account, not necessarily at key-creation time,
-  # so the key policy names them by `aws:PrincipalArn` condition (see below).
-  runtime_crl_role_arn = "arn:${local.partition}:iam::${local.account_id}:role/${var.name}-crl-issuer"
-
+  # The key policy names the signers by `aws:PrincipalArn` under the account-root
+  # principal, so KMS never has to resolve (or rewrite) a role principal — see
+  # data.aws_iam_policy_document.intermediate_ca_key.
   ca_key_principal_arns = compact(concat(
-    [aws_iam_role.ceremony_host.arn, local.runtime_crl_role_arn],
+    [aws_iam_role.ceremony_host.arn, aws_iam_role.crl_issuer.arn],
     var.additional_signer_principal_arns,
   ))
 
@@ -138,6 +142,13 @@ locals {
     bucket                     = aws_s3_bucket.artifacts.id
     bootstrap_key              = aws_s3_object.bootstrap_script[0].key
     rotate_key                 = aws_s3_object.rotate_script.key
+
+    # The activation tail: the workflow installs the chain it just built and
+    # flips the placeholder trust anchor on.
+    trust_anchor_id   = aws_rolesanywhere_trust_anchor.this.id
+    trust_anchor_arn  = aws_rolesanywhere_trust_anchor.this.arn
+    ssm_ca_bundle_pem = local.ssm_ca_bundle_pem
+    crl_function_name = aws_lambda_function.crl_issuer.function_name
   })
 }
 
@@ -209,46 +220,10 @@ resource "aws_security_group" "ceremony" {
 }
 
 ###############################################################################
-# Artifacts
+# The ceremony host's artifacts (the bucket itself is in main.tf)
 ###############################################################################
 
-resource "aws_s3_bucket" "artifacts" {
-  bucket_prefix       = "${var.name}-ceremony-"
-  bucket              = var.artifact_bucket_name != "" ? var.artifact_bucket_name : null
-  force_destroy       = false
-  object_lock_enabled = false
-  tags                = local.tags
-}
-
-resource "aws_s3_bucket_versioning" "artifacts" {
-  bucket = aws_s3_bucket.artifacts.id
-
-  versioning_configuration {
-    status = "Enabled"
-  }
-}
-
-resource "aws_s3_bucket_server_side_encryption_configuration" "artifacts" {
-  bucket = aws_s3_bucket.artifacts.id
-
-  rule {
-    apply_server_side_encryption_by_default {
-      sse_algorithm = "AES256"
-    }
-    bucket_key_enabled = true
-  }
-}
-
-resource "aws_s3_bucket_public_access_block" "artifacts" {
-  bucket                  = aws_s3_bucket.artifacts.id
-  block_public_acls       = true
-  block_public_policy     = true
-  ignore_public_acls      = true
-  restrict_public_buckets = true
-}
-
-# The tooling and the two OpenSSL profiles, byte-identical to the runtime
-# module's copies.
+# The tooling and the two OpenSSL profiles.
 resource "aws_s3_object" "kms_ca_tool" {
   bucket                 = aws_s3_bucket.artifacts.id
   key                    = "scripts/kms_ca_tool.py"
@@ -277,7 +252,7 @@ resource "aws_s3_object" "intermediate_ca_cnf" {
   tags                   = local.tags
 }
 
-# Bootstrap is the runtime module's own ceremony script; the entrypoint only
+# Bootstrap is the ceremony script itself; the entrypoint only
 # downloads it and executes it, so the two paths cannot diverge.
 resource "aws_s3_object" "bootstrap_script" {
   count = var.enable_bootstrap ? 1 : 0
@@ -311,7 +286,7 @@ resource "aws_s3_object" "bootstrap_entrypoint" {
 }
 
 ###############################################################################
-# SSM hand-over parameters (the artifact the runtime stack consumes)
+# SSM hand-over parameters (the chain the trust anchor and the Lambda read)
 ###############################################################################
 
 resource "random_password" "hsm_admin" {
@@ -533,12 +508,12 @@ resource "aws_iam_instance_profile" "ceremony_host" {
 ###############################################################################
 # Intermediate CA key (KMS asymmetric, never exportable)
 #
-# The ceremony stack creates it, so the "foundation" is one apply: the workflow
-# needs GetPublicKey + Sign to build the Intermediate CSR, and the runtime
-# module needs Sign for CRLs and leaf issuance. The policy matches both by
-# `aws:PrincipalArn` under the account-root principal — the runtime module's
-# <name>-crl-issuer may not exist yet, and KMS refuses (or rewrites) role
-# principals it cannot resolve. Because that delegates to IAM, each signer also
+# The ceremony needs GetPublicKey + Sign to build the Intermediate CSR, and the
+# CRL Lambda needs Sign for CRLs and leaf issuance. Both are matched by
+# `aws:PrincipalArn` under the account-root principal: KMS resolves principals
+# when the policy is written, and it rewrites a role principal to its AROA id, so
+# naming the roles directly is fragile in an apply that creates them alongside the
+# key. Because a root principal delegates the decision to IAM, each signer also
 # carries an identity-policy grant with the same digest-only conditions.
 ###############################################################################
 
@@ -560,9 +535,9 @@ data "aws_iam_policy_document" "intermediate_ca_key" {
   # The principals are named by an `aws:PrincipalArn` condition rather than by
   # listing the role ARNs in `Principal`, for two reasons that both bite on the
   # first apply:
-  #   * KMS resolves principals when the policy is written, so a role that does
-  #     not exist yet (the runtime module's <name>-crl-issuer, which may be
-  #     applied later) fails the apply with MalformedPolicyDocumentException.
+  #   * KMS resolves principals when the policy is written, so a role created in
+  #     the same apply fails the key with MalformedPolicyDocumentException unless
+  #     Terraform happens to order it first.
   #   * KMS rewrites a role principal ARN to its principal ID (AROA…), so the
   #     stored policy stops matching the role ARN and every plan shows a diff.
   # With the account root as the principal and the role ARNs in a condition, the
@@ -722,6 +697,30 @@ data "aws_iam_policy_document" "sfn" {
     actions   = ["xray:PutTraceSegments", "xray:PutTelemetryRecords"]
     resources = ["*"]
   }
+
+  # The activation tail of the workflow: install the chain it just published,
+  # turn the placeholder trust anchor on, then have the CRL importer sign and
+  # import the first CRL.
+  statement {
+    sid = "ActivateTrustAnchor"
+    actions = [
+      "rolesanywhere:UpdateTrustAnchor",
+      "rolesanywhere:EnableTrustAnchor",
+    ]
+    resources = [aws_rolesanywhere_trust_anchor.this.arn]
+  }
+
+  statement {
+    sid       = "ReadCaBundle"
+    actions   = ["ssm:GetParameter"]
+    resources = ["arn:${local.partition}:ssm:${local.region}:${local.account_id}:parameter${local.ssm_ca_bundle_pem}"]
+  }
+
+  statement {
+    sid       = "InvokeCrlIssuer"
+    actions   = ["lambda:InvokeFunction"]
+    resources = [aws_lambda_function.crl_issuer.arn]
+  }
 }
 
 resource "aws_iam_role_policy" "sfn" {
@@ -747,4 +746,48 @@ resource "aws_sfn_state_machine" "ceremony" {
   }
 
   tags = local.tags
+}
+
+###############################################################################
+# auto_bootstrap — one command, one apply
+#
+# With var.auto_bootstrap = false (the default) this does nothing: apply lands in
+# under a minute with the trust anchor DISABLED and the operator starts the
+# ceremony out of band. With true, a local-exec starts the bootstrap execution
+# and polls it, so a failure fails the apply with the execution's cause instead
+# of leaving a half-configured PKI behind.
+#
+# terraform_data rather than a data source: the side effect must run at apply,
+# not during plan, and must re-run only when the state machine or name changes.
+###############################################################################
+
+resource "terraform_data" "auto_bootstrap" {
+  count = var.auto_bootstrap ? 1 : 0
+
+  triggers_replace = [
+    aws_sfn_state_machine.ceremony.arn,
+    var.name,
+  ]
+
+  provisioner "local-exec" {
+    interpreter = ["/bin/bash", "-c"]
+    environment = {
+      STATE_MACHINE_ARN = aws_sfn_state_machine.ceremony.arn
+      SSM_CA_BUNDLE     = local.ssm_ca_bundle_pem
+      PKI_NAME          = var.name
+      AWS_REGION        = local.region
+      WAIT_TIMEOUT      = tostring(var.auto_bootstrap_timeout_seconds)
+    }
+    command = "${path.module}/scripts/run_ceremony_and_wait.sh"
+  }
+
+  depends_on = [
+    aws_sfn_state_machine.ceremony,
+    aws_cloudhsm_v2_cluster.this,
+    aws_kms_key.intermediate_ca,
+    aws_rolesanywhere_trust_anchor.this,
+    aws_iam_role_policy.sfn,
+    aws_lambda_function.crl_issuer,
+    aws_ssm_parameter.ca_bundle_pem,
+  ]
 }

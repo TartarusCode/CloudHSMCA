@@ -4,6 +4,44 @@ All notable changes to this repository are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the module follows
 semantic versioning once it is tagged.
 
+## [0.3.0] - 2026-11-13
+
+Breaking: the repository is a single root module, and one `terraform apply`
+deploys the whole PKI.
+
+### Changed
+
+- `modules/pki-ceremony` and `modules/roles-anywhere` are merged into the
+  repository root (`main.tf`, `ceremony.tf`, `roles_anywhere.tf`,
+  `crl_issuer_lambda.tf`, `statemachine.asl.json.tftpl`, `scripts/`, `tests/`).
+  The KMS key, IAM roles and trust anchor are wired by resource reference, not by
+  cross-stack variables or name guesses.
+- `examples/01-pki-ceremony` + `examples/02-roles-anywhere` become
+  `examples/complete` and `examples/auto-bootstrap`, each calling `source = "../../"`.
+
+### Added
+
+- A **disabled placeholder trust anchor**: a throwaway `tls` self-signed
+  certificate satisfies `CreateTrustAnchor`, so the first apply no longer waits
+  for a ceremony, and `ignore_changes = [source, enabled]` keeps later plans from
+  reverting the real chain.
+- The ceremony's activation tail: `ReadCaBundle` → `UpdateTrustAnchor` →
+  `EnableTrustAnchor` → `ImportOrUpdateCrl`. A success now leaves a trust anchor
+  with the real Root + Intermediate chain, enabled, with a CRL imported.
+- `var.auto_bootstrap` (default `false`) and `scripts/run_ceremony_and_wait.sh`:
+  with `true`, apply starts the ceremony and polls it, failing with the
+  execution's cause. The waiter is idempotent on the published bundle.
+- `Module = "cloudhsmca"` on every resource.
+
+### Removed
+
+- The `hashicorp/awscc` dependency, `awscc_rolesanywhere_crl`, and the
+  `crl_management_mode` / `crl_pem_path` / `auto_bootstrap_crl` /
+  `crl_bootstrap_generation` variables: the Lambda is the only CRL owner and the
+  ceremony imports the first CRL.
+- The SSM `data` source and its precondition on the trust anchor, and the
+  `intermediate_kms_key_arn` / `backup_guard_role_names` cross-stack inputs.
+
 ## [0.2.0] - 2026-11-13
 
 Breaking: the two-phase `ceremony_mode` toggle is gone. The ceremony is its own

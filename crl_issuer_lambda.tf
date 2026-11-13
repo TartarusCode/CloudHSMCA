@@ -4,15 +4,12 @@
 #   EventBridge rule  rate(24 hours)  ->  Lambda
 #   Lambda            build TBSCertList, kms.sign(DIGEST), ImportCrl (PEM)
 #
-# hashicorp/aws has no CRL resource (5.x and 6.x schemas checked); the
-# declarative route is awscc_rolesanywhere_crl, used when
-# crl_management_mode = "awscc" (see roles_anywhere.tf). This Lambda is the
-# hands-off route: crl_management_mode = "lambda", no Terraform CRL state.
-# It refuses to import when awscc owns the object, so the two paths cannot fork
-# into two enabled CRLs with different nextUpdate values.
+# hashicorp/aws has no aws_rolesanywhere_crl resource (5.x and 6.x schemas both
+# checked), so nothing in Terraform holds CRL state: the ceremony imports the
+# first CRL, and this Lambda keeps it fresh and re-imports it every 24 hours.
 #
-# The chain this Lambda revokes against is published by the ceremony stack; the
-# key it signs with is that stack's KMS Intermediate CA key.
+# The chain this Lambda revokes against is published by the ceremony; the key it
+# signs with is this module's KMS Intermediate CA key.
 #
 # The handler is stdlib-only on purpose (the Python runtime has no
 # `cryptography`): DER is encoded by hand, the signature is over the DER
@@ -331,13 +328,7 @@ data "archive_file" "crl_issuer" {
 
           if not trust_anchor_arn:
               raise RuntimeError(
-                  "TRUST_ANCHOR_ARN is empty: the module is still in ceremony mode")
-          if os.environ.get("CRL_OWNER", "lambda") != "lambda":
-              raise RuntimeError(
-                  "CRL ownership is %r (crl_management_mode = awscc): this object is "
-                  "managed by awscc_rolesanywhere_crl. Re-apply Terraform to refresh "
-                  "it instead of invoking this function."
-                  % os.environ.get("CRL_OWNER"))
+                  "TRUST_ANCHOR_ARN is empty: the module did not wire the trust anchor")
 
           ssm = boto3.client("ssm")
           kms = boto3.client("kms")
@@ -481,7 +472,7 @@ data "aws_iam_policy_document" "crl_issuer" {
   statement {
     sid       = "SignWithIntermediateCa"
     actions   = ["kms:Sign"]
-    resources = [var.intermediate_kms_key_arn]
+    resources = [aws_kms_key.intermediate_ca.arn]
 
     condition {
       test     = "StringEquals"
@@ -489,7 +480,7 @@ data "aws_iam_policy_document" "crl_issuer" {
       values   = ["DIGEST"]
     }
 
-    # The ceremony stack's key policy already pins the single algorithm for the
+    # This module's key policy already pins the single algorithm for the
     # key spec; this keeps the identity policy from widening it to RSA.
     condition {
       test     = "StringLike"
@@ -501,7 +492,7 @@ data "aws_iam_policy_document" "crl_issuer" {
   statement {
     sid       = "ReadIntermediateCaKey"
     actions   = ["kms:GetPublicKey", "kms:DescribeKey"]
-    resources = [var.intermediate_kms_key_arn]
+    resources = [aws_kms_key.intermediate_ca.arn]
   }
 
   statement {
@@ -557,12 +548,11 @@ resource "aws_lambda_function" "crl_issuer" {
     variables = {
       TRUST_ANCHOR_ARN   = aws_rolesanywhere_trust_anchor.this.arn
       ISSUER_CERT_PARAM  = local.ssm_intermediate_ca_pem
-      KMS_KEY_ARN        = var.intermediate_kms_key_arn
+      KMS_KEY_ARN        = aws_kms_key.intermediate_ca.arn
       REVOCATIONS_S3_URI = "s3://${aws_s3_bucket.artifacts.id}/${var.revocations_s3_key}"
       CRL_OUTPUT_PREFIX  = "s3://${aws_s3_bucket.artifacts.id}/crl"
       CRL_VALIDITY_DAYS  = tostring(var.crl_validity_days)
       CRL_NAME_PREFIX    = "${var.name}-crl"
-      CRL_OWNER          = var.crl_management_mode
       LOG_LEVEL          = "INFO"
     }
   }
@@ -577,11 +567,13 @@ resource "aws_lambda_function" "crl_issuer" {
 
 ###############################################################################
 # Daily refresh
+#
+# The Lambda is the only owner of the CRL object, so this always exists: a CRL
+# whose nextUpdate has passed rejects every certificate, which is worse than no
+# CRL at all. The ceremony imports the first one; this keeps it fresh.
 ###############################################################################
 
 resource "aws_cloudwatch_event_rule" "crl_refresh" {
-  count = var.crl_management_mode == "lambda" ? 1 : 0
-
   name                = "${var.name}-crl-refresh"
   description         = "Refresh the IAM Roles Anywhere CRL every 24 hours"
   schedule_expression = "rate(24 hours)"
@@ -589,9 +581,7 @@ resource "aws_cloudwatch_event_rule" "crl_refresh" {
 }
 
 resource "aws_cloudwatch_event_target" "crl_refresh" {
-  count = var.crl_management_mode == "lambda" ? 1 : 0
-
-  rule      = aws_cloudwatch_event_rule.crl_refresh[0].name
+  rule      = aws_cloudwatch_event_rule.crl_refresh.name
   target_id = "crl-issuer"
   arn       = aws_lambda_function.crl_issuer.arn
 
@@ -599,11 +589,9 @@ resource "aws_cloudwatch_event_target" "crl_refresh" {
 }
 
 resource "aws_lambda_permission" "crl_refresh" {
-  count = var.crl_management_mode == "lambda" ? 1 : 0
-
   statement_id  = "AllowEventBridgeCrlRefresh"
   action        = "lambda:InvokeFunction"
   function_name = aws_lambda_function.crl_issuer.function_name
   principal     = "events.amazonaws.com"
-  source_arn    = aws_cloudwatch_event_rule.crl_refresh[0].arn
+  source_arn    = aws_cloudwatch_event_rule.crl_refresh.arn
 }

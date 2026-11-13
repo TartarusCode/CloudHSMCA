@@ -1,5 +1,5 @@
 {
-  "Comment": "CloudHSM Root CA ceremony for IAM Roles Anywhere. BOOTSTRAP creates the non-exportable Root key and signs the Intermediate; ROTATE_INTERMEDIATE restores the cluster backup and re-signs only the Intermediate. Every failure path deletes the HSM, terminates the host, and re-raises the original cause.",
+  "Comment": "CloudHSM Root CA ceremony for IAM Roles Anywhere. BOOTSTRAP creates the non-exportable Root key and signs the Intermediate; ROTATE_INTERMEDIATE restores the cluster backup and re-signs only the Intermediate. The success path then installs the published chain into the trust anchor, enables it, and imports the first CRL. Every failure path deletes the HSM, terminates the host, and re-raises the original cause.",
   "StartAt": "InitializeRun",
   "TimeoutSeconds": 21600,
   "States": {
@@ -645,7 +645,7 @@
               "IsPresent": true
             }
           ],
-          "Next": "TerminateHostAfterSuccess"
+          "Next": "ReadCaBundle"
         }
       ],
       "Default": "GuardBackupPolls"
@@ -672,6 +672,106 @@
         "backupPoll": "States.MathAdd($.backupPoll, 1)"
       },
       "Next": "PollBackup"
+    },
+    "ReadCaBundle": {
+      "Type": "Task",
+      "Comment": "Fetch the chain the ceremony just published, so the trust anchor can be given the real bundle.",
+      "Resource": "arn:aws:states:::aws-sdk:ssm:getParameter",
+      "Parameters": {
+        "Name": "${ssm_ca_bundle_pem}"
+      },
+      "ResultSelector": {
+        "caBundlePem.$": "$.Parameter.Value"
+      },
+      "ResultPath": "$.bundle",
+      "Retry": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "IntervalSeconds": 5,
+          "MaxAttempts": 6,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "CleanupHsmOnFailure"
+        }
+      ],
+      "Next": "UpdateTrustAnchor"
+    },
+    "UpdateTrustAnchor": {
+      "Type": "Task",
+      "Comment": "Install the real Root + Intermediate chain, replacing the placeholder Terraform created so the first apply would not have to wait for this run.",
+      "Resource": "arn:aws:states:::aws-sdk:rolesanywhere:updateTrustAnchor",
+      "Parameters": {
+        "TrustAnchorId": "${trust_anchor_id}",
+        "Source": {
+          "SourceType": "CERTIFICATE_BUNDLE",
+          "SourceData": {
+            "X509CertificateData.$": "$.bundle.caBundlePem"
+          }
+        }
+      },
+      "ResultPath": "$.trustAnchor",
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "CleanupHsmOnFailure"
+        }
+      ],
+      "Next": "EnableTrustAnchor"
+    },
+    "EnableTrustAnchor": {
+      "Type": "Task",
+      "Comment": "Only now may workloads authenticate: the anchor is created DISABLED and Terraform never re-enables it (ignore_changes).",
+      "Resource": "arn:aws:states:::aws-sdk:rolesanywhere:enableTrustAnchor",
+      "Parameters": {
+        "TrustAnchorId": "${trust_anchor_id}"
+      },
+      "ResultPath": "$.trustAnchorEnabled",
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "CleanupHsmOnFailure"
+        }
+      ],
+      "Next": "ImportOrUpdateCrl"
+    },
+    "ImportOrUpdateCrl": {
+      "Type": "Task",
+      "Comment": "Sign and import the initial CRL: an enabled trust anchor with no CRL rejects every certificate it should accept.",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${crl_function_name}",
+        "Payload": {
+          "reason": "ceremony-activation"
+        }
+      },
+      "ResultSelector": {
+        "ok.$": "$.Payload.ok",
+        "crlId.$": "$.Payload.crlId"
+      },
+      "ResultPath": "$.crl",
+      "Retry": [
+        {
+          "ErrorEquals": ["Lambda.ServiceException", "Lambda.TooManyRequestsException", "States.TaskFailed"],
+          "IntervalSeconds": 10,
+          "MaxAttempts": 3,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "CleanupHsmOnFailure"
+        }
+      ],
+      "Next": "TerminateHostAfterSuccess"
     },
     "TerminateHostAfterSuccess": {
       "Type": "Task",

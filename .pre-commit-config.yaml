@@ -27,8 +27,8 @@ repos:
   - repo: local
     hooks:
       - id: offline-harnesses
-        name: offline harnesses (module and ceremony suites)
-        entry: bash -c 'bash modules/roles-anywhere/tests/run-all.sh && bash modules/pki-ceremony/tests/run-all.sh'
+        name: offline harnesses (module, lambda, crypto, ceremony, asl)
+        entry: bash tests/run-all.sh
         language: system
         pass_filenames: false
         files: '\.(tf|tftpl|py|sh)$'

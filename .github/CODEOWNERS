@@ -4,8 +4,8 @@
 # The certificate profiles, the CA tooling and the ceremony are the highest-risk
 # files: the extensions there decide who can obtain AWS credentials, and the KMS
 # key policy decides who can sign with the Intermediate.
-/modules/pki-ceremony/scripts/ @BGarber42
-/modules/pki-ceremony/main.tf @BGarber42
-/modules/pki-ceremony/statemachine.asl.json.tftpl @BGarber42
-/modules/roles-anywhere/roles_anywhere.tf @BGarber42
-/modules/roles-anywhere/crl_issuer_lambda.tf @BGarber42
+/scripts/ @BGarber42
+/ceremony.tf @BGarber42
+/statemachine.asl.json.tftpl @BGarber42
+/roles_anywhere.tf @BGarber42
+/crl_issuer_lambda.tf @BGarber42
