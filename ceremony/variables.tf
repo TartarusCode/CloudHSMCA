@@ -70,7 +70,7 @@ variable "kms_deletion_window_in_days" {
 }
 
 variable "additional_signer_principal_arns" {
-  description = "Extra IAM principals (e.g. your issuance pipeline role) allowed to Sign with the Intermediate CA key under the digest-only conditions."
+  description = "Extra IAM principals (e.g. your issuance pipeline role) matched by `aws:PrincipalArn` in the Intermediate CA key policy for digest-only kms:Sign. Each still needs its own identity-policy grant."
   type        = list(string)
   default     = []
 }

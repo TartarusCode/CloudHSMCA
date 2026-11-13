@@ -474,6 +474,36 @@ data "aws_iam_policy_document" "crl_issuer" {
     }
   }
 
+  # The key policy names this role by aws:PrincipalArn condition and delegates
+  # to the account root, so the signer also needs an identity grant, and it must
+  # be split: `kms:MessageType`/`kms:SigningAlgorithm` do not exist on a
+  # GetPublicKey request, so a shared statement would deny the read.
+  statement {
+    sid       = "SignWithIntermediateCa"
+    actions   = ["kms:Sign"]
+    resources = [var.intermediate_kms_key_arn]
+
+    condition {
+      test     = "StringEquals"
+      variable = "kms:MessageType"
+      values   = ["DIGEST"]
+    }
+
+    # The ceremony stack's key policy already pins the single algorithm for the
+    # key spec; this keeps the identity policy from widening it to RSA.
+    condition {
+      test     = "StringLike"
+      variable = "kms:SigningAlgorithm"
+      values   = ["ECDSA_SHA_*"]
+    }
+  }
+
+  statement {
+    sid       = "ReadIntermediateCaKey"
+    actions   = ["kms:GetPublicKey", "kms:DescribeKey"]
+    resources = [var.intermediate_kms_key_arn]
+  }
+
   statement {
     sid       = "ReadRevocations"
     actions   = ["s3:GetObject"]

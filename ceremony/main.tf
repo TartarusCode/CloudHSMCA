@@ -117,11 +117,11 @@ locals {
     ECC_NIST_P521 = "ECDSA_SHA_512"
   }[var.intermediate_key_spec]
 
-  # The runtime module names its CRL role deterministically, so the key policy
-  # can grant it without an apply-order dependency between the two stacks.
+  # Both roles exist only in the account, not necessarily at key-creation time,
+  # so the key policy names them by `aws:PrincipalArn` condition (see below).
   runtime_crl_role_arn = "arn:${local.partition}:iam::${local.account_id}:role/${var.name}-crl-issuer"
 
-  ca_key_principals = compact(concat(
+  ca_key_principal_arns = compact(concat(
     [aws_iam_role.ceremony_host.arn, local.runtime_crl_role_arn],
     var.additional_signer_principal_arns,
   ))
@@ -479,8 +479,34 @@ data "aws_iam_policy_document" "ceremony_host" {
     }
   }
 
+  # The key policy delegates to the account root under an aws:PrincipalArn
+  # condition, so signing also needs this identity grant. Both are required:
+  # the key policy cannot grant anything the identity policy does not allow
+  # once the principal is the account rather than this role.
+  #
+  # Split in two: `kms:MessageType` and `kms:SigningAlgorithm` do not exist on a
+  # GetPublicKey request, so one statement carrying them for both actions would
+  # deny the read outright.
   statement {
-    sid       = "IntermediateKeyUsage"
+    sid       = "SignIntermediateKey"
+    actions   = ["kms:Sign"]
+    resources = [aws_kms_key.intermediate_ca.arn]
+
+    condition {
+      test     = "StringEquals"
+      variable = "kms:MessageType"
+      values   = ["DIGEST"]
+    }
+
+    condition {
+      test     = "StringEquals"
+      variable = "kms:SigningAlgorithm"
+      values   = [local.ca_signing_algorithm]
+    }
+  }
+
+  statement {
+    sid       = "ReadIntermediateKey"
     actions   = ["kms:GetPublicKey", "kms:DescribeKey"]
     resources = [aws_kms_key.intermediate_ca.arn]
   }
@@ -509,9 +535,11 @@ resource "aws_iam_instance_profile" "ceremony_host" {
 #
 # The ceremony stack creates it, so the "foundation" is one apply: the workflow
 # needs GetPublicKey + Sign to build the Intermediate CSR, and the runtime
-# module needs Sign for CRLs and leaf issuance. The policy grants both, naming
-# the runtime module's role deterministically (<name>-crl-issuer), so neither
-# stack has to be applied before the other.
+# module needs Sign for CRLs and leaf issuance. The policy matches both by
+# `aws:PrincipalArn` under the account-root principal — the runtime module's
+# <name>-crl-issuer may not exist yet, and KMS refuses (or rewrites) role
+# principals it cannot resolve. Because that delegates to IAM, each signer also
+# carries an identity-policy grant with the same digest-only conditions.
 ###############################################################################
 
 data "aws_iam_policy_document" "intermediate_ca_key" {
@@ -528,6 +556,17 @@ data "aws_iam_policy_document" "intermediate_ca_key" {
 
   # Signing is restricted to raw-digest requests with the single algorithm that
   # matches the key spec, so this key cannot be repurposed as a general signer.
+  #
+  # The principals are named by an `aws:PrincipalArn` condition rather than by
+  # listing the role ARNs in `Principal`, for two reasons that both bite on the
+  # first apply:
+  #   * KMS resolves principals when the policy is written, so a role that does
+  #     not exist yet (the runtime module's <name>-crl-issuer, which may be
+  #     applied later) fails the apply with MalformedPolicyDocumentException.
+  #   * KMS rewrites a role principal ARN to its principal ID (AROA…), so the
+  #     stored policy stops matching the role ARN and every plan shows a diff.
+  # With the account root as the principal and the role ARNs in a condition, the
+  # policy is written unchanged and the role is matched when it is used.
   statement {
     sid       = "CaSignDigestOnly"
     actions   = ["kms:Sign"]
@@ -535,7 +574,13 @@ data "aws_iam_policy_document" "intermediate_ca_key" {
 
     principals {
       type        = "AWS"
-      identifiers = local.ca_key_principals
+      identifiers = ["arn:${local.partition}:iam::${local.account_id}:root"]
+    }
+
+    condition {
+      test     = "ArnEquals"
+      variable = "aws:PrincipalArn"
+      values   = local.ca_key_principal_arns
     }
 
     condition {
@@ -561,7 +606,13 @@ data "aws_iam_policy_document" "intermediate_ca_key" {
 
     principals {
       type        = "AWS"
-      identifiers = local.ca_key_principals
+      identifiers = ["arn:${local.partition}:iam::${local.account_id}:root"]
+    }
+
+    condition {
+      test     = "ArnEquals"
+      variable = "aws:PrincipalArn"
+      values   = local.ca_key_principal_arns
     }
   }
 }
