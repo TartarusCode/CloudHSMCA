@@ -94,6 +94,9 @@ jobs:
             bash -n "$f"
           done
 
+      - name: terraform init (the ceremony harness renders the template with it)
+        run: terraform -chdir="$MODULE" init -backend=false -input=false -no-color
+
       - name: offline harnesses
         run: bash "$MODULE/tests/run-all.sh"
 

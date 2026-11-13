@@ -7,6 +7,11 @@ credentials: `tests/run-all.sh` is the whole suite and what CI runs.
 make test          # or: tests/run-all.sh
 ```
 
+`tests/ceremony` renders the template with `terraform console`, which loads the
+module configuration, so the module's providers must be installed; the harness
+runs `terraform init -backend=false` itself when `.terraform/providers` is
+missing. Nothing else needs Terraform.
+
 What each one actually proves, and what it explicitly does not:
 
 ## `crypto/test_kms_ca_tool.sh`

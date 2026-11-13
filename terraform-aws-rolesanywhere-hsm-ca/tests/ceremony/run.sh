@@ -29,6 +29,14 @@ trap 'rm -rf "$HARNESS"' EXIT
 echo "module: $MODULE"
 echo "work:   $HARNESS"
 
+# `terraform console` loads the module configuration, so its providers must be
+# installed before the template can be rendered. Self-heal rather than making
+# the operator remember: CI and a fresh clone both start with no .terraform.
+if [ ! -d "$MODULE/.terraform/providers" ]; then
+  echo "initialising $MODULE (providers are needed to render the template)"
+  terraform -chdir="$MODULE" init -backend=false -input=false -no-color >/dev/null
+fi
+
 # --- stubs ------------------------------------------------------------------
 for tool in dnf curl systemctl configure-cli; do
   cat > "$HARNESS/fakebin/$tool" <<EOF

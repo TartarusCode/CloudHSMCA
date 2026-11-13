@@ -45,7 +45,7 @@ docs: ## Regenerate the module's input/output tables (needs terraform-docs)
 	  echo "terraform-docs not installed: https://terraform-docs.io"; exit 1; }
 	terraform-docs markdown table --output-file README.md --output-mode inject $(MODULE)
 
-test: ## Run the offline harnesses (no AWS account needed)
+test: init ## Run the offline harnesses (no AWS account needed)
 	bash $(MODULE)/tests/run-all.sh
 
 check: fmt-check validate lint test ## Everything CI runs
