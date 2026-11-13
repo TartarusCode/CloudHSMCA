@@ -35,7 +35,7 @@ jobs:
           terraform_version: ${{ env.TF_VERSION }}
           terraform_wrapper: false
 
-      - uses: actions/cache@v4
+      - uses: actions/cache@v6
         with:
           path: ${{ env.TF_PLUGIN_CACHE_DIR }}
           key: tf-providers-${{ runner.os }}-${{ env.TF_VERSION }}-${{ hashFiles('**/.terraform.lock.hcl') }}
@@ -73,7 +73,7 @@ jobs:
         with:
           python-version: "3.11"
 
-      - uses: actions/cache@v4
+      - uses: actions/cache@v6
         with:
           path: ${{ env.TF_PLUGIN_CACHE_DIR }}
           key: tf-providers-${{ runner.os }}-${{ env.TF_VERSION }}-${{ hashFiles('**/.terraform.lock.hcl') }}
