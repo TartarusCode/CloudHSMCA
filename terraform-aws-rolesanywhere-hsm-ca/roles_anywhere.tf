@@ -11,12 +11,22 @@
 # --------------------
 # hashicorp/aws has NO `aws_rolesanywhere_crl` resource: the verified provider
 # schemas for both 5.100.0 and 6.73.0 expose only aws_rolesanywhere_profile and
-# aws_rolesanywhere_trust_anchor, and a resource block for a non-existent type
-# fails validation. CRLs are therefore created through the Roles Anywhere
-# ImportCrl API, which is exactly what the Lambda in crl_issuer_lambda.tf does
-# (raw DER bytes, no PEM/base64 ambiguity). The one-shot `terraform_data`
-# below runs the same Lambda at apply time so a CRL exists before the first
-# certificate is presented; every subsequent refresh is the daily schedule.
+# aws_rolesanywhere_trust_anchor. The CRL resource lives in the **AWSCC**
+# provider (`awscc_rolesanywhere_crl`), which wraps AWS::RolesAnywhere::CRL.
+#
+# Exactly one actor owns the CRL object; two overlapping owners leave an enabled
+# CRL whose nextUpdate expires while a newer one also exists:
+#
+#   crl_management_mode = "awscc"  (default)
+#     awscc_rolesanywhere_crl manages it from var.crl_pem_path. ImportCrl takes
+#     PEM ("a CRL must be in PEM format"), which is why CrlData is a CFN String
+#     and why this module feeds it a PEM file rather than raw DER.
+#     Rotation = regenerate crl.pem + `terraform apply` (CI job).
+#
+#   crl_management_mode = "lambda"
+#     The scheduled Lambda imports a fresh CRL every 24 hours through
+#     rolesanywhere:ImportCrl; Terraform keeps no CRL state. The Lambda refuses
+#     to run when awscc owns the CRL, so a stray invoke cannot fork the object.
 ###############################################################################
 
 locals {
@@ -25,6 +35,10 @@ locals {
   workload_profiles = var.ceremony_mode ? {} : var.workload_profiles
 
   trust_anchor_bundle = local.phase2 ? data.aws_ssm_parameter.ca_bundle[0].value : ""
+
+  crl_owned_by_awscc = local.phase2 && var.crl_management_mode == "awscc"
+
+  crl_pem = local.crl_owned_by_awscc && var.crl_pem_path != "" && fileexists(var.crl_pem_path) ? file(var.crl_pem_path) : ""
 }
 
 data "aws_ssm_parameter" "ca_bundle" {
@@ -163,15 +177,48 @@ resource "aws_rolesanywhere_profile" "this" {
 }
 
 ###############################################################################
-# One-shot CRL bootstrap
+# CRL object — declarative (awscc)
+###############################################################################
+
+resource "awscc_rolesanywhere_crl" "this" {
+  count = local.crl_owned_by_awscc ? 1 : 0
+
+  name             = "${var.name}-crl"
+  trust_anchor_arn = aws_rolesanywhere_trust_anchor.this[0].arn
+  enabled          = true
+  crl_data         = trimspace(local.crl_pem)
+
+  depends_on = [aws_rolesanywhere_trust_anchor.this]
+
+  lifecycle {
+    precondition {
+      condition     = can(regex("-----BEGIN X509 CRL-----", local.crl_pem))
+      error_message = <<-EOT
+        crl_management_mode is "awscc" but no PEM CRL was supplied
+        (var.crl_pem_path = "${var.crl_pem_path}"). Roles Anywhere accepts a CRL
+        only in PEM format and Terraform cannot sign one, so produce it first:
+
+          python3 scripts/kms_ca_tool.py generate-crl --signer kms \
+            --kms-key-id ${aws_kms_key.intermediate_ca.arn} \
+            --issuer-cert intermediate_ca.pem \
+            --revoked-file revoked.json --out crl.pem
+
+        or set crl_management_mode = "lambda" to let the scheduled Lambda own it.
+      EOT
+    }
+  }
+}
+
+###############################################################################
+# CRL object — scheduled import (lambda)
 #
-# Purely so that the first `aws_s3` / API call from a workload does not fail on
+# One-shot bootstrap so the first request from a workload does not fail on
 # "no CRL in trust anchor". Idempotent by trigger: it re-runs only when
 # var.crl_bootstrap_generation is bumped or the trust anchor is replaced.
 ###############################################################################
 
 resource "terraform_data" "bootstrap_crl" {
-  count = local.phase2 && var.auto_bootstrap_crl ? 1 : 0
+  count = local.phase2 && var.crl_management_mode == "lambda" && var.auto_bootstrap_crl ? 1 : 0
 
   triggers_replace = [
     var.crl_bootstrap_generation,

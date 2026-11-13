@@ -2,16 +2,19 @@
 # Automated CRL refresh
 #
 #   EventBridge rule  rate(24 hours)  ->  Lambda
-#   Lambda            build TBSCertList, kms.sign(DIGEST), ImportCrl (DER)
+#   Lambda            build TBSCertList, kms.sign(DIGEST), ImportCrl (PEM)
 #
-# Why a Lambda and not a resource: hashicorp/aws has no aws_rolesanywhere_crl
-# (verified against the 5.100.0 and 6.73.0 provider schemas), and Roles Anywhere
-# only ingests CRLs through the ImportCrl API with a DER blob. Doing it here
-# keeps the CRL a first-class scheduled artifact instead of a manual step.
+# hashicorp/aws has no CRL resource (5.x and 6.x schemas checked); the
+# declarative route is awscc_rolesanywhere_crl, used when
+# crl_management_mode = "awscc" (see roles_anywhere.tf). This Lambda is the
+# hands-off route: crl_management_mode = "lambda", no Terraform CRL state.
+# It refuses to import when awscc owns the object, so the two paths cannot fork
+# into two enabled CRLs with different nextUpdate values.
 #
 # The handler is stdlib-only on purpose (the Python runtime has no
-# `cryptography`): DER is encoded by hand, and after ImportCrl the stored bytes
-# are read back with GetCrl and compared to what was signed.
+# `cryptography`): DER is encoded by hand, the signature is over the DER
+# TBSCertList, and the API gets PEM as documented. After ImportCrl the stored
+# bytes are read back with GetCrl and compared to what was signed.
 ###############################################################################
 
 locals {
@@ -29,8 +32,11 @@ data "archive_file" "crl_issuer" {
       IAM Roles Anywhere CRL issuer.
 
       Builds an X.509 v2 Certificate Revocation List for the KMS-backed Intermediate
-      CA, signs the TBSCertList with kms.sign(MessageType='DIGEST'), and imports the
-      DER into the trust anchor with rolesanywhere:ImportCrl.
+      CA, signs the TBSCertList with kms.sign(MessageType='DIGEST'), and imports it
+      into the trust anchor with rolesanywhere:ImportCrl. The signature is over DER,
+      which is what X.509 mandates; the ImportCrl API itself takes the CRL **in PEM**
+      (API reference: "a CRL must be in PEM format"), so the DER is wrapped before it
+      is sent.
 
       Deliberately stdlib-only: the Lambda runtime does not ship `cryptography`, so
       the DER for TBSCertList is encoded (and the issuer name / authority key
@@ -170,10 +176,22 @@ data "archive_file" "crl_issuer" {
 
 
       def pem_to_der(pem):
+          if isinstance(pem, bytes):
+              pem = pem.decode("ascii", "replace")
           body = "".join(
               line for line in pem.strip().splitlines() if "-----" not in line
           )
           return base64.b64decode(body)
+
+
+      def as_der(blob):
+          """ImportCrl/GetCrl speak PEM; accept either form and compare DER."""
+          if isinstance(blob, str):
+              blob = blob.encode("ascii", "replace")
+          stripped = blob.lstrip()
+          if stripped.startswith(b"-----BEGIN"):
+              return pem_to_der(stripped)
+          return blob
 
 
       # --------------------------------------------------------------------------- #
@@ -311,6 +329,12 @@ data "archive_file" "crl_issuer" {
           if not trust_anchor_arn:
               raise RuntimeError(
                   "TRUST_ANCHOR_ARN is empty: the module is still in ceremony mode")
+          if os.environ.get("CRL_OWNER", "lambda") != "lambda":
+              raise RuntimeError(
+                  "CRL ownership is %r (crl_management_mode = awscc): this object is "
+                  "managed by awscc_rolesanywhere_crl. Re-apply Terraform to refresh "
+                  "it instead of invoking this function."
+                  % os.environ.get("CRL_OWNER"))
 
           ssm = boto3.client("ssm")
           kms = boto3.client("kms")
@@ -345,20 +369,22 @@ data "archive_file" "crl_issuer" {
                         + der_tlv(TAG_CONTEXT_0, der_tlv(TAG_SEQUENCE, extensions)))
 
           crl_der = sign_crl(kms, key_arn, tbs, sig_alg_name)
+          crl_pem = pem_wrap(crl_der, "X509 CRL")
           digest_sha256 = hashlib.sha256(crl_der).hexdigest()
 
           name = "%s-%s" % (name_prefix, now.strftime("%Y%m%dT%H%M%SZ"))
           imported = rolesanywhere.import_crl(
               name=name,
-              crlData=crl_der,          # DER bytes; botocore base64-encodes the blob
+              # Documented format for ImportCrl: "a CRL must be in PEM format".
+              crlData=crl_pem.encode("ascii"),
               trustAnchorArn=trust_anchor_arn,
               enabled=True,
           )["crl"]
           crl_id = imported["crlId"]
 
-          # Prove the round trip: AWS must return exactly the bytes we signed.
+          # Prove the round trip: AWS must return exactly the CRL we signed.
           stored = rolesanywhere.get_crl(crlId=crl_id)["crl"]
-          stored_sha256 = hashlib.sha256(base64.b64decode(stored["crlData"])).hexdigest()
+          stored_sha256 = hashlib.sha256(as_der(stored["crlData"])).hexdigest()
           if stored_sha256 != digest_sha256:
               raise RuntimeError(
                   "stored CRL digest %s does not match the signed digest %s"
@@ -372,9 +398,11 @@ data "archive_file" "crl_issuer" {
               s3.put_object(Bucket=parsed.netloc, Key="%s/%s.der" % (base, name),
                             Body=crl_der, ContentType="application/pkix-crl")
               s3.put_object(Bucket=parsed.netloc, Key="%s/%s.pem" % (base, name),
-                            Body=pem_wrap(crl_der, "X509 CRL").encode("ascii"))
+                            Body=crl_pem.encode("ascii"))
               s3.put_object(Bucket=parsed.netloc, Key="%s/latest.der" % base,
                             Body=crl_der, ContentType="application/pkix-crl")
+              s3.put_object(Bucket=parsed.netloc, Key="%s/latest.pem" % base,
+                            Body=crl_pem.encode("ascii"))
 
           LOG.info("imported CRL %s (%s) revoked=%d next_update=%s sha256=%s",
                    crl_id, name, len(revoked), next_update.isoformat(), digest_sha256)
@@ -501,6 +529,7 @@ resource "aws_lambda_function" "crl_issuer" {
       CRL_OUTPUT_PREFIX  = "s3://${aws_s3_bucket.artifacts.id}/crl"
       CRL_VALIDITY_DAYS  = tostring(var.crl_validity_days)
       CRL_NAME_PREFIX    = "${var.name}-crl"
+      CRL_OWNER          = var.crl_management_mode
       LOG_LEVEL          = "INFO"
     }
   }
@@ -518,7 +547,7 @@ resource "aws_lambda_function" "crl_issuer" {
 ###############################################################################
 
 resource "aws_cloudwatch_event_rule" "crl_refresh" {
-  count = local.phase2 ? 1 : 0
+  count = local.phase2 && var.crl_management_mode == "lambda" ? 1 : 0
 
   name                = "${var.name}-crl-refresh"
   description         = "Refresh the IAM Roles Anywhere CRL every 24 hours"
@@ -527,7 +556,7 @@ resource "aws_cloudwatch_event_rule" "crl_refresh" {
 }
 
 resource "aws_cloudwatch_event_target" "crl_refresh" {
-  count = local.phase2 ? 1 : 0
+  count = local.phase2 && var.crl_management_mode == "lambda" ? 1 : 0
 
   rule      = aws_cloudwatch_event_rule.crl_refresh[0].name
   target_id = "crl-issuer"
@@ -537,7 +566,7 @@ resource "aws_cloudwatch_event_target" "crl_refresh" {
 }
 
 resource "aws_lambda_permission" "crl_refresh" {
-  count = local.phase2 ? 1 : 0
+  count = local.phase2 && var.crl_management_mode == "lambda" ? 1 : 0
 
   statement_id  = "AllowEventBridgeCrlRefresh"
   action        = "lambda:InvokeFunction"

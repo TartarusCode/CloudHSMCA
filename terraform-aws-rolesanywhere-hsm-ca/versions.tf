@@ -14,6 +14,13 @@ terraform {
       source  = "hashicorp/archive"
       version = ">= 2.4.0" # source { content = ... } for the CRL Lambda
     }
+    # awscc_rolesanywhere_crl is the ONLY Terraform resource that can manage an
+    # IAM Roles Anywhere CRL: hashicorp/aws exposes just the profile and the
+    # trust anchor in 5.x and 6.x (both schemas checked).
+    awscc = {
+      source  = "hashicorp/awscc"
+      version = ">= 1.0.0"
+    }
     random = {
       source  = "hashicorp/random"
       version = ">= 3.5.0"

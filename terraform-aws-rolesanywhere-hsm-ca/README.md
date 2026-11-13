@@ -32,8 +32,8 @@ versions.tf               Terraform/provider constraints
 variables.tf              inputs (ceremony_mode, subjects, workload_profiles, ...)
 main.tf                   KMS Intermediate key, S3 artifact bucket, SSM hand-over, backup guard
 ceremony_hsm.tf           CloudHSM cluster/HSM, ceremony host + IAM, rendered profile uploads
-roles_anywhere.tf         trust anchor, workload roles, profiles, CRL bootstrap
-crl_issuer_lambda.tf      EventBridge 24h schedule + Lambda that signs/imports the CRL
+roles_anywhere.tf         trust anchor, workload roles, profiles, awscc CRL (or Lambda-owned CRL)
+crl_issuer_lambda.tf      24h EventBridge schedule + Lambda that signs/imports the CRL
 outputs.tf                trust_anchor_arn, profile_arns, ceremony_ssm_connect_command, ...
 scripts/kms_ca_tool.py    all X.509 construction: CSR, certificates, CRL (KMS | CloudHSM | local)
 scripts/hsm_ceremony.sh.tftpl   cloud-init ceremony orchestration (Amazon Linux 2023)
@@ -141,22 +141,44 @@ aws_signing_helper credential-process \
 ```bash
 echo '{"revoked":[{"serial":"0x1f2e…","reason":"key_compromise"}]}' \
   | aws s3 cp - s3://<artifact bucket>/revocations/revoked.json
-aws lambda invoke --function-name <crl_issuer_function_name> \
+
+# crl_management_mode = "awscc"  (default): regenerate and re-apply
+python3 scripts/kms_ca_tool.py generate-crl --signer kms \
+  --kms-key-id "$(terraform output -raw intermediate_kms_key_arn)" \
+  --issuer-cert intermediate_ca.pem --revoked-file revoked.json \
+  --days 7 --out crl.pem
+terraform apply -var 'crl_pem_path=crl.pem'
+
+# crl_management_mode = "lambda": invoke now instead of waiting for the schedule
+aws lambda invoke --function-name "$(terraform output -raw crl_issuer_function_name)" \
   --payload '{"reason":"manual"}' out.json && cat out.json
 ```
 
-The same Lambda runs every 24 hours; it rebuilds the CRL from that JSON, signs it
-with the KMS Intermediate CA, imports the DER, then reads the stored CRL back and
-compares SHA-256 with what it signed.
+In `lambda` mode the same Lambda runs every 24 hours; it rebuilds the CRL from
+that JSON, signs it with the KMS Intermediate CA, imports it as PEM, then reads
+the stored CRL back and compares SHA-256 with what it signed. In `awscc` mode the
+CRL is a tracked resource, so a stale `crl.pem` shows up in `terraform plan`
+rather than silently expiring.
 
 ## Design notes worth reading before you change anything
 
-**`aws_rolesanywhere_crl` does not exist.** Verified against the provider schemas
-of `hashicorp/aws` **5.100.0** and **6.73.0**: only `aws_rolesanywhere_profile`
-and `aws_rolesanywhere_trust_anchor` are exposed. CRL import is an API call, so
-the module does it in the Lambda (`rolesanywhere:ImportCrl` with raw DER) and
-bootstraps it once through `terraform_data`. Do not "fix" this by adding a
-resource block — `terraform validate` rejects it.
+**`aws_rolesanywhere_crl` does not exist in hashicorp/aws — `awscc_rolesanywhere_crl` does.** Verified against the provider schemas: hashicorp/aws **5.100.0** and **6.73.0** expose only `aws_rolesanywhere_profile` and `aws_rolesanywhere_trust_anchor`; the CRL resource is in the **AWSCC** provider (`AWS::RolesAnywhere::CRL`). The module therefore has two mutually exclusive owners, chosen by `crl_management_mode`:
+
+| mode | owner | refresh |
+|---|---|---|
+| `awscc` (default) | `awscc_rolesanywhere_crl` from `var.crl_pem_path` | regenerate the PEM + `terraform apply` |
+| `lambda` | the scheduled Lambda (`rolesanywhere:ImportCrl`) | every 24 hours, hands-off |
+
+Only one may own it: a second owner leaves an *enabled* CRL whose `nextUpdate`
+expires while a newer one also exists, and Roles Anywhere evaluates every enabled
+CRL. The Lambda refuses to import when `crl_management_mode = "awscc"`, and the
+schedule is not created at all in that mode.
+
+**ImportCrl takes PEM, not DER.** The API reference says plainly: *"In order to
+be properly imported, a CRL must be in PEM format."* That is also why `CrlData`
+is a CloudFormation `String` and can be fed from a file. The signature is still
+over the DER `TBSCertList` (X.509 requires that), so both tools produce a DER
+CRL, verify it as DER, and hand the service PEM.
 
 **`customer_master_key_spec`, not `key_spec`.** `key_spec` exists in aws 5.x but
 is absent from 6.x; `customer_master_key_spec` is accepted by both, which is what
@@ -207,8 +229,13 @@ Exercised locally (not against AWS — no cloud resources were created):
   DER CRL — every artifact verified by `openssl verify` / `openssl crl -verify`;
   tampered CSR refused; unknown extension refused; `spki-from-point` byte-identical
   to `openssl pkey -pubout -outform DER`.
-* `crl_issuer_lambda.tf` handler run against a real P-384 key: DER CRL verified by
-  `openssl crl -verify`, with the empty-revocation-set variant too.
+* `crl_issuer_lambda.tf` handler run against a real P-384 key: the DER CRL it
+  builds verifies with `openssl crl -verify`, the empty-revocation-set variant too,
+  and the blob handed to `import_crl` is asserted to be PEM; the handler refuses
+  to run when `crl_management_mode = "awscc"`.
+* `awscc_rolesanywhere_crl` is accepted by `terraform validate` against
+  `hashicorp/awscc 1.110.0`, with a precondition that fails with the exact
+  `generate-crl` command when no PEM has been supplied.
 * `hsm_ceremony.sh.tftpl`: rendered by Terraform, then executed end-to-end with
   `cloudhsm-cli`, the AWS CLI and KMS emulated (the emulated HSM really signs, in
   base64 `r||s`, exactly as SDK 5 does) — reached `COMPLETE` and the resulting

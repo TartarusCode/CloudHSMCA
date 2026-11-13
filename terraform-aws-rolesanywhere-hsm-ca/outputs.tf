@@ -81,14 +81,24 @@ output "workload_role_arns" {
   value       = { for key, role in aws_iam_role.workload : key => role.arn }
 }
 
+output "crl_id" {
+  description = "Terraform-managed CRL id (null unless crl_management_mode = \"awscc\")."
+  value       = local.crl_owned_by_awscc ? awscc_rolesanywhere_crl.this[0].crl_id : null
+}
+
+output "crl_management_mode" {
+  description = "Which actor owns the CRL object: awscc (declarative) or lambda (scheduled import)."
+  value       = var.crl_management_mode
+}
+
 output "crl_issuer_function_name" {
   description = "CRL refresh Lambda (invoke manually with `aws lambda invoke --payload '{\"reason\":\"manual\"}'`)."
   value       = aws_lambda_function.crl_issuer.function_name
 }
 
-output "crl_bootstrap_needed" {
-  description = "True when no CRL has been imported yet, i.e. workloads will be rejected until one exists."
-  value       = local.phase2 && var.auto_bootstrap_crl ? false : local.phase2
+output "crl_revoke_preconditions_met" {
+  description = "False when CRL ownership is declarative but no PEM was supplied — workloads are rejected until a CRL exists."
+  value       = !local.crl_owned_by_awscc || can(regex("-----BEGIN X509 CRL-----", local.crl_pem))
 }
 
 output "cloudhsm_backup_guard_policy_arn" {

@@ -861,9 +861,12 @@ def import_crl(args, der: bytes, crl_number: int, revoked_count: int) -> None:
 
     client = boto3.client("rolesanywhere", region_name=args.region)
     name = args.crl_name or "crl-%s" % _dt.datetime.now().strftime("%Y%m%dT%H%M%SZ")
+    persisted = x509.load_der_x509_crl(der).public_bytes(serialization.Encoding.PEM)
     resp = client.import_crl(
         name=name,
-        crlData=der,  # DER bytes; botocore base64-encodes the blob
+        # ImportCrl documents PEM as the accepted encoding ("a CRL must be in
+        # PEM format"); the signature itself is over the DER TBSCertList.
+        crlData=persisted,
         trustAnchorArn=args.trust_anchor_arn,
         enabled=True,
     )

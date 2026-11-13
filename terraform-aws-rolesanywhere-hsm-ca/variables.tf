@@ -223,6 +223,38 @@ variable "backup_guard_role_names" {
   default     = []
 }
 
+variable "crl_management_mode" {
+  description = <<-EOT
+    Who owns the CRL object. Exactly one actor may own it: an enabled CRL that
+    stops being refreshed (nextUpdate in the past) is worse than no CRL at all.
+
+    "awscc"  — awscc_rolesanywhere_crl manages it declaratively from
+               var.crl_pem_path; refresh by re-applying (see README).
+    "lambda" — the scheduled Lambda imports a new CRL every 24 hours through
+               rolesanywhere:ImportCrl; Terraform does not track CRL objects.
+  EOT
+  type        = string
+  default     = "awscc"
+
+  validation {
+    condition     = contains(["awscc", "lambda"], var.crl_management_mode)
+    error_message = "crl_management_mode must be awscc or lambda."
+  }
+}
+
+variable "crl_pem_path" {
+  description = <<-EOT
+    Path to the PEM CRL used when crl_management_mode = "awscc". Roles Anywhere
+    ImportCrl takes PEM, and Terraform cannot sign, so the CRL is produced
+    before apply with:
+      python3 scripts/kms_ca_tool.py generate-crl --signer kms \
+        --kms-key-id <arn> --issuer-cert intermediate_ca.pem \
+        --revoked-file revoked.json --out crl.pem
+  EOT
+  type        = string
+  default     = ""
+}
+
 variable "revocations_s3_key" {
   description = "S3 key (inside the artifact bucket) holding the revoked-serial JSON read by the CRL Lambda."
   type        = string
