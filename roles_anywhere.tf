@@ -39,9 +39,15 @@ resource "tls_private_key" "placeholder" {
 resource "tls_self_signed_cert" "placeholder" {
   private_key_pem = tls_private_key.placeholder.private_key_pem
 
-  is_ca_certificate     = true
-  validity_period_hours = 1
-  allowed_uses          = ["cert_signing", "crl_signing"]
+  is_ca_certificate = true
+  allowed_uses      = ["cert_signing", "crl_signing"]
+
+  # A year, not an hour. Nothing signs with this key and the anchor is created
+  # DISABLED, so its expiry has no security meaning — but a 1-hour certificate
+  # would be expired by the time AWS validates it during a delayed apply or on a
+  # host whose clock is skewed, and CreateTrustAnchor/UpdateTrustAnchor reject an
+  # expired bundle. Terraform replaces this on the anchor's replacement anyway.
+  validity_period_hours = 8760
 
   subject {
     common_name  = "${var.name} placeholder — not a certificate authority"

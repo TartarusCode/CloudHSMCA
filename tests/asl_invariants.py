@@ -187,6 +187,40 @@ def main():
     check(not unresolved, "no unresolved Terraform placeholder in the definition",
           str(unresolved))
 
+    # A list of strings is a literal: Step Functions interpolates a path only
+    # when the *key* ends in `.$`, so `"InstanceIds": ["$.host..."]` sends the
+    # text "$.host..." to EC2/SSM. That fails at run time and passes every
+    # structural check, so the shape is asserted rather than the intent.
+    def literal_paths(node, where=""):
+        hits = []
+        if isinstance(node, dict):
+            for key, value in node.items():
+                if isinstance(value, list) and any(
+                        isinstance(item, str) and item.startswith("$.") for item in value):
+                    hits.append("%s/%s" % (where, key))
+                hits += literal_paths(value, "%s/%s" % (where, key))
+        elif isinstance(node, list):
+            for index, item in enumerate(node):
+                hits += literal_paths(item, "%s[%d]" % (where, index))
+        return hits
+
+    buried = literal_paths(defn)
+    check(not buried, "no JSONPath hides inside a list (it would be sent literally)",
+          str(buried))
+
+    instance_calls = [n for n, s in states.items()
+                      if s.get("Resource", "").endswith(
+                          (":ssm:sendCommand", ":ssm:describeInstanceInformation",
+                           ":ec2:terminateInstances"))]
+    unresolved_ids = [n for n in instance_calls
+                      if "States.Array($.host.Instances[0].InstanceId)"
+                      not in json.dumps(states[n])]
+    check(bool(instance_calls), "the ceremony drives the host through EC2/SSM",
+          str(instance_calls))
+    check(not unresolved_ids,
+          "every EC2/SSM call resolves the instance id with States.Array",
+          str(unresolved_ids))
+
     fails = [n for n, s in states.items() if s.get("Type") in FAIL_TYPES]
     check(bool(fails), "the definition can fail explicitly")
     for name in fails:

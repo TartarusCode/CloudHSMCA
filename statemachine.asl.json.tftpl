@@ -342,7 +342,7 @@
         "Filters": [
           {
             "Key": "InstanceIds",
-            "Values": ["$.host.Instances[0].InstanceId"]
+            "Values.$": "States.Array($.host.Instances[0].InstanceId)"
           }
         ]
       },
@@ -414,7 +414,7 @@
       "Comment": "Initializes the cluster (cloudhsm-cli cluster activate), generates the non-exportable Root key, self-signs the Root CA and signs the Intermediate.",
       "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
       "Parameters": {
-        "InstanceIds": ["$.host.Instances[0].InstanceId"],
+        "InstanceIds.$": "States.Array($.host.Instances[0].InstanceId)",
         "DocumentName": "AWS-RunShellScript",
         "Comment": "${name} bootstrap ceremony",
         "TimeoutSeconds": 3600,
@@ -438,7 +438,7 @@
       "Comment": "Signs a new Intermediate CSR with the restored Root key. No Root generation, no re-activation.",
       "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
       "Parameters": {
-        "InstanceIds": ["$.host.Instances[0].InstanceId"],
+        "InstanceIds.$": "States.Array($.host.Instances[0].InstanceId)",
         "DocumentName": "AWS-RunShellScript",
         "Comment": "${name} intermediate rotation",
         "TimeoutSeconds": 3600,
@@ -777,7 +777,7 @@
       "Type": "Task",
       "Resource": "arn:aws:states:::aws-sdk:ec2:terminateInstances",
       "Parameters": {
-        "InstanceIds": ["$.host.Instances[0].InstanceId"]
+        "InstanceIds.$": "States.Array($.host.Instances[0].InstanceId)"
       },
       "ResultPath": "$.hostTerminated",
       "Catch": [
@@ -844,7 +844,7 @@
       "Type": "Task",
       "Resource": "arn:aws:states:::aws-sdk:ec2:terminateInstances",
       "Parameters": {
-        "InstanceIds": ["$.host.Instances[0].InstanceId"]
+        "InstanceIds.$": "States.Array($.host.Instances[0].InstanceId)"
       },
       "ResultPath": "$.cleanupHost",
       "Retry": [
