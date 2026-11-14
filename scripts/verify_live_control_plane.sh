@@ -65,6 +65,12 @@ command -v openssl >/dev/null || fail "openssl is required"
 # --------------------------------------------------------------------------- #
 log "reading outputs from $STACK_DIR"
 outputs="$(terraform -chdir="$STACK_DIR" output -json)" || fail "terraform output failed (is the stack applied?)"
+# With no state, `terraform output -json` succeeds and prints {}. Saying "nothing
+# is applied" is more useful than the first missing-output check below, which
+# would report a contract field as absent when the whole stack is.
+if [ -z "${outputs//[[:space:]]/}" ] || [ "${outputs//[[:space:]]/}" = "{}" ]; then
+  fail "nothing is applied in $STACK_DIR — run terraform apply there first"
+fi
 
 read -r CA_NAME CA_BUNDLE_PARAM ROOT_PARAM INTER_PARAM KMS_ARN TRUST_ANCHOR_ID EVENT_BUS EVENT_SOURCE DETAIL_TYPE ARTIFACT_BUCKET <<EOF
 $(python3 - "$outputs" <<'PY'
