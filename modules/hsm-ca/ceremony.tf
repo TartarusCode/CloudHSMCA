@@ -554,6 +554,9 @@ data "aws_iam_policy_document" "intermediate_ca_key" {
       "kms:TagResource",
       "kms:UntagResource",
       "kms:UpdateAlias",
+      # Not an alias: the provider calls UpdateKeyDescription when the module's
+      # name (and therefore the key description) changes.
+      "kms:UpdateKeyDescription",
     ]
     resources = ["*"]
 
