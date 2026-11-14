@@ -31,7 +31,8 @@ from cryptography.hazmat.primitives.asymmetric import ec, utils
 from cryptography.x509.oid import NameOID
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-MODULE = sys.argv[1] if len(sys.argv) > 1 else os.path.abspath(os.path.join(HERE, "..", ".."))
+MODULE = sys.argv[1] if len(sys.argv) > 1 else os.path.abspath(
+    os.path.join(HERE, "..", "..", "modules", "roles-anywhere"))
 TF_PATH = os.path.join(MODULE, "crl_issuer_lambda.tf")
 
 WORK = tempfile.mkdtemp(prefix="crl-lambda-test-")
@@ -62,26 +63,41 @@ def load_handler():
 
 
 class FakeBoto3(types.ModuleType):
-    def __init__(self, issuer_pem, sink):
+    def __init__(self, issuer_pem, sink, bundle=None):
         super().__init__("boto3")
         self.__version__ = "harness-stub"
         self._issuer_pem = issuer_pem
+        self._bundle = bundle
         self._sink = sink
 
     def client(self, name, **kwargs):
         return {
-            "ssm": _Ssm(self._issuer_pem),
+            "ssm": _Ssm(self._issuer_pem, self._bundle),
             "kms": _Kms(),
             "s3": _S3(),
             "rolesanywhere": _RolesAnywhere(self._sink),
         }[name]
 
 
+class _ParameterNotFound(Exception):
+    pass
+
+
 class _Ssm:
-    def __init__(self, pem):
+    """Serves the issuer certificate and, optionally, the published CA bundle."""
+
+    class exceptions:
+        ParameterNotFound = _ParameterNotFound
+
+    def __init__(self, pem, bundle=None):
         self._pem = pem
+        self._bundle = bundle
 
     def get_parameter(self, Name):
+        if Name.endswith("ca_bundle.pem"):
+            if self._bundle is None:
+                raise _ParameterNotFound(Name)
+            return {"Parameter": {"Value": self._bundle}}
         return {"Parameter": {"Value": self._pem}}
 
 
@@ -124,6 +140,15 @@ class _S3:
 class _RolesAnywhere:
     def __init__(self, sink):
         self._sink = sink
+
+    def update_trust_anchor(self, trustAnchorId, source):
+        self._sink["trustAnchorId"] = trustAnchorId
+        self._sink["trustAnchorSource"] = source
+        return {"trustAnchor": {"trustAnchorId": trustAnchorId}}
+
+    def enable_trust_anchor(self, trustAnchorId):
+        self._sink["enabledTrustAnchor"] = trustAnchorId
+        return {"trustAnchor": {"trustAnchorId": trustAnchorId, "enabled": True}}
 
     def import_crl(self, name, crlData, trustAnchorArn, enabled):
         self._sink["name"] = name
@@ -175,9 +200,18 @@ def main():
     sink = {}
     pem_path, cert = make_issuer(WORK)
 
-    sys.modules["boto3"] = FakeBoto3(open(pem_path).read(), sink)
+    issuer_pem = open(pem_path).read()
+    # Two certificates is the shape the real chain has (Root + Intermediate);
+    # the stub only has to be a bundle, not a verifiable one.
+    bundle_pem = issuer_pem + issuer_pem
+    fake_boto3 = FakeBoto3(issuer_pem, sink, bundle_pem)
+    sys.modules["boto3"] = fake_boto3
+
     os.environ.update({
         "TRUST_ANCHOR_ARN": "arn:aws:rolesanywhere:us-west-2:111122223333:trust-anchor/abc",
+        "TRUST_ANCHOR_ID": "6f5c0e2a-1b3d-4e5f-8a9b-0c1d2e3f4a5b",
+        "CA_BUNDLE_PARAM": "/corp-pki/pki/ca_bundle.pem",
+        "CA_EVENT_SOURCE": "cloudhsmca.pki",
         "ISSUER_CERT_PARAM": "/corp-pki/pki/intermediate_ca.pem",
         "KMS_KEY_ARN": "arn:aws:kms:us-west-2:111122223333:key/xyz",
         "REVOCATIONS_S3_URI": "s3://bucket/revocations/revoked.json",
@@ -188,8 +222,64 @@ def main():
     handler_module, source = load_handler()
     print("handler extracted from crl_issuer_lambda.tf (%d bytes)" % len(source))
 
-    result = handler_module.handler({"reason": "test"}, None)
+    # --- path A: the fan-out event (activation) ----------------------------
+    print("\n[1] CAChainPublished: install the chain, enable the anchor, import a CRL")
+    activation_event = {
+        "version": "0",
+        "source": "cloudhsmca.pki",
+        "detail-type": "CAChainPublished",
+        "detail": {"ca_name": "corp-pki",
+                   "ca_bundle_ssm_param": "/corp-pki/pki/ca_bundle.pem",
+                   "intermediate_kms_key_arn": "arn:aws:kms:us-west-2:111122223333:key/xyz"},
+        "resources": [],
+    }
+    result = handler_module.handler(activation_event, None)
     print(json.dumps(result, indent=2))
+
+    assert result.get("activated") is True, result
+    source_shape = sink.get("trustAnchorSource", {})
+    assert source_shape.get("sourceType") == "CERTIFICATE_BUNDLE", source_shape
+    installed = source_shape.get("sourceData", {}).get("x509CertificateData", "")
+    assert installed.count("BEGIN CERTIFICATE") == 2, installed[:60]
+    assert sink.get("enabledTrustAnchor") == os.environ["TRUST_ANCHOR_ID"], sink
+    print("updated trust anchor with 2 certificates and enabled it")
+
+    # --- path B: a scheduled tick before the first ceremony is a no-op ------
+    print("\n[2] scheduled tick with no published chain: skip, never import")
+    fake_boto3._bundle = None
+    sink.clear()
+    skipped = handler_module.handler({"reason": "scheduled-refresh"}, None)
+    print(json.dumps(skipped, indent=2))
+    assert skipped == {"ok": True, "skipped": "chain-not-published",
+                       "reason": "scheduled-refresh"}, skipped
+    assert "crlData" not in sink, "a CRL was imported before any chain existed"
+
+    # --- path C: a scheduled tick after publication refreshes the CRL -------
+    print("\n[3] scheduled tick with the chain published: refresh only")
+    fake_boto3._bundle = bundle_pem
+    sink.clear()
+    refreshed = handler_module.handler({"reason": "scheduled-refresh"}, None)
+    assert refreshed.get("activated") is False, refreshed
+    assert "enabledTrustAnchor" not in sink, "a refresh must not touch the anchor"
+    assert "crlData" in sink, "a refresh must import a CRL"
+    print("refreshed without touching the trust anchor")
+
+    # --- path D: an activation event with no chain is a hard failure --------
+    print("\n[4] CAChainPublished with no chain: fail loudly")
+    fake_boto3._bundle = None
+    sink.clear()
+    try:
+        handler_module.handler(activation_event, None)
+    except RuntimeError as exc:
+        assert "no usable chain" in str(exc), exc
+        print("refused to activate without a chain:", str(exc)[:70], "...")
+    else:
+        sys.exit("FAIL: activation ran with no chain to install")
+
+    # put the bundle back for the remaining assertions on the CRL itself
+    fake_boto3._bundle = bundle_pem
+    sink.clear()
+    handler_module.handler(activation_event, None)
 
     # 1. the imported blob must be PEM, because ImportCrl documents PEM
     sent = sink["crlData"]

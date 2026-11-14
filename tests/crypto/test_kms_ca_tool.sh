@@ -4,7 +4,7 @@
 # before anything is applied to AWS.
 set -euo pipefail
 
-MOD="${1:-$(cd "$(dirname "$0")/../.." && pwd)}"
+MOD="${1:-$(cd "$(dirname "$0")/../../modules/hsm-ca" && pwd)}"
 WORK="$(mktemp -d)"
 cd "$WORK"
 

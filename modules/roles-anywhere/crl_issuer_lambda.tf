@@ -1,15 +1,18 @@
 ###############################################################################
-# Automated CRL refresh
+# Activation + CRL refresh — one Lambda, two triggers
 #
-#   EventBridge rule  rate(24 hours)  ->  Lambda
-#   Lambda            build TBSCertList, kms.sign(DIGEST), ImportCrl (PEM)
+#   cloudhsmca.pki / CAChainPublished  ->  install the chain, enable the anchor,
+#                                          import the first CRL
+#   rate(24 hours)                     ->  re-sign and re-import the CRL
+#
+# It is the consumer's only coupling to the PKI engine: one event contract, one
+# shared signing key, no Terraform resource crossing the module boundary. The
+# scheduled tick on an unpublished CA is a no-op (the bundle still reads
+# PENDING-CEREMONY), and the activation tick without a bundle is a hard failure,
+# because that combination means the workflow published an event with no chain.
 #
 # hashicorp/aws has no aws_rolesanywhere_crl resource (5.x and 6.x schemas both
-# checked), so nothing in Terraform holds CRL state: the ceremony imports the
-# first CRL, and this Lambda keeps it fresh and re-imports it every 24 hours.
-#
-# The chain this Lambda revokes against is published by the ceremony; the key it
-# signs with is this module's KMS Intermediate CA key.
+# checked), so nothing in Terraform holds CRL state.
 #
 # The handler is stdlib-only on purpose (the Python runtime has no
 # `cryptography`): DER is encoded by hand, the signature is over the DER
@@ -18,7 +21,9 @@
 ###############################################################################
 
 locals {
-  crl_lambda_name = "${var.name}-crl-issuer"
+  # The rest of the shared locals (name, tags, the SSM parameter ARNs) are
+  # declared in roles_anywhere.tf; a module may only define each one once.
+  crl_lambda_name = "${local.name}-crl-issuer"
 }
 
 data "archive_file" "crl_issuer" {
@@ -44,8 +49,18 @@ data "archive_file" "crl_issuer" {
       assembled exactly once and never re-encoded, then AWS is asked for the stored
       CRL back so the byte-for-byte round trip is proved at run time.
 
+      Two entry points, one code path after the chain is available:
+
+        * an EventBridge envelope (source == CA_EVENT_SOURCE): read the chain,
+          UpdateTrustAnchor + EnableTrustAnchor, then import a CRL;
+        * a scheduled tick: if the chain is still PENDING-CEREMONY, skip; else
+          import a refreshed CRL.
+
       Environment:
-        TRUST_ANCHOR_ARN        required in steady state
+        TRUST_ANCHOR_ARN        trust anchor to activate and import against
+        TRUST_ANCHOR_ID         its id, for UpdateTrustAnchor/EnableTrustAnchor
+        CA_BUNDLE_PARAM         SSM parameter holding the published chain
+        CA_EVENT_SOURCE         event source that means "chain is ready"
         ISSUER_CERT_PARAM       SSM parameter holding the Intermediate CA PEM
         KMS_KEY_ARN             Intermediate CA key (SIGN_VERIFY)
         REVOCATIONS_S3_URI      s3://bucket/key JSON list of revoked serials
@@ -335,6 +350,45 @@ data "archive_file" "crl_issuer" {
           s3 = boto3.client("s3")
           rolesanywhere = boto3.client("rolesanywhere")
 
+          # ---- activation vs refresh --------------------------------------
+          event = event or {}
+          activation = event.get("source") == os.environ.get(
+              "CA_EVENT_SOURCE", "cloudhsmca.pki")
+          bundle_param = os.environ.get("CA_BUNDLE_PARAM", "")
+
+          bundle = None
+          if bundle_param:
+              try:
+                  bundle = ssm.get_parameter(Name=bundle_param)["Parameter"]["Value"]
+              except ssm.exceptions.ParameterNotFound:
+                  bundle = None
+          chain_ready = bool(bundle) and "BEGIN CERTIFICATE" in bundle \
+              and "PENDING-CEREMONY" not in bundle
+
+          if activation:
+              # An event without a chain means the workflow published before it
+              # wrote SSM: fail loudly, never enable an anchor without a bundle.
+              if not chain_ready:
+                  raise RuntimeError(
+                      "CAChainPublished arrived but %s holds no usable chain"
+                      % bundle_param)
+              trust_anchor_id = os.environ["TRUST_ANCHOR_ID"]
+              rolesanywhere.update_trust_anchor(
+                  trustAnchorId=trust_anchor_id,
+                  source={
+                      "sourceType": "CERTIFICATE_BUNDLE",
+                      "sourceData": {"x509CertificateData": bundle},
+                  })
+              rolesanywhere.enable_trust_anchor(trustAnchorId=trust_anchor_id)
+              LOG.info("trust anchor %s installed %d certificates and enabled",
+                       trust_anchor_id, bundle.count("BEGIN CERTIFICATE"))
+          elif bundle_param and not chain_ready:
+              # A scheduled tick before the first ceremony: nothing to revoke
+              # against yet, and an imported CRL would be useless anyway.
+              LOG.info("chain not published at %s: skipping this tick", bundle_param)
+              return {"ok": True, "skipped": "chain-not-published",
+                      "reason": event.get("reason", "scheduled")}
+
           issuer_der = pem_to_der(ssm.get_parameter(Name=issuer_param)["Parameter"]["Value"])
           subject_der, akid = issuer_identity(issuer_der)
 
@@ -403,6 +457,7 @@ data "archive_file" "crl_issuer" {
 
           return {
               "ok": True,
+              "activated": activation,
               "crlId": crl_id,
               "crlArn": imported.get("crlArn"),
               "name": name,
@@ -415,6 +470,11 @@ data "archive_file" "crl_issuer" {
       PY
   }
 }
+
+
+###############################################################################
+# The Lambda and its role
+###############################################################################
 
 resource "aws_cloudwatch_log_group" "crl_issuer" {
   name              = "/aws/lambda/${local.crl_lambda_name}"
@@ -434,8 +494,8 @@ data "aws_iam_policy_document" "crl_issuer_assume" {
 }
 
 resource "aws_iam_role" "crl_issuer" {
-  name               = "${var.name}-crl-issuer"
-  description        = "Builds and imports the Roles Anywhere CRL"
+  name               = local.crl_lambda_name
+  description        = "Activates the Roles Anywhere trust anchor and keeps its CRL fresh"
   assume_role_policy = data.aws_iam_policy_document.crl_issuer_assume.json
   tags               = local.tags
 }
@@ -447,64 +507,21 @@ data "aws_iam_policy_document" "crl_issuer" {
     resources = ["${aws_cloudwatch_log_group.crl_issuer.arn}:*"]
   }
 
+  # Both SSM reads: the published chain (activation) and the issuer certificate
+  # (every CRL, since the TBSCertList embeds the issuer name and key id).
   statement {
-    sid       = "ReadIssuerCertificate"
-    actions   = ["ssm:GetParameter", "ssm:GetParameters"]
-    resources = ["arn:${local.partition}:ssm:${local.region}:${local.account_id}:parameter${local.ssm_intermediate_ca_pem}"]
+    sid       = "ReadChainAndIssuer"
+    actions   = ["ssm:GetParameter"]
+    resources = [local.ca_bundle_param_arn, local.issuer_param_arn]
   }
 
   statement {
-    sid       = "DecryptSecureParameters"
-    actions   = ["kms:Decrypt"]
-    resources = ["*"]
-
-    condition {
-      test     = "StringEquals"
-      variable = "kms:ViaService"
-      values   = ["ssm.${local.region}.amazonaws.com"]
-    }
-  }
-
-  # The key policy names this role by aws:PrincipalArn condition and delegates
-  # to the account root, so the signer also needs an identity grant, and it must
-  # be split: `kms:MessageType`/`kms:SigningAlgorithm` do not exist on a
-  # GetPublicKey request, so a shared statement would deny the read.
-  statement {
-    sid       = "SignWithIntermediateCa"
-    actions   = ["kms:Sign"]
-    resources = [aws_kms_key.intermediate_ca.arn]
-
-    condition {
-      test     = "StringEquals"
-      variable = "kms:MessageType"
-      values   = ["DIGEST"]
-    }
-
-    # This module's key policy already pins the single algorithm for the
-    # key spec; this keeps the identity policy from widening it to RSA.
-    condition {
-      test     = "StringLike"
-      variable = "kms:SigningAlgorithm"
-      values   = ["ECDSA_SHA_*"]
-    }
-  }
-
-  statement {
-    sid       = "ReadIntermediateCaKey"
-    actions   = ["kms:GetPublicKey", "kms:DescribeKey"]
-    resources = [aws_kms_key.intermediate_ca.arn]
-  }
-
-  statement {
-    sid       = "ReadRevocations"
-    actions   = ["s3:GetObject"]
-    resources = ["${aws_s3_bucket.artifacts.arn}/${var.revocations_s3_key}", "${aws_s3_bucket.artifacts.arn}/revocations/*"]
-  }
-
-  statement {
-    sid       = "WriteCrlArtifacts"
-    actions   = ["s3:PutObject"]
-    resources = ["${aws_s3_bucket.artifacts.arn}/crl/*"]
+    sid = "ActivateTrustAnchor"
+    actions = [
+      "rolesanywhere:UpdateTrustAnchor",
+      "rolesanywhere:EnableTrustAnchor",
+    ]
+    resources = [aws_rolesanywhere_trust_anchor.this.arn]
   }
 
   statement {
@@ -517,9 +534,49 @@ data "aws_iam_policy_document" "crl_issuer" {
       "rolesanywhere:DisableCrl",
     ]
     resources = [
-      "arn:${local.partition}:rolesanywhere:${local.region}:${local.account_id}:trust-anchor/*",
-      "arn:${local.partition}:rolesanywhere:${local.region}:${local.account_id}:crl/*",
+      "arn:${var.ca_contract.partition}:rolesanywhere:${var.ca_contract.region}:${var.ca_contract.account_id}:trust-anchor/*",
+      "arn:${var.ca_contract.partition}:rolesanywhere:${var.ca_contract.region}:${var.ca_contract.account_id}:crl/*",
     ]
+  }
+
+  statement {
+    sid       = "ReadRevocations"
+    actions   = ["s3:GetObject"]
+    resources = ["${var.ca_contract.artifacts_bucket_arn}/${var.revocations_s3_key}", "${var.ca_contract.artifacts_bucket_arn}/revocations/*"]
+  }
+
+  statement {
+    sid       = "WriteCrlArtifacts"
+    actions   = ["s3:PutObject"]
+    resources = ["${var.ca_contract.artifacts_bucket_arn}/crl/*"]
+  }
+
+  # The core module's key policy matches this role by `aws:PrincipalArn` under the
+  # account-root principal, so the signer also needs this identity grant. Split in
+  # two on purpose: kms:MessageType/kms:SigningAlgorithm do not exist on a
+  # GetPublicKey request, so a shared statement would deny the read.
+  statement {
+    sid       = "SignWithIntermediateCa"
+    actions   = ["kms:Sign"]
+    resources = [var.ca_contract.intermediate_kms_key_arn]
+
+    condition {
+      test     = "StringEquals"
+      variable = "kms:MessageType"
+      values   = ["DIGEST"]
+    }
+
+    condition {
+      test     = "StringEquals"
+      variable = "kms:SigningAlgorithm"
+      values   = [var.ca_contract.signing_algorithm]
+    }
+  }
+
+  statement {
+    sid       = "ReadIntermediateCaKey"
+    actions   = ["kms:GetPublicKey", "kms:DescribeKey"]
+    resources = [var.ca_contract.intermediate_kms_key_arn]
   }
 }
 
@@ -531,7 +588,7 @@ resource "aws_iam_role_policy" "crl_issuer" {
 
 resource "aws_lambda_function" "crl_issuer" {
   function_name = local.crl_lambda_name
-  description   = "Signs a DER CRL with the ${var.name} KMS Intermediate CA and imports it into IAM Roles Anywhere"
+  description   = "Activates the ${local.name} trust anchor from CAChainPublished and keeps its CRL fresh"
   role          = aws_iam_role.crl_issuer.arn
 
   filename         = data.archive_file.crl_issuer.output_path
@@ -542,17 +599,22 @@ resource "aws_lambda_function" "crl_issuer" {
   timeout          = 120
   memory_size      = 256
 
+  # One CRL owner, one activation: concurrent runs would race ImportCrl and the
+  # trust anchor update against each other.
   reserved_concurrent_executions = 1
 
   environment {
     variables = {
       TRUST_ANCHOR_ARN   = aws_rolesanywhere_trust_anchor.this.arn
-      ISSUER_CERT_PARAM  = local.ssm_intermediate_ca_pem
-      KMS_KEY_ARN        = aws_kms_key.intermediate_ca.arn
-      REVOCATIONS_S3_URI = "s3://${aws_s3_bucket.artifacts.id}/${var.revocations_s3_key}"
-      CRL_OUTPUT_PREFIX  = "s3://${aws_s3_bucket.artifacts.id}/crl"
+      TRUST_ANCHOR_ID    = aws_rolesanywhere_trust_anchor.this.id
+      CA_BUNDLE_PARAM    = var.ca_contract.ca_bundle_ssm_param
+      CA_EVENT_SOURCE    = var.ca_contract.event_source
+      ISSUER_CERT_PARAM  = var.ca_contract.intermediate_ca_ssm_param
+      KMS_KEY_ARN        = var.ca_contract.intermediate_kms_key_arn
+      REVOCATIONS_S3_URI = "s3://${var.ca_contract.artifacts_bucket}/${var.revocations_s3_key}"
+      CRL_OUTPUT_PREFIX  = "s3://${var.ca_contract.artifacts_bucket}/crl"
       CRL_VALIDITY_DAYS  = tostring(var.crl_validity_days)
-      CRL_NAME_PREFIX    = "${var.name}-crl"
+      CRL_NAME_PREFIX    = "${local.name}-crl"
       LOG_LEVEL          = "INFO"
     }
   }
@@ -566,23 +628,59 @@ resource "aws_lambda_function" "crl_issuer" {
 }
 
 ###############################################################################
-# Daily refresh
+# Trigger 1: the CA published its chain (fan-out from the ceremony)
+###############################################################################
+
+resource "aws_cloudwatch_event_rule" "ca_chain_published" {
+  name           = "${local.name}-ca-chain-published"
+  description    = "Activate the ${local.name} trust anchor when the CA publishes its chain"
+  event_bus_name = var.ca_contract.event_bus_name
+
+  event_pattern = jsonencode({
+    source        = [var.ca_contract.event_source]
+    "detail-type" = [var.ca_contract.event_detail_type]
+    detail = {
+      ca_name = [var.ca_contract.name]
+    }
+  })
+
+  tags = local.tags
+}
+
+# No input transformer: the target receives the whole envelope, which is how the
+# handler tells activation (event.source == cloudhsmca.pki) from a scheduled tick.
+resource "aws_cloudwatch_event_target" "ca_chain_published" {
+  rule           = aws_cloudwatch_event_rule.ca_chain_published.name
+  event_bus_name = var.ca_contract.event_bus_name
+  target_id      = "crl-issuer-activation"
+  arn            = aws_lambda_function.crl_issuer.arn
+}
+
+resource "aws_lambda_permission" "ca_chain_published" {
+  statement_id  = "AllowEventBridgeCaChainPublished"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.crl_issuer.function_name
+  principal     = "events.amazonaws.com"
+  source_arn    = aws_cloudwatch_event_rule.ca_chain_published.arn
+}
+
+###############################################################################
+# Trigger 2: routine refresh
 #
-# The Lambda is the only owner of the CRL object, so this always exists: a CRL
-# whose nextUpdate has passed rejects every certificate, which is worse than no
-# CRL at all. The ceremony imports the first one; this keeps it fresh.
+# A CRL whose nextUpdate has passed rejects every certificate, so this is not
+# optional; the activation path only happens once per ceremony.
 ###############################################################################
 
 resource "aws_cloudwatch_event_rule" "crl_refresh" {
-  name                = "${var.name}-crl-refresh"
-  description         = "Refresh the IAM Roles Anywhere CRL every 24 hours"
-  schedule_expression = "rate(24 hours)"
+  name                = "${local.name}-crl-refresh"
+  description         = "Refresh the ${local.name} Roles Anywhere CRL"
+  schedule_expression = var.crl_refresh_schedule
   tags                = local.tags
 }
 
 resource "aws_cloudwatch_event_target" "crl_refresh" {
   rule      = aws_cloudwatch_event_rule.crl_refresh.name
-  target_id = "crl-issuer"
+  target_id = "crl-issuer-refresh"
   arn       = aws_lambda_function.crl_issuer.arn
 
   input = jsonencode({ reason = "scheduled-refresh" })

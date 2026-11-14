@@ -4,6 +4,45 @@ All notable changes to this repository are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the module follows
 semantic versioning once it is tagged.
 
+## [0.4.0] - 2026-11-13
+
+Breaking: the PKI engine and the workload consumers are separate modules joined by
+an EventBridge event.
+
+### Changed
+
+- `modules/hsm-ca` is the workload-agnostic engine: CloudHSM cluster, KMS
+  Intermediate key, artifact bucket, SSM chain, ceremony state machine. Its state
+  machine no longer knows about Roles Anywhere, CRLs or any consumer: after the
+  HSM is deleted, the backup is READY and the host is terminated, it ends with
+  `PublishCaReadyEvent` (`eventbridge:putEvents`, `source = "cloudhsmca.pki"`,
+  `detail-type = "CAChainPublished"`).
+- `modules/roles-anywhere` is a consumer that takes `ca_contract` and subscribes
+  to that event. Its Lambda has two triggers: `CAChainPublished` (install the
+  chain, enable the anchor, import the first CRL) and `rate(24 hours)` (refresh).
+  A scheduled tick before publication returns `chain-not-published` instead of
+  failing.
+- The repository root is a composite module (`module "hsm_ca"` +
+  `module "roles_anywhere"` behind `enable_roles_anywhere`, default `true`).
+
+### Added
+
+- `ca_contract`: the engine's output object — key/bucket ARNs, SSM parameter
+  names, signing algorithm, event bus/source/detail-type — which is the only
+  thing a consumer needs.
+- `allowed_kms_signer_role_arns`: the key policy matches signers by
+  `aws:PrincipalArn` under the account-root principal, defaulting to
+  `arn:aws:iam::<account>:role/<name>-*`, so a consumer can sign CRLs without the
+  engine referencing it.
+- `examples/standalone-hsm-ca`: the engine alone, for ALB/API Gateway mTLS, VPN
+  or internal TLS.
+
+### Removed
+
+- `ReadCaBundle`, `UpdateTrustAnchor`, `EnableTrustAnchor` and `ImportOrUpdateCrl`
+  from the engine's state machine, and every `rolesanywhere:*`, `ssm:GetParameter`
+  and `lambda:InvokeFunction` permission that served them.
+
 ## [0.3.0] - 2026-11-13
 
 Breaking: the repository is a single root module, and one `terraform apply`

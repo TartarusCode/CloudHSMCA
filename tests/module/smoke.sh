@@ -22,7 +22,7 @@
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
-MODULE="${1:-$(cd "$HERE/../.." && pwd)}"
+MODULE="${1:-$(cd "$HERE/../../modules/hsm-ca" && pwd)}"
 
 if [ ! -d "$MODULE/.terraform/providers" ]; then
   echo "initialising $MODULE"
@@ -80,14 +80,20 @@ PY
 
 echo "defaults (auto_bootstrap off, nothing required beyond the network):"
 snapshot defaults "$BASE" \
-  '{module_tag = local.module_tag, tags = local.tags, auto_bootstrap = var.auto_bootstrap, ssm_ca_bundle_pem = local.ssm_ca_bundle_pem, ssm_intermediate_ca_pem = local.ssm_intermediate_ca_pem, signing_algorithm = local.ca_signing_algorithm, workload_profiles = var.workload_profiles}' \
-  "{\"module_tag\": \"cloudhsmca\", \"tags\": {\"Module\": \"cloudhsmca\", \"Tier\": \"root-of-trust\"}, \"auto_bootstrap\": false, \"ssm_ca_bundle_pem\": \"/corp-pki/pki/ca_bundle.pem\", \"ssm_intermediate_ca_pem\": \"/corp-pki/pki/intermediate_ca.pem\", \"signing_algorithm\": \"ECDSA_SHA_384\", \"workload_profiles\": {}}"
+  '{module_tag = local.module_tag, tags = local.tags, auto_bootstrap = var.auto_bootstrap, ssm_ca_bundle_pem = local.ssm_ca_bundle_pem, ssm_intermediate_ca_pem = local.ssm_intermediate_ca_pem, signing_algorithm = local.ca_signing_algorithm, signer_override = var.allowed_kms_signer_role_arns, event_bus = var.event_bus_name}' \
+  "{\"module_tag\": \"cloudhsmca\", \"tags\": {\"Module\": \"cloudhsmca\", \"Tier\": \"root-of-trust\"}, \"auto_bootstrap\": false, \"ssm_ca_bundle_pem\": \"/corp-pki/pki/ca_bundle.pem\", \"ssm_intermediate_ca_pem\": \"/corp-pki/pki/intermediate_ca.pem\", \"signing_algorithm\": \"ECDSA_SHA_384\", \"signer_override\": null, \"event_bus\": \"default\"}"
 
 echo
 echo "auto_bootstrap = true (the turnkey path is a variable, not a second module):"
 snapshot auto-bootstrap "$BASE -var auto_bootstrap=true" \
   '{auto_bootstrap = var.auto_bootstrap, module_tag = local.module_tag}' \
   '{"auto_bootstrap": true, "module_tag": "cloudhsmca"}'
+
+echo
+echo "an explicit signer list replaces the <name>-* default (consumers may be named anything):"
+snapshot signers "$BASE -var allowed_kms_signer_role_arns=[\"arn:aws:iam::111122223333:role/mtls-consumer\"]" \
+  '{signer_override = var.allowed_kms_signer_role_arns}' \
+  '{"signer_override": ["arn:aws:iam::111122223333:role/mtls-consumer"]}'
 
 echo
 echo "the Module tag overrides a caller-supplied Module, so Cost Explorer stays clean:"
@@ -101,14 +107,13 @@ echo "variable validation (one process: console reports every invalid variable i
 # expression references and prints a separate "Invalid value for variable" for
 # each. The exit status is not a gate (console exits 0), so match the messages.
 rejected=$(
-  printf 'jsonencode({a = var.name, b = var.root_key_curve, c = var.object_lock_mode, d = var.workload_profiles})\n' \
+  printf 'jsonencode({a = var.name, b = var.root_key_curve, c = var.object_lock_mode})\n' \
     | console -var vpc_id=vpc-1 -var 'private_subnet_ids=["s-1"]' -var availability_zone=us-west-2a \
       -var name=Bad_Name \
       -var root_key_curve=secp999r1 \
-      -var object_lock_mode=WORM \
-      -var 'workload_profiles={bad={session_duration_seconds=60}}' 2>&1 || true
+      -var object_lock_mode=WORM 2>&1 || true
 )
-for want in 'must be 2-24 chars' 'root_key_curve must be' 'object_lock_mode must be' 'session_duration_seconds must be'; do
+for want in 'must be 2-24 chars' 'root_key_curve must be' 'object_lock_mode must be'; do
   if grep -qF "$want" <<<"$rejected"; then
     printf '  rejected %-34s -> ok\n' "$want"
   else

@@ -18,7 +18,7 @@
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
-MODULE="${1:-$(cd "$HERE/../.." && pwd)}"
+MODULE="${1:-$(cd "$HERE/../../modules/hsm-ca" && pwd)}"
 HARNESS="$(mktemp -d)"
 STUB="$HARNESS/stub"
 export HARNESS STUB_DIR="$STUB"

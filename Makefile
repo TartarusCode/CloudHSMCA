@@ -14,9 +14,10 @@
 # each configuration would download its own copy of the providers.
 
 MODULE   ?= .
+MODULES  := modules/hsm-ca modules/roles-anywhere
 TF       ?= terraform
 EXAMPLES := $(patsubst %/main.tf,%,$(wildcard examples/*/main.tf))
-CONFIGS  := $(MODULE) $(EXAMPLES)
+CONFIGS  := $(MODULE) $(MODULES) $(EXAMPLES)
 
 # One provider cache shared by every configuration: a copy per configuration
 # otherwise, and a fresh clone downloads them once per directory. It lives inside
@@ -45,8 +46,11 @@ fmt: ## Rewrite formatting in place
 fmt-check: ## Fail if anything is unformatted (what CI runs)
 	$(TF) fmt -recursive -check -diff
 
-validate: init ## terraform validate the root module
-	$(TF) -chdir=$(MODULE) validate -no-color
+validate: init ## terraform validate every module (root composite, hsm-ca, roles-anywhere)
+	@set -e; for d in $(MODULE) $(MODULES); do \
+	  echo "== $$d"; \
+	  $(TF) -chdir=$$d validate -no-color; \
+	done
 
 examples: init ## Validate every example against the module
 	@set -e; for d in $(EXAMPLES); do \

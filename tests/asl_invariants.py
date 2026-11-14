@@ -29,7 +29,8 @@ import subprocess
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-STACK = sys.argv[1] if len(sys.argv) > 1 else os.path.abspath(os.path.join(HERE, ".."))
+STACK = sys.argv[1] if len(sys.argv) > 1 else os.path.abspath(
+    os.path.join(HERE, "..", "modules", "hsm-ca"))
 TEMPLATE = "statemachine.asl.json.tftpl"
 
 # Mirrors the locals in ceremony.tf. Values are placeholders: the checks are
@@ -46,10 +47,14 @@ RENDER_VARS = {
     "bucket": "corp-pki-ceremony-artifacts",
     "bootstrap_key": "scripts/bootstrap.sh",
     "rotate_key": "scripts/rotate_intermediate.sh",
-    "trust_anchor_id": "6f5c0e2a-1b3d-4e5f-8a9b-0c1d2e3f4a5b",
-    "trust_anchor_arn": "arn:aws:rolesanywhere:us-west-2:111122223333:trust-anchor/6f5c0e2a",
-    "ssm_ca_bundle_pem": "/corp-pki/pki/ca_bundle.pem",
-    "crl_function_name": "corp-pki-crl-issuer",
+    "event_bus_name": "default",
+    "ca_name": "corp-pki",
+    "ca_bundle_ssm_pem": "/corp-pki/pki/ca_bundle.pem",
+    "root_ca_ssm_pem": "/corp-pki/pki/root_ca.pem",
+    "intermediate_ssm_pem": "/corp-pki/pki/intermediate_ca.pem",
+    "cluster_id_out": "cluster-abc123",
+    "kms_key_arn_out": "arn:aws:kms:us-west-2:111122223333:key/abc",
+    "bucket_out": "corp-pki-pki-artifacts",
 }
 
 TASK_TYPES = {"Task"}
@@ -328,56 +333,62 @@ def main():
         # terminal come from a terminateInstances task.
         inbound = [n for n, s in states.items()
                    if any(t == terminal for _, t in edges(s))]
+        # Either the terminate task itself, or the fan-out publish that only runs
+        # after it (asserted in the fan-out section below).
         check(all(states[n].get("Resource", "").endswith(":ec2:terminateInstances")
+                  or n == "PublishCaReadyEvent"
                   for n in inbound),
               "%s is reached only after the host is terminated" % terminal, str(inbound))
     hsms_gone = [n for n, s in states.items()
                  if "Hsms[0].HsmId" in json.dumps(s) and '"IsPresent": false' in json.dumps(s)]
     check(bool(hsms_gone), "a poll confirms the HSM is gone before success", str(hsms_gone))
 
-    # --- 5. activation tail -----------------------------------------------
-    # The trust anchor is created DISABLED with a placeholder bundle, so the
-    # workflow is what makes the PKI usable. A success that skips these states
-    # leaves an anchor that accepts nothing, and nothing else would notice.
-    print("\nactivation tail (install the chain, enable the anchor, import a CRL):")
-    for required in ("UpdateTrustAnchor", "EnableTrustAnchor", "ImportOrUpdateCrl", "ReadCaBundle"):
-        check(required in states, "%s exists" % required)
+    # --- 5. the fan-out ------------------------------------------------
+    # The module is workload-agnostic: it announces the published chain and
+    # knows nothing about who consumes it. A success that stops before the event
+    # leaves every consumer waiting forever, and any rolesanywhere reference here
+    # would mean the core module grew a workload dependency again.
+    print("\nfan-out (publish the chain, know nothing about consumers):")
+    check("PublishCaReadyEvent" in states, "PublishCaReadyEvent exists")
+    check("rolesanywhere" not in json.dumps(defn),
+          "the state machine has no rolesanywhere coupling")
 
-    if "UpdateTrustAnchor" in states:
-        params = json.dumps(states["UpdateTrustAnchor"].get("Parameters", {}))
-        check("CERTIFICATE_BUNDLE" in params, "UpdateTrustAnchor sets SourceType=CERTIFICATE_BUNDLE", params)
-        check("$.bundle.caBundlePem" in params,
-              "UpdateTrustAnchor installs the chain the ceremony published", params)
-        check("trust-anchor/6f5c0e2a" in params or "$.bundle" in params,
-              "UpdateTrustAnchor targets this module's trust anchor", params)
-        check(path_exists(defn, "UpdateTrustAnchor",
+    if "PublishCaReadyEvent" in states:
+        publish = states["PublishCaReadyEvent"]
+        resource = publish.get("Resource", "")
+        check(resource.endswith(":eventbridge:putEvents"),
+              "PublishCaReadyEvent calls eventbridge:putEvents", resource)
+        entries = publish.get("Parameters", {}).get("Entries", [{}])
+        entry = entries[0] if entries else {}
+        check(entry.get("Source") == "cloudhsmca.pki",
+              "the event source is cloudhsmca.pki", entry.get("Source"))
+        check(entry.get("DetailType") == "CAChainPublished",
+              "the detail type is CAChainPublished", entry.get("DetailType"))
+        check(entry.get("EventBusName") == "default",
+              "the event goes to the configured bus", entry.get("EventBusName"))
+        try:
+            detail = json.loads(entry.get("Detail", "{}"))
+        except ValueError:
+            detail = {}
+        missing = [k for k in ("ca_name", "cluster_id", "intermediate_kms_key_arn",
+                               "ca_bundle_ssm_param", "root_ca_ssm_param",
+                               "intermediate_ca_ssm_param", "artifacts_bucket")
+                   if k not in detail]
+        check(not missing, "the detail carries the whole contract", str(missing))
+        check(detail.get("ca_name") == "corp-pki",
+              "the detail names the CA (consumers match on it)", str(detail.get("ca_name")))
+
+        # The event must be the last Thing To Happen: HSM gone, backup READY,
+        # host terminated — otherwise a consumer activates against a chain whose
+        # Root key is not yet escrowed.
+        check(path_exists(defn, "TerminateHostAfterSuccess",
+                          lambda n, s: n == "PublishCaReadyEvent"),
+              "the event is published after the host is terminated")
+        check(path_exists(defn, "PublishCaReadyEvent",
                           lambda n, s: s.get("Type") == "Succeed"),
-              "UpdateTrustAnchor precedes the Succeed state")
-
-    if "EnableTrustAnchor" in states:
-        params = json.dumps(states["EnableTrustAnchor"].get("Parameters", {}))
-        check("TrustAnchorId" in params, "EnableTrustAnchor passes TrustAnchorId", params)
-        check(path_exists(defn, "EnableTrustAnchor",
-                          lambda n, s: s.get("Type") == "Succeed"),
-              "EnableTrustAnchor precedes the Succeed state")
-        check(path_exists(defn, "UpdateTrustAnchor",
-                          lambda n, s: n == "EnableTrustAnchor"),
-              "the anchor is enabled only after the real chain is installed")
-
-    if "ImportOrUpdateCrl" in states:
-        resource = states["ImportOrUpdateCrl"].get("Resource", "")
-        check(resource.endswith(":lambda:invoke"),
-              "ImportOrUpdateCrl invokes the CRL issuer", resource)
-
-    # Every state after the HSM exists must still reach the teardown on failure.
-    for name in ("ReadCaBundle", "UpdateTrustAnchor", "EnableTrustAnchor", "ImportOrUpdateCrl"):
-        if name not in states:
-            continue
-        catches = states[name].get("Catch", [])
-        check(bool(catches), "%s catches failures instead of stalling" % name)
-        check(path_exists(defn, name,
-                          lambda n, s: s.get("Resource", "").endswith(":cloudhsmv2:deleteHsm")),
-              "%s can still reach deleteHsm on failure" % name)
+              "PublishCaReadyEvent precedes the Succeed state")
+        check(bool(publish.get("Catch")),
+              "a failed publish is caught instead of stalling")
 
     print()
     failures.extend(check_scripts())

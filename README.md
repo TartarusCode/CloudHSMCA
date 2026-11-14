@@ -1,111 +1,144 @@
 # cloudhsmca
 
-A hardware-backed internal PKI for **AWS IAM Roles Anywhere**, built for roughly
-**$20/year** instead of the ~$400/month of ACM Private CA:
+A hardware-backed internal PKI, built for roughly **$20/year** instead of the
+~$400/month of ACM Private CA:
 
 - the **offline Root CA private key** is generated inside an ephemeral AWS
   CloudHSM (`hsm2m.medium`, FIPS mode) with `EXTRACTABLE=false`, self-signs the
-  Root certificate, signs the Intermediate CSR, and is then deleted with the HSM —
-  the encrypted cluster backup AWS keeps automatically is what escrows it;
+  Root certificate, signs the Intermediate CSR, and is deleted with the HSM — the
+  encrypted cluster backup AWS keeps automatically is what escrows it;
 - the **Intermediate CA** is an always-online AWS KMS asymmetric key
   (`SIGN_VERIFY`, ECC), so its private key never leaves AWS's FIPS 140-3 Level 3
   fleet;
-- **IAM Roles Anywhere** turns certificates into temporary AWS credentials, with
-  a scheduled Lambda keeping a CRL imported and fresh.
-
-**One module, one apply.** The whole foundation, the Step Functions ceremony and
-the Roles Anywhere runtime are in this directory, so there is nothing to pass
-between stacks and no second pass.
+- consumers turn certificates into whatever they need: temporary AWS credentials
+  (IAM Roles Anywhere), an mTLS trust store (ALB, API Gateway), a VPN, or plain
+  PEMs for internal TLS.
 
 | | steady-state cost |
 |---|---|
 | KMS asymmetric key (`SIGN_VERIFY`, ECC) | ~$1/month |
-| IAM Roles Anywhere, Lambda, S3, SSM, Step Functions | cents |
+| Lambda, S3, SSM, Step Functions, EventBridge | cents |
 | CloudHSM | **$0/hr** — no HSM exists outside a ceremony run (~$1.50/hr for one) |
 
-## How one apply is possible
+## Two modules and one contract
+
+```
+modules/hsm-ca            the PKI engine — knows nothing about workloads
+  ceremony.tf             cluster shell, KMS Intermediate key, ceremony host,
+                          state machine, auto_bootstrap
+  statemachine.asl...     bootstrap / rotation / cleanup / PublishCaReadyEvent
+  scripts/                kms_ca_tool.py, hsm_ceremony.sh, profiles
+        │
+        │  SSM: /<name>/pki/{root_ca,intermediate_ca,ca_bundle}.pem
+        │  EventBridge: source=cloudhsmca.pki  detail-type=CAChainPublished
+        ▼
+modules/roles-anywhere    one consumer among many
+  roles_anywhere.tf       placeholder trust anchor, workload roles, profiles
+  crl_issuer_lambda.tf    activation + 24h CRL refresh (one Lambda, two triggers)
+```
+
+`modules/hsm-ca` emits `ca_contract` — ARNs, SSM parameter names, the artifact
+bucket, the signing algorithm and the event contract. A consumer needs nothing
+else, and the engine never references a consumer, so the dependency graph is a
+tree instead of a cycle.
+
+The repository **root** is a turnkey composite (`module "hsm_ca"` +
+`module "roles_anywhere"`, the latter behind `enable_roles_anywhere = true`).
+Source the root for the all-in-one stack, or source the two modules independently
+when they belong in separate states — `examples/standalone-hsm-ca` is the engine
+alone.
+
+## One apply, zero circular dependencies
 
 `CreateTrustAnchor` needs a certificate bundle, but the real chain only exists
-after a ceremony that itself needs the cluster, the KMS key and the trust anchor
-to exist first. The usual answer is two applies.
+after a ceremony that itself needs the cluster and the KMS key to exist first.
+Waiting for the chain made the first apply a two-pass affair.
 
-This module creates the trust anchor **DISABLED with a placeholder bundle**
-(a throwaway self-signed certificate from the `tls` provider) and lets the
-ceremony activate it:
+Instead:
 
-1. `apply` lands in well under a minute: cluster shell, KMS key, bucket, SSM
-   parameters, IAM, state machine, trust anchor (DISABLED), profiles and roles.
-2. The workflow runs the ceremony and deletes the HSM.
-3. Still inside the same execution it fetches the published chain
-   (`ReadCaBundle`), installs it (`UpdateTrustAnchor`), enables the anchor
-   (`EnableTrustAnchor`) and imports the first CRL (`ImportOrUpdateCrl`).
+1. `terraform apply` lands in well under a minute. The consumer creates its trust
+   anchor **DISABLED with a placeholder bundle** (a throwaway `tls` self-signed
+   certificate, one year, CA:TRUE) and `lifecycle { ignore_changes = [source,
+   enabled] }` so no later plan can revert the chain or disable a working anchor.
+2. The operator (or `auto_bootstrap = true`) runs the ceremony: HSM up, Root key
+   generated, Root + Intermediate signed, HSM deleted, backup verified, host
+   terminated.
+3. The last state, `PublishCaReadyEvent`, emits `CAChainPublished`.
+4. The consumer's Lambda installs the real chain (`UpdateTrustAnchor`), enables
+   the anchor (`EnableTrustAnchor`) and imports a CRL — all from the event, with
+   no Terraform resource crossing the module boundary.
 
-`lifecycle { ignore_changes = [source, enabled] }` is what makes that safe: no
-later plan can revert the chain Terraform created or disable a working anchor.
-
-Two ways to run step 2, chosen by `var.auto_bootstrap`:
-
-| `auto_bootstrap` | `terraform apply` | who runs the ceremony |
-|---|---|---|
-| `false` (default) | ~45 s, trust anchor DISABLED | the operator: `terraform output -raw start_bootstrap_command \| bash` |
-| `true` | 15–45 min, returns with the PKI working | `terraform_data.auto_bootstrap` → `scripts/run_ceremony_and_wait.sh`, which polls the execution and fails the apply with its cause |
-
-The waiter is idempotent: if `/<name>/pki/ca_bundle.pem` already holds a chain,
-it does nothing, so a re-apply never starts a second HSM.
-
-## Layout
-
+```json
+{
+  "source": "cloudhsmca.pki",
+  "detail-type": "CAChainPublished",
+  "detail": {
+    "ca_name": "corp-pki",
+    "cluster_id": "cluster-…",
+    "intermediate_kms_key_arn": "arn:aws:kms:…:key/…",
+    "ca_bundle_ssm_param": "/corp-pki/pki/ca_bundle.pem",
+    "root_ca_ssm_param": "/corp-pki/pki/root_ca.pem",
+    "intermediate_ca_ssm_param": "/corp-pki/pki/intermediate_ca.pem",
+    "artifacts_bucket": "corp-pki-pki-…"
+  }
+}
 ```
-.
-├── versions.tf                    aws, archive, random, tls (nothing else)
-├── variables.tf                   network, key material, subjects, workloads
-├── main.tf                        artifact bucket (Object Lock), backup deny-list
-├── ceremony.tf                    cluster shell, KMS key, host role, state machine,
-│                                  auto_bootstrap
-├── roles_anywhere.tf              placeholder trust anchor, workload roles, profiles
-├── crl_issuer_lambda.tf           CRL signing Lambda + 24h refresh
-├── outputs.tf
-├── statemachine.asl.json.tftpl    bootstrap / rotation / activation / cleanup
-├── scripts/
-│   ├── kms_ca_tool.py             DER/TBS splicing CA tool (local, KMS, CloudHSM signers)
-│   ├── hsm_ceremony.sh.tftpl      what runs on the ephemeral host
-│   ├── run_ceremony_and_wait.sh   the auto_bootstrap waiter
-│   └── *.cnf.tftpl                the OpenSSL profiles
-├── tests/                         five offline harnesses (see tests/README.md)
-└── examples/
-    ├── complete/                  auto_bootstrap = false
-    └── auto-bootstrap/            auto_bootstrap = true
-```
+
+Any other consumer — ALB mTLS, API Gateway, a VPN gateway — subscribes to the
+same event and reads the same SSM parameters. Nothing in this repository has to
+change for it.
 
 ## Quick start
 
+Composite (PKI + Roles Anywhere), fast path:
+
 ```bash
 cd examples/complete
-$EDITOR main.tf              # your VPC + private subnet, subjects, tags
+$EDITOR main.tf              # your VPC + private subnet, subjects, tags, profiles
 terraform init && terraform apply          # ~45 s
 
 terraform output -raw start_bootstrap_command | bash
 aws stepfunctions describe-execution --execution-arn <arn>   # until SUCCEEDED
 ```
 
-When that execution succeeds the trust anchor holds the real Root + Intermediate
-chain, is ENABLED, and has a CRL. For a sandbox where one command should do all
-of it, use `examples/auto-bootstrap` (`auto_bootstrap = true`).
+The event fires at the end of that execution; the trust anchor is ENABLED and has
+a CRL a few seconds later (`aws rolesanywhere get-trust-anchor --trust-anchor-id
+$(terraform output -raw trust_anchor_id)`).
+
+Engine only (mTLS, VPN, internal TLS):
+
+```bash
+cd examples/standalone-hsm-ca
+terraform init && terraform apply
+terraform output -raw start_bootstrap_command | bash
+```
+
+One command that also waits for the ceremony:
+`examples/auto-bootstrap` (`auto_bootstrap = true`), which polls the execution and
+fails the apply with its cause if the ceremony fails.
 
 Issue a workload certificate with the KMS Intermediate CA:
 
 ```bash
-python3 scripts/kms_ca_tool.py sign-leaf-csr \
+python3 modules/hsm-ca/scripts/kms_ca_tool.py sign-leaf-csr \
   --signer kms --kms-key-id "$(terraform output -raw intermediate_kms_key_arn)" \
   --issuer-cert intermediate_ca.pem --csr workload.csr --days 90 --out workload.pem
 ```
 
 The leaf gets `basicConstraints=critical,CA:FALSE`,
 `keyUsage=critical,digitalSignature`, `extendedKeyUsage=clientAuth`, SKI and AKI.
-Workloads then call `aws_signing_helper credential-process` — the
-`rolesanywhere_update_env` output prints a ready-made command.
 
-## Workload role hardening
+## Who may sign with the Intermediate key
+
+The key policy names the account root as principal and matches signers by
+`aws:PrincipalArn`: the ceremony host plus `allowed_kms_signer_role_arns`, which
+defaults to `arn:aws:iam::<account>:role/<name>-*`. That is what lets a consumer
+module sign CRLs or leaf certificates without the engine referencing it — and
+without KMS having to resolve (or rewrite to an AROA id) a role principal. Each
+signer still needs its own identity-policy grant under the same digest-only
+conditions; the Roles Anywhere Lambda's policy shows the shape.
+
+## Workload role hardening (Roles Anywhere consumer)
 
 Each role's trust policy allows only `rolesanywhere.amazonaws.com`, only for this
 trust anchor (`ArnEquals aws:SourceArn`), and optionally only for a given
@@ -117,28 +150,45 @@ is granted alongside it.
 ## The CRL
 
 `hashicorp/aws` has no `aws_rolesanywhere_crl` resource (5.100.0 and 6.73.0
-schemas both checked), and this module does not depend on `hashicorp/awscc` for
-it: the CRL is owned by the Lambda.
+schemas both checked) and this repository does not depend on `hashicorp/awscc`:
+one Lambda owns the CRL, with two triggers.
 
-- The ceremony's `ImportOrUpdateCrl` state imports the first CRL, so an enabled
-  anchor never rejects everything for want of a revocation list.
-- A 24-hour EventBridge schedule re-signs and re-imports it from
-  `revocations/revoked.json` in the artifact bucket.
-- **ImportCrl takes PEM.** The API says so outright — *"In order to be properly
-  imported, a CRL must be in PEM format"* — which is also why the CloudFormation
-  `CrlData` is a String. The signature is over the DER `TBSCertList`; the payload
-  is PEM. The handler reads the stored CRL back and compares SHA-256 with what it
-  signed, so "the API accepted it" becomes evidence.
-- A CRL whose `nextUpdate` has passed rejects every certificate, which is why the
-  schedule is not optional and `crl_validity_days` (7) is well above 24 h.
+- **`CAChainPublished`** — install the chain, enable the anchor, import the first
+  CRL. Activation completes before any workload can connect, so an enabled anchor
+  never rejects everything for want of a revocation list.
+- **`rate(24 hours)`** — re-sign and re-import. On a schedule tick before the
+  first ceremony the bundle still reads `PENDING-CEREMONY`, and the handler
+  returns `{"skipped": "chain-not-published"}` instead of failing.
+
+**ImportCrl takes PEM.** The API says so outright — *"In order to be properly
+imported, a CRL must be in PEM format"* — which is why the CloudFormation
+`CrlData` is a String. The signature is over the DER `TBSCertList`; the payload is
+PEM. The handler reads the stored CRL back and compares SHA-256 with what it
+signed, so "the API accepted it" becomes evidence.
 
 ## CloudHSM backup protection
 
 The offline Root CA key exists in exactly one place after a ceremony: the
 encrypted cluster backup. `cloudhsm:DeleteBackup` and
 `cloudhsm:ModifyBackupAttributes` are denied account-wide and attached to the two
-roles here that can manage CloudHSM (the ceremony host and the state machine);
-`cloudhsm_backup_guard_policy_arn` is exposed so other principals can be covered.
+roles that can manage CloudHSM in the engine (the ceremony host and the state
+machine); `cloudhsm_backup_guard_policy_arn` is exposed so other principals can
+be covered.
+
+## Layout
+
+```
+.
+├── main.tf variables.tf outputs.tf versions.tf   composite: hsm_ca + roles_anywhere
+├── modules/
+│   ├── hsm-ca/          engine: cluster, KMS key, ceremony, SSM, bucket, event
+│   └── roles-anywhere/  consumer: trust anchor, profiles, roles, CRL Lambda
+├── tests/               five offline harnesses (see tests/README.md)
+└── examples/
+    ├── complete/          composite, auto_bootstrap = false
+    ├── auto-bootstrap/    composite, auto_bootstrap = true
+    └── standalone-hsm-ca/ engine only (mTLS / VPN / TLS)
+```
 
 ## Testing
 
@@ -146,15 +196,15 @@ Five offline harnesses, **no AWS account, no HSM, no credentials**:
 
 | harness | proves |
 |---|---|
-| `tests/module` | the variable-only locals the way plan computes them, both `auto_bootstrap` paths, the `Module` tag, four validations — `validate` never evaluates locals |
-| `tests/lambda` | the CRL handler extracted from `crl_issuer_lambda.tf`, signed with a real P-384 key, verified by openssl, round-tripped through a stubbed `GetCrl` |
+| `tests/module` | the engine's variable-only locals the way plan computes them, both `auto_bootstrap` paths, the `Module` tag, the signer override, three validations |
+| `tests/asl_invariants.py` | the rendered state machine: cleanup on `States.ALL`, cause preservation, SSM readiness, the backup gate, and that it ends with `PublishCaReadyEvent` and has **no** `rolesanywhere` coupling |
 | `tests/crypto` | the whole X.509 chain — root, Intermediate, leaf, CRL — with local stand-ins for KMS and CloudHSM |
 | `tests/ceremony` | `hsm_ceremony.sh.tftpl` rendered by Terraform and executed against a stub `cloudhsm-cli` that really signs (base64 `r\|\|s`, as Client SDK 5 returns) |
-| `tests/asl_invariants.py` | the rendered state machine walked as a graph: cleanup on `States.ALL`, cause preservation, SSM readiness, the backup gate, and the activation tail |
+| `tests/lambda` | the consumer's Lambda: the `CAChainPublished` activation (update + enable + import), the scheduled refresh, the no-chain skip, the no-chain activation failure, and the CRL itself via openssl |
 
 ```bash
 make init        # one init per configuration, into one shared provider cache
-make -j4 check   # ~25 s: fmt, validate, examples, lint, all five harnesses
+make -j4 check   # fmt, validate (all three modules), examples, lint, all five harnesses
 ```
 
 `TF_PLUGIN_CACHE_DIR` defaults to `.terraform-plugin-cache` in the working tree
@@ -162,8 +212,8 @@ make -j4 check   # ~25 s: fmt, validate, examples, lint, all five harnesses
 `make clean` keeps it; `make cache-clean` drops it.
 
 What the harnesses cannot prove — CloudHSM control-plane timing, KMS policy
-enforcement, Roles Anywhere accepting the CRL — is listed in
-[`tests/README.md`](tests/README.md).
+enforcement, Roles Anywhere accepting the CRL, `UpdateTrustAnchor` itself — is
+listed in [`tests/README.md`](tests/README.md).
 
 ## Requirements
 

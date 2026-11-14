@@ -9,7 +9,28 @@ updates:
       prefix: "chore(deps)"
 
   - package-ecosystem: terraform
+    directory: /modules/hsm-ca
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: "chore(deps)"
+
+  - package-ecosystem: terraform
+    directory: /modules/roles-anywhere
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: "chore(deps)"
+
+  - package-ecosystem: terraform
     directory: /examples/complete
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: "chore(deps)"
+
+  - package-ecosystem: terraform
+    directory: /examples/standalone-hsm-ca
     schedule:
       interval: weekly
     commit-message:

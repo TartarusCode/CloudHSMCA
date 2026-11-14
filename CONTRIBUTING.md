@@ -20,8 +20,8 @@ make init        # one init per configuration, into one shared provider cache
 make -j4 check   # fmt-check, validate, examples, lint, and all five harnesses
 ```
 
-`make check` is what CI runs (`fmt-check`, validate on the module and both
-examples, `tflint`, and `tests/run-all.sh`). `make -j4 check` runs the independent
+`make check` is what CI runs (`fmt-check`, validate on all three modules and
+every example, `tflint`, and `tests/run-all.sh`). `make -j4 check` runs the independent
 gates in parallel: `init` is a single target, so the slots cannot race each other
 in the provider cache.
 
@@ -32,7 +32,7 @@ drops the cache too.
 
 ## Changing the ceremony or the CA tooling
 
-The scripts under `scripts/` run on an ephemeral host inside a VPC with no
+The scripts under `modules/hsm-ca/scripts/` run on an ephemeral host inside a VPC with no
 inbound access, so a mistake there is discovered at the worst moment. Their
 harnesses execute the real artifacts — the script rendered by `terraform
 console`, the Python tool against local keys, the CloudHSM CLI and AWS CLI against

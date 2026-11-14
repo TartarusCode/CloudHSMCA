@@ -1,24 +1,26 @@
 #!/bin/bash
-# Runs every offline harness for the module. No AWS account, no HSM, no
+# Runs every offline harness for both modules. No AWS account, no HSM, no
 # credentials.
 #
-#   tests/module   — the variable-only locals evaluated the way plan does, both
-#                    auto_bootstrap paths, the Module tag, the validations
-#   tests/lambda   — the CRL handler extracted from crl_issuer_lambda.tf, signed
-#                    with a real P-384 key and verified with openssl
-#   tests/crypto   — kms_ca_tool.py: root, CSR, Intermediate, leaf, CRL, plus the
-#                    refusal paths
+#   tests/module   — modules/hsm-ca's variable-only locals the way plan computes
+#                    them, both auto_bootstrap paths, the Module tag
+#   tests/asl_invariants.py — modules/hsm-ca's rendered state machine: cleanup on
+#                    States.ALL, cause preservation, SSM readiness, the backup
+#                    gate, and the CAChainPublished fan-out
+#   tests/crypto   — kms_ca_tool.py: root, CSR, Intermediate, leaf, CRL
 #   tests/ceremony — hsm_ceremony.sh.tftpl rendered by Terraform and executed
 #                    against a stub cloudhsm-cli that really signs
-#   tests/asl_invariants.py — the rendered state machine walked as a graph:
-#                    cleanup on States.ALL, cause preservation, SSM readiness,
-#                    the backup gate, and the activation tail
+#   tests/lambda   — modules/roles-anywhere's Lambda: the CAChainPublished
+#                    activation path, the scheduled refresh, the no-chain skip,
+#                    and the CRL itself, verified with openssl
 #
-# usage: tests/run-all.sh [module-dir]
+# usage: tests/run-all.sh
 set -uo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
-MODULE="${1:-$(cd "$HERE/.." && pwd)}"
+ROOT="$(cd "$HERE/.." && pwd)"
+HsmCa="$ROOT/modules/hsm-ca"
+RolesAnywhere="$ROOT/modules/roles-anywhere"
 fail=0
 
 run() {
@@ -35,11 +37,11 @@ run() {
   fi
 }
 
-run "module (locals evaluated like plan)" bash "$HERE/module/smoke.sh" "$MODULE"
-run "lambda (crl handler)" python3 "$HERE/lambda/test_lambda.py" "$MODULE"
-run "crypto (kms_ca_tool.py)" bash "$HERE/crypto/test_kms_ca_tool.sh" "$MODULE"
-run "ceremony (hsm_ceremony.sh)" bash "$HERE/ceremony/run.sh" "$MODULE"
-run "asl invariants" python3 "$HERE/asl_invariants.py" "$MODULE"
+run "module (hsm-ca locals evaluated like plan)" bash "$HERE/module/smoke.sh" "$HsmCa"
+run "asl invariants (hsm-ca, no consumer coupling)" python3 "$HERE/asl_invariants.py" "$HsmCa"
+run "crypto (kms_ca_tool.py)" bash "$HERE/crypto/test_kms_ca_tool.sh" "$HsmCa"
+run "ceremony (hsm_ceremony.sh)" bash "$HERE/ceremony/run.sh" "$HsmCa"
+run "lambda (activation + CRL refresh)" python3 "$HERE/lambda/test_lambda.py" "$RolesAnywhere"
 
 echo
 if [ "$fail" -eq 0 ]; then

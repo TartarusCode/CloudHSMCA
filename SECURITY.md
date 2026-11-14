@@ -17,9 +17,8 @@ vulnerability* on this repository. Do not open a public issue for:
   policy,
 - a dependency or supply-chain issue in the ceremony tooling.
 
-Include the affected file (and line) — `ceremony.tf`, `roles_anywhere.tf`,
-`crl_issuer_lambda.tf`, `statemachine.asl.json.tftpl`, or `scripts/` — and what an
-attacker gains. A working `terraform plan` diff or a failing harness case is the
+Include the affected file (and line) — under `modules/hsm-ca/` (the engine) or
+`modules/roles-anywhere/` (the consumer) — and what an attacker gains. A working `terraform plan` diff or a failing harness case is the
 most useful evidence.
 
 ## Scope and design claims worth testing

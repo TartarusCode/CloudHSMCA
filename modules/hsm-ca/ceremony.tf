@@ -122,12 +122,17 @@ locals {
     ECC_NIST_P521 = "ECDSA_SHA_512"
   }[var.intermediate_key_spec]
 
-  # The key policy names the signers by `aws:PrincipalArn` under the account-root
-  # principal, so KMS never has to resolve (or rewrite) a role principal — see
-  # data.aws_iam_policy_document.intermediate_ca_key.
+  # Who may sign with the Intermediate CA key: the ceremony host, plus whatever
+  # consumers the caller names. The default is every role whose name starts with
+  # "<name>-", which is how a consumer module in this repository is named, so the
+  # key policy never has to reference a resource the core module does not own.
+  consumer_signer_arns = var.allowed_kms_signer_role_arns != null ? var.allowed_kms_signer_role_arns : [
+    "arn:${local.partition}:iam::${local.account_id}:role/${var.name}-*"
+  ]
+
   ca_key_principal_arns = compact(concat(
-    [aws_iam_role.ceremony_host.arn, aws_iam_role.crl_issuer.arn],
-    var.additional_signer_principal_arns,
+    [aws_iam_role.ceremony_host.arn],
+    local.consumer_signer_arns,
   ))
 
   statemachine_definition = templatefile("${path.module}/statemachine.asl.json.tftpl", {
@@ -143,12 +148,16 @@ locals {
     bootstrap_key              = aws_s3_object.bootstrap_script[0].key
     rotate_key                 = aws_s3_object.rotate_script.key
 
-    # The activation tail: the workflow installs the chain it just built and
-    # flips the placeholder trust anchor on.
-    trust_anchor_id   = aws_rolesanywhere_trust_anchor.this.id
-    trust_anchor_arn  = aws_rolesanywhere_trust_anchor.this.arn
-    ssm_ca_bundle_pem = local.ssm_ca_bundle_pem
-    crl_function_name = aws_lambda_function.crl_issuer.function_name
+    # The fan-out: the workflow announces the chain on EventBridge and knows
+    # nothing about who consumes it.
+    event_bus_name       = var.event_bus_name
+    ca_name              = var.name
+    ca_bundle_ssm_pem    = local.ssm_ca_bundle_pem
+    root_ca_ssm_pem      = local.ssm_root_ca_pem
+    intermediate_ssm_pem = local.ssm_intermediate_ca_pem
+    cluster_id_out       = aws_cloudhsm_v2_cluster.this.cluster_id
+    kms_key_arn_out      = aws_kms_key.intermediate_ca.arn
+    bucket_out           = aws_s3_bucket.artifacts.id
   })
 }
 
@@ -698,28 +707,12 @@ data "aws_iam_policy_document" "sfn" {
     resources = ["*"]
   }
 
-  # The activation tail of the workflow: install the chain it just published,
-  # turn the placeholder trust anchor on, then have the CRL importer sign and
-  # import the first CRL.
+  # The fan-out: the workflow announces the published chain and knows nothing
+  # about the consumers that react to it.
   statement {
-    sid = "ActivateTrustAnchor"
-    actions = [
-      "rolesanywhere:UpdateTrustAnchor",
-      "rolesanywhere:EnableTrustAnchor",
-    ]
-    resources = [aws_rolesanywhere_trust_anchor.this.arn]
-  }
-
-  statement {
-    sid       = "ReadCaBundle"
-    actions   = ["ssm:GetParameter"]
-    resources = ["arn:${local.partition}:ssm:${local.region}:${local.account_id}:parameter${local.ssm_ca_bundle_pem}"]
-  }
-
-  statement {
-    sid       = "InvokeCrlIssuer"
-    actions   = ["lambda:InvokeFunction"]
-    resources = [aws_lambda_function.crl_issuer.arn]
+    sid       = "PublishCaReady"
+    actions   = ["events:PutEvents"]
+    resources = ["arn:${local.partition}:events:${local.region}:${local.account_id}:event-bus/${var.event_bus_name}"]
   }
 }
 
@@ -785,9 +778,7 @@ resource "terraform_data" "auto_bootstrap" {
     aws_sfn_state_machine.ceremony,
     aws_cloudhsm_v2_cluster.this,
     aws_kms_key.intermediate_ca,
-    aws_rolesanywhere_trust_anchor.this,
     aws_iam_role_policy.sfn,
-    aws_lambda_function.crl_issuer,
     aws_ssm_parameter.ca_bundle_pem,
   ]
 }

@@ -1,35 +1,50 @@
 ###############################################################################
-# IAM Roles Anywhere
+# IAM Roles Anywhere — the consumer
 #
-#   trust anchor  created DISABLED with a placeholder bundle, activated by the
-#                 ceremony (see ceremony.tf and statemachine.asl.json.tftpl)
+#   trust anchor  created DISABLED with a placeholder bundle; activated by the
+#                 CRL Lambda when the CA publishes its chain
 #   profiles      one per var.workload_profiles entry
 #   roles         assumption restricted to rolesanywhere.amazonaws.com, this
 #                 trust anchor (aws:SourceArn) and, optionally, the x509 subject
 #                 fields Roles Anywhere puts in the session principal tags
 #
+# This module never touches CloudHSM or the ceremony. It subscribes to
+# cloudhsmca.pki/CAChainPublished (see crl_issuer_lambda.tf), and every ARN or
+# parameter name it needs comes from var.ca_contract.
+#
 # Why the placeholder exists
 # --------------------------
 # CreateTrustAnchor needs a certificate bundle, but the real chain only exists
-# after a ceremony that itself needs the cluster, the KMS key and this anchor to
-# exist first. Creating the anchor enabled with the real chain therefore forced a
-# second apply, gated on an SSM parameter that would not exist yet.
-#
-# Instead the anchor is created DISABLED with a throwaway self-signed certificate,
-# and the workflow installs the real bundle (UpdateTrustAnchor) and enables it
+# after a ceremony that itself needs the cluster and the KMS key to exist first.
+# Waiting for the chain made the first apply a two-pass affair. Instead the anchor
+# is created DISABLED with a throwaway self-signed certificate, and the activation
+# Lambda installs the real bundle (UpdateTrustAnchor) and enables it
 # (EnableTrustAnchor). `ignore_changes = [source, enabled]` is what makes that
 # safe: no later plan can revert the chain or disable a working anchor.
 #
-# The placeholder key never signs anything and lives only in Terraform state
-# (it cannot be marked ephemeral: `ephemeral` blocks need Terraform 1.10, and this
+# The placeholder key never signs anything and lives only in Terraform state (it
+# cannot be marked ephemeral: `ephemeral` blocks need Terraform 1.10, and this
 # module supports 1.6+). It is destroyed with the state.
 #
 # CRL
 # ---
 # hashicorp/aws has no aws_rolesanywhere_crl resource (the 5.100.0 and 6.73.0
-# schemas were both checked), so nothing here holds CRL state: the CRL Lambda and
-# the ceremony's ImportOrUpdateCrl state import it through rolesanywhere:ImportCrl.
+# schemas were both checked), so nothing here holds CRL state: the Lambda imports
+# it through rolesanywhere:ImportCrl on activation and on the 24-hour schedule.
 ###############################################################################
+
+locals {
+  name       = var.ca_contract.name
+  module_tag = "cloudhsmca"
+
+  tags = merge(var.tags, {
+    Module = local.module_tag
+    Ca     = local.name
+  })
+
+  ca_bundle_param_arn = "arn:${var.ca_contract.partition}:ssm:${var.ca_contract.region}:${var.ca_contract.account_id}:parameter${var.ca_contract.ca_bundle_ssm_param}"
+  issuer_param_arn    = "arn:${var.ca_contract.partition}:ssm:${var.ca_contract.region}:${var.ca_contract.account_id}:parameter${var.ca_contract.intermediate_ca_ssm_param}"
+}
 
 resource "tls_private_key" "placeholder" {
   algorithm   = "ECDSA"
@@ -45,35 +60,34 @@ resource "tls_self_signed_cert" "placeholder" {
   # A year, not an hour. Nothing signs with this key and the anchor is created
   # DISABLED, so its expiry has no security meaning — but a 1-hour certificate
   # would be expired by the time AWS validates it during a delayed apply or on a
-  # host whose clock is skewed, and CreateTrustAnchor/UpdateTrustAnchor reject an
-  # expired bundle. Terraform replaces this on the anchor's replacement anyway.
+  # host whose clock is skewed, and CreateTrustAnchor rejects an expired bundle.
   validity_period_hours = 8760
 
   subject {
-    common_name  = "${var.name} placeholder — not a certificate authority"
+    common_name  = "${local.name} placeholder — not a certificate authority"
     organization = "placeholder"
   }
 }
 
 resource "aws_rolesanywhere_trust_anchor" "this" {
-  name    = "${var.name}-trust-anchor"
-  enabled = false # the ceremony flips this on once the real chain is installed
+  name    = "${local.name}-trust-anchor"
+  enabled = false # the activation Lambda flips this on when the chain arrives
   tags    = local.tags
 
   source {
     source_type = "CERTIFICATE_BUNDLE"
 
     source_data {
-      # Replaced by the ceremony with Root + Intermediate from the HSM and KMS
-      # CAs. KMS validates this one as a well-formed CA certificate and nothing
-      # else; no workload can authenticate against it.
+      # Replaced with Root + Intermediate as soon as the ceremony publishes them.
+      # Roles Anywhere validates this one as a well-formed CA certificate and
+      # nothing else; no workload can authenticate against it.
       x509_certificate_data = tls_self_signed_cert.placeholder.cert_pem
     }
   }
 
   lifecycle {
-    # The ceremony owns both fields from here on. Without this, every plan would
-    # try to restore the placeholder and disable the anchor.
+    # The Lambda owns both fields from here on. Without this, every plan would try
+    # to restore the placeholder and disable the anchor.
     ignore_changes = [source, enabled]
   }
 }
@@ -127,7 +141,7 @@ data "aws_iam_policy_document" "workload_assume" {
 resource "aws_iam_role" "workload" {
   for_each = var.workload_profiles
 
-  name                 = "${var.name}-${each.key}"
+  name                 = "${local.name}-${each.key}"
   description          = each.value.description
   assume_role_policy   = data.aws_iam_policy_document.workload_assume[each.key].json
   max_session_duration = each.value.session_duration_seconds
@@ -159,7 +173,7 @@ resource "aws_iam_role_policy_attachment" "workload" {
 resource "aws_rolesanywhere_profile" "this" {
   for_each = var.workload_profiles
 
-  name                        = "${var.name}-${each.key}"
+  name                        = "${local.name}-${each.key}"
   enabled                     = true
   role_arns                   = [aws_iam_role.workload[each.key].arn]
   managed_policy_arns         = each.value.managed_policy_arns
