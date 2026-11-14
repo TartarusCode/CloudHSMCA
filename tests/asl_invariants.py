@@ -356,8 +356,12 @@ def main():
     if "PublishCaReadyEvent" in states:
         publish = states["PublishCaReadyEvent"]
         resource = publish.get("Resource", "")
-        check(resource.endswith(":eventbridge:putEvents"),
-              "PublishCaReadyEvent calls eventbridge:putEvents", resource)
+        # The optimized integration, not the aws-sdk one: it accepts Detail as an
+        # object and raises EventBridge.FailedEntry, where aws-sdk:eventbridge
+        # needs a pre-serialized string and returns 200 with FailedEntryCount=1
+        # when AWS drops the event.
+        check(resource == "arn:aws:states:::events:putEvents",
+              "PublishCaReadyEvent uses the optimized events:putEvents integration", resource)
         entries = publish.get("Parameters", {}).get("Entries", [{}])
         entry = entries[0] if entries else {}
         check(entry.get("Source") == "cloudhsmca.pki",
@@ -366,10 +370,17 @@ def main():
               "the detail type is CAChainPublished", entry.get("DetailType"))
         check(entry.get("EventBusName") == "default",
               "the event goes to the configured bus", entry.get("EventBusName"))
-        try:
-            detail = json.loads(entry.get("Detail", "{}"))
-        except ValueError:
-            detail = {}
+
+        detail = entry.get("Detail")
+        check(isinstance(detail, dict),
+              "Detail is a native object, not a pre-serialized string",
+              type(detail).__name__)
+        if isinstance(detail, str):
+            try:
+                detail = json.loads(detail)
+            except ValueError:
+                detail = {}
+        detail = detail if isinstance(detail, dict) else {}
         missing = [k for k in ("ca_name", "cluster_id", "intermediate_kms_key_arn",
                                "ca_bundle_ssm_param", "root_ca_ssm_param",
                                "intermediate_ca_ssm_param", "artifacts_bucket")
@@ -377,6 +388,20 @@ def main():
         check(not missing, "the detail carries the whole contract", str(missing))
         check(detail.get("ca_name") == "corp-pki",
               "the detail names the CA (consumers match on it)", str(detail.get("ca_name")))
+        check(detail.get("artifacts_bucket") == "corp-pki-pki-artifacts",
+              "the detail carries the bucket", str(detail.get("artifacts_bucket")))
+
+        retried = [e for r in publish.get("Retry", []) for e in r.get("ErrorEquals", [])]
+        check("EventBridge.FailedEntry" in retried,
+              "a dropped event is retried, not silently accepted", str(retried))
+        # The failure lands here, after teardown: routing to cleanup would delete
+        # an already-deleted HSM and terminate an already-terminated host.
+        catch_targets = [c.get("Next") for c in publish.get("Catch", [])]
+        check(catch_targets == ["FailCaEventPublish"],
+              "a failed publish goes to its own Fail, not through cleanup",
+              str(catch_targets))
+        check(states.get("FailCaEventPublish", {}).get("Type") == "Fail",
+              "FailCaEventPublish is a Fail state")
 
         # The event must be the last Thing To Happen: HSM gone, backup READY,
         # host terminated — otherwise a consumer activates against a chain whose

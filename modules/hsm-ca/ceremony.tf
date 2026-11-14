@@ -527,9 +527,34 @@ resource "aws_iam_instance_profile" "ceremony_host" {
 ###############################################################################
 
 data "aws_iam_policy_document" "intermediate_ca_key" {
+  # Key administration, deliberately without any condition: the account root may
+  # read, update and schedule deletion of this key from any principal IAM lets
+  # manage KMS, so Terraform never locks itself out of the key it created.
+  #
+  # The list excludes kms:Sign and kms:Verify on purpose. A bare kms:* here would
+  # mean any role with an IAM policy granting kms:Sign could sign with any digest
+  # and algorithm, which would defeat CaSignDigestOnly below: key policy and
+  # identity policy must both allow an action, so the narrower one wins.
   statement {
-    sid       = "AccountAdministration"
-    actions   = ["kms:*"]
+    sid = "AccountAdministration"
+    actions = [
+      "kms:CancelKeyDeletion",
+      "kms:CreateAlias",
+      "kms:DeleteAlias",
+      "kms:DescribeKey",
+      "kms:DisableKey",
+      "kms:EnableKey",
+      "kms:GetKeyPolicy",
+      "kms:GetKeyRotationStatus",
+      "kms:GetPublicKey",
+      "kms:ListResourceTags",
+      "kms:ListKeyPolicies",
+      "kms:PutKeyPolicy",
+      "kms:ScheduleKeyDeletion",
+      "kms:TagResource",
+      "kms:UntagResource",
+      "kms:UpdateAlias",
+    ]
     resources = ["*"]
 
     principals {

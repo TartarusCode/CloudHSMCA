@@ -691,24 +691,32 @@
     },
     "PublishCaReadyEvent": {
       "Type": "Task",
-      "Comment": "Announce the published chain. Consumers (Roles Anywhere, ALB mTLS, VPN, TLS) subscribe to this instead of Terraform knowing about them.",
-      "Resource": "arn:aws:states:::aws-sdk:eventbridge:putEvents",
+      "Comment": "Announce the published chain. The optimized EventBridge integration takes Detail as an object and raises EventBridge.FailedEntry when AWS drops the entry, unlike the aws-sdk integration which returns 200 with FailedEntryCount=1.",
+      "Resource": "arn:aws:states:::events:putEvents",
       "Parameters": {
         "Entries": [
           {
             "EventBusName": "${event_bus_name}",
             "Source": "cloudhsmca.pki",
             "DetailType": "CAChainPublished",
-            "Detail": "{\"ca_name\":\"${ca_name}\",\"cluster_id\":\"${cluster_id_out}\",\"intermediate_kms_key_arn\":\"${kms_key_arn_out}\",\"ca_bundle_ssm_param\":\"${ca_bundle_ssm_pem}\",\"root_ca_ssm_param\":\"${root_ca_ssm_pem}\",\"intermediate_ca_ssm_param\":\"${intermediate_ssm_pem}\",\"artifacts_bucket\":\"${bucket_out}\"}"
+            "Detail": {
+              "ca_name": "${ca_name}",
+              "cluster_id": "${cluster_id_out}",
+              "intermediate_kms_key_arn": "${kms_key_arn_out}",
+              "ca_bundle_ssm_param": "${ca_bundle_ssm_pem}",
+              "root_ca_ssm_param": "${root_ca_ssm_pem}",
+              "intermediate_ca_ssm_param": "${intermediate_ssm_pem}",
+              "artifacts_bucket": "${bucket_out}"
+            }
           }
         ]
       },
       "ResultPath": "$.eventResult",
       "Retry": [
         {
-          "ErrorEquals": ["States.ALL"],
-          "IntervalSeconds": 5,
-          "MaxAttempts": 6,
+          "ErrorEquals": ["EventBridge.FailedEntry", "Events.InternalException", "States.TaskFailed"],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
           "BackoffRate": 2.0
         }
       ],
@@ -716,10 +724,16 @@
         {
           "ErrorEquals": ["States.ALL"],
           "ResultPath": "$.error",
-          "Next": "CleanupHsmOnFailure"
+          "Next": "FailCaEventPublish"
         }
       ],
       "Next": "CeremonySucceeded"
+    },
+    "FailCaEventPublish": {
+      "Type": "Fail",
+      "Comment": "Publish runs after the host is terminated and the backup is READY, so there is nothing left to tear down: report the publish failure directly instead of routing through cleanup, which would delete an already-deleted HSM and terminate an already-terminated host.",
+      "Error": "CaEventPublishFailed",
+      "CausePath": "States.Format('chain published to SSM and the HSM is gone, but CAChainPublished was not emitted: {} | mode={} : {}', $.error.Error, $.mode, $.error.Cause)"
     },
     "CeremonySucceeded": {
       "Type": "Succeed"
