@@ -18,10 +18,12 @@ env:
   MODULE: "."
 
   # One provider cache for every configuration. `make init` populates it once,
-  # so the providers are downloaded and stored a single time per lock file
-  # instead of once per directory, and the cache action below carries it
-  # between runs.
+  # so the providers are downloaded and stored a single time instead of once per
+  # directory, and the cache action below carries it between runs. The dependency
+  # lock file is not tracked (see .gitignore), so the cache may resolve without
+  # pinning package hashes into one.
   TF_PLUGIN_CACHE_DIR: ${{ github.workspace }}/.terraform-plugin-cache
+  TF_PLUGIN_CACHE_MAY_BREAK_DEPENDENCY_LOCK_FILE: "true"
 
 jobs:
   terraform:
@@ -38,7 +40,7 @@ jobs:
       - uses: actions/cache@v6
         with:
           path: ${{ env.TF_PLUGIN_CACHE_DIR }}
-          key: tf-providers-${{ runner.os }}-${{ env.TF_VERSION }}-${{ hashFiles('**/.terraform.lock.hcl') }}
+          key: tf-providers-${{ runner.os }}-${{ env.TF_VERSION }}-${{ hashFiles('**/versions.tf') }}
           restore-keys: |
             tf-providers-${{ runner.os }}-${{ env.TF_VERSION }}-
 
@@ -76,7 +78,7 @@ jobs:
       - uses: actions/cache@v6
         with:
           path: ${{ env.TF_PLUGIN_CACHE_DIR }}
-          key: tf-providers-${{ runner.os }}-${{ env.TF_VERSION }}-${{ hashFiles('**/.terraform.lock.hcl') }}
+          key: tf-providers-${{ runner.os }}-${{ env.TF_VERSION }}-${{ hashFiles('**/versions.tf') }}
           restore-keys: |
             tf-providers-${{ runner.os }}-${{ env.TF_VERSION }}-
 
@@ -125,6 +127,17 @@ jobs:
           set -euo pipefail
           if git ls-files | grep -E '\.(tfstate|tfplan|tfvars|pem|key|csr)$'; then
             echo "::error::generated or secret material must not be tracked"
+            exit 1
+          fi
+
+      - name: no dependency lock file tracked
+        run: |
+          set -euo pipefail
+          # This is a reusable module, so providers resolve against versions.tf.
+          # A committed lock file pins one platform's package hashes and then
+          # fails on another OS/arch, or freezes CI on a stale provider set.
+          if git ls-files | grep -E '(^|/)\.terraform\.lock\.hcl$'; then
+            echo "::error::.terraform.lock.hcl must not be tracked"
             exit 1
           fi
 

@@ -1,6 +1,11 @@
 # Local .terraform directories
 .terraform/
 
+# Never track the dependency lock file: a reusable module resolves providers
+# against versions.tf in CI, and a committed lock file pins one platform's
+# package hashes, which then fails on linux_amd64 vs darwin_arm64.
+**/.terraform.lock.hcl
+
 # Shared provider cache (see TF_PLUGIN_CACHE_DIR in the Makefile)
 .terraform-plugin-cache/
 

@@ -17,7 +17,7 @@
 
 ```bash
 make init        # one init per configuration, into one shared provider cache
-make -j4 check   # fmt-check, validate, examples, lint, and all five harnesses
+make -j4 check   # fmt-check, validate, examples, lint, and all seven harnesses
 ```
 
 `make check` is what CI runs (`fmt-check`, validate on all three modules and
@@ -27,8 +27,16 @@ in the provider cache.
 
 `TF_PLUGIN_CACHE_DIR` defaults to `.terraform-plugin-cache` in the working tree
 (gitignored); point it elsewhere with a make variable if you prefer. `make clean`
-removes the `.terraform` directories and keeps the cache; `make cache-clean`
-drops the cache too.
+removes the `.terraform` directories, any local lock files, and keeps the cache;
+`make cache-clean` drops the cache too.
+
+`.terraform.lock.hcl` is **not** tracked, and `.gitignore` says so. Providers are
+constrained by `versions.tf` and resolved fresh, so CI is not frozen on one
+provider set and a contributor on `darwin/arm64` does not hit hash mismatches
+recorded on `linux/amd64`. `TF_PLUGIN_CACHE_MAY_BREAK_DEPENDENCY_LOCK_FILE=true`
+is exported for the same reason: the shared cache may serve providers without
+pinning their package hashes into a file that must never be committed. The
+hygiene job fails the build if a lock file is ever added.
 
 ## Changing the ceremony or the CA tooling
 

@@ -25,6 +25,10 @@ CONFIGS  := $(MODULE) $(MODULES) $(EXAMPLES)
 # `make TF_PLUGIN_CACHE_DIR=/var/cache/tf check`.
 TF_PLUGIN_CACHE_DIR ?= $(CURDIR)/.terraform-plugin-cache
 export TF_PLUGIN_CACHE_DIR
+# The lock file is deliberately untracked (see .gitignore), so let the plugin
+# cache feed init without pinning package hashes into it; otherwise every init
+# writes a lock file that must never be committed.
+export TF_PLUGIN_CACHE_MAY_BREAK_DEPENDENCY_LOCK_FILE = true
 
 .DEFAULT_GOAL := help
 .PHONY: help init fmt fmt-check validate examples lint docs test check clean cache-clean
@@ -80,8 +84,9 @@ check: fmt-check lint validate examples test ## Everything CI runs
 	@echo
 	@echo "check: OK"
 
-clean: ## Remove local Terraform working directories
+clean: ## Remove local Terraform working directories and lock files
 	find . -type d -name .terraform -prune -exec rm -rf {} +
+	find . -name .terraform.lock.hcl -delete
 	rm -rf tests/lambda/__pycache__ tests/__pycache__
 
 cache-clean: ## Remove the shared provider cache (it is only a cache)

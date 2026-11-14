@@ -1,51 +1,44 @@
 version: 2
+
+# One terraform entry covers the root module, every submodule and every example,
+# so a provider bump is one pull request instead of one per directory. The group
+# folds all provider updates into a single PR as well.
 updates:
   - package-ecosystem: terraform
-    directory: /
+    directories:
+      - "/"
+      - "/modules/*"
+      - "/examples/*"
     schedule:
       interval: weekly
     open-pull-requests-limit: 5
-    commit-message:
-      prefix: "chore(deps)"
-
-  - package-ecosystem: terraform
-    directory: /modules/hsm-ca
-    schedule:
-      interval: weekly
-    commit-message:
-      prefix: "chore(deps)"
-
-  - package-ecosystem: terraform
-    directory: /modules/roles-anywhere
-    schedule:
-      interval: weekly
-    commit-message:
-      prefix: "chore(deps)"
-
-  - package-ecosystem: terraform
-    directory: /examples/complete
-    schedule:
-      interval: weekly
-    commit-message:
-      prefix: "chore(deps)"
-
-  - package-ecosystem: terraform
-    directory: /examples/standalone-hsm-ca
-    schedule:
-      interval: weekly
-    commit-message:
-      prefix: "chore(deps)"
-
-  - package-ecosystem: terraform
-    directory: /examples/auto-bootstrap
-    schedule:
-      interval: weekly
+    groups:
+      terraform-providers:
+        patterns: ["*"]
     commit-message:
       prefix: "chore(deps)"
 
   - package-ecosystem: github-actions
-    directory: /
+    directory: "/"
     schedule:
       interval: weekly
+    groups:
+      github-actions:
+        patterns: ["*"]
     commit-message:
       prefix: "chore(ci)"
+
+# Two notes on what the terraform entry can and cannot do here.
+#
+# `versioning-strategy: widen` is not applied. Dependabot supports that key for
+# bundler, cargo, composer, helm, mix, npm, pip, pub and uv only, and
+# dependabot-core's terraform requirements updater has no versioning-strategy
+# handling at all. It is also unnecessary: the terraform ecosystem never rewrites
+# `required_providers` constraints — it bumps the resolved provider versions in
+# .terraform.lock.hcl and registry module `version` attributes. This repository
+# tracks no lock file on purpose and uses local module sources, so no `>=` floor
+# can be raised by a bot.
+#
+# Because the lock file is untracked, provider updates are what CI resolves on
+# every run (against the ranges in versions.tf), not something Dependabot opens
+# PRs for. The groups and directories above keep whatever it does find to one PR.
