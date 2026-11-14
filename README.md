@@ -20,7 +20,7 @@ about **$2/month** at steady state instead of **$400+/month** for ACM Private CA
 
 ```hcl
 module "corp_pki" {
-  source = "git::https://github.com/TartarusCode/CloudHSMCA.git?ref=main"
+  source = "git::https://github.com/TartarusCode/CloudHSMCA.git?ref=v0.5.0"
 
   name               = "corp-pki"
   vpc_id             = "vpc-0123456789abcdef0"
@@ -49,7 +49,7 @@ activates them when it runs (see below).
 ```hcl
 # stack 1 — the PKI engine, its own state file, touched once per CA lifetime
 module "hsm_ca" {
-  source = "git::https://github.com/TartarusCode/CloudHSMCA.git//modules/hsm-ca?ref=main"
+  source = "git::https://github.com/TartarusCode/CloudHSMCA.git//modules/hsm-ca?ref=v0.5.0"
 
   name               = "corp-pki"
   vpc_id             = "vpc-0123456789abcdef0"
@@ -59,7 +59,7 @@ module "hsm_ca" {
 
 # stack 2 — consumers, their own state, reviewed and applied by workload teams
 module "roles_anywhere" {
-  source = "git::https://github.com/TartarusCode/CloudHSMCA.git//modules/roles-anywhere?ref=main"
+  source = "git::https://github.com/TartarusCode/CloudHSMCA.git//modules/roles-anywhere?ref=v0.5.0"
 
   ca_contract = module.hsm_ca.ca_contract   # or a terraform_remote_state lookup
   workload_profiles = {
@@ -68,7 +68,7 @@ module "roles_anywhere" {
 }
 
 module "alb_mtls" {
-  source = "git::https://github.com/TartarusCode/CloudHSMCA.git//modules/alb-mtls?ref=main"
+  source = "git::https://github.com/TartarusCode/CloudHSMCA.git//modules/alb-mtls?ref=v0.5.0"
 
   ca_contract = module.hsm_ca.ca_contract
 }

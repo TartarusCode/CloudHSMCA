@@ -6,6 +6,10 @@ semantic versioning once it is tagged.
 
 ## [0.5.0] - 2026-11-14
 
+First tagged release. The module is usable end to end: one apply creates the
+cluster shell and the disabled trust stores, the ceremony turns them on, and both
+consumers keep their CRLs current.
+
 ### Added
 
 - `modules/alb-mtls`: the second consumer — an ELBv2 trust store for ALB mutual
@@ -18,12 +22,44 @@ semantic versioning once it is tagged.
   chain with the deployed KMS key, publishes it, emits a synthetic
   `CAChainPublished` and asserts the trust anchor and CRL come up.
   `--restore-pending` puts the stack back.
+- `scripts/workflow_lint.py` and `make workflow-lint`: structural checks the
+  Actions YAML can drift out of (top-level `permissions`, per-job
+  `timeout-minutes`, `shell` on every composite `run:`, no expressions in action
+  metadata), then `actionlint`. Runs in `make check` and in CI.
+- `start_rotation_command` at the root, next to `start_bootstrap_command`.
 
 ### Changed
 
-- `modules/hsm-ca` is fully workload-agnostic in name too: the KMS key description
-  is `<name> Intermediate CA Signing Key`, and the ceremony's description mentions
-  no consumer.
+- `modules/hsm-ca` is workload-agnostic in name as well as in behaviour: the KMS
+  key description is `<name> Intermediate CA Signing Key`, and neither the state
+  machine's comment nor the CA tool's docstrings mention a consumer.
+- The root README is a registry-style document — badges, cost table, three usage
+  patterns, architecture, day-2 operations — with `terraform-docs` tables
+  (`make docs`). `modules/hsm-ca` and `modules/roles-anywhere` gained the READMEs
+  they never had.
+- `.terraform.lock.hcl` is no longer tracked and `.gitignore` says so; providers
+  resolve against `versions.tf`, and CI fails if a lock file is ever added. A
+  Monday 08:00 UTC run resolves the newest `hashicorp/aws` with `init -upgrade`.
+- CI: Terraform setup, the provider cache and `make init` moved into
+  `.github/actions/setup-terraform-env`; tflint plugins and Python wheels are
+  cached; every job has a `timeout-minutes`; the pinned CLI is 1.17.2 and a
+  second step validates all seven configurations with 1.6.6, the floor that
+  `required_version = ">= 1.6.0"` promises.
+- Dependabot: one grouped `terraform` entry over `/`, `/modules/*` and
+  `/examples/*`, plus `github-actions` covering the composite action.
+
+### Fixed
+
+- `start_bootstrap_command` and `start_rotation_command` emitted
+  `--input {"mode":"BOOTSTRAP"}` unquoted, so piping to `bash` stripped the inner
+  quotes and Step Functions received `{mode:BOOTSTRAP}`. Both now emit a
+  single-quoted argument.
+- The composite action named `${{ env.TF_VERSION }}` inside an input
+  `description`, which GitHub evaluates without the `env` context — the action
+  failed to load entirely. `workflow_lint.py` now rejects expressions in action
+  metadata in both of its parsers.
+- The composite action ran `terraform version` before the plugin cache directory
+  existed, printing a CLI configuration error on every run.
 
 ## [0.4.0] - 2026-11-13
 
