@@ -12,6 +12,9 @@ Two layers, because they catch different things:
        - every `run:` step in a composite action declares `shell` (the default
          shell differs between bash and sh, and only `shell: bash` gets
          `-eo pipefail`)
+       - no `${{ }}` in action metadata: GitHub evaluates expressions there, and
+         the `env` context is not among the valid named-values, so a
+         `description` that mentions one makes the whole action fail to load
   2. `actionlint`, which knows the actual expression grammar, event payloads and
      action input schemas
 
@@ -67,6 +70,7 @@ def check_with_yaml(path, doc, is_action):
     problems = []
 
     if is_action:
+        problems.extend(metadata_expressions(doc))
         runs = (doc or {}).get("runs") or {}
         if runs.get("using") != "composite":
             return problems
@@ -90,6 +94,24 @@ def check_with_yaml(path, doc, is_action):
     return problems
 
 
+def metadata_expressions(doc):
+    """Expressions in action metadata are evaluated with a context set that does
+    not include `env`; naming one there makes the action fail to load."""
+    problems = []
+    if not isinstance(doc, dict):
+        return problems
+    for key in ("name", "description"):
+        if "${{" in str(doc.get(key) or ""):
+            problems.append(f"`{key}:` contains an expression; metadata is "
+                            f"evaluated without the `env` context")
+    for input_id, spec in (doc.get("inputs") or {}).items():
+        if isinstance(spec, dict) and "${{" in str(spec.get("description") or ""):
+            problems.append(f"input `{input_id}`: `description:` contains an "
+                            f"expression; metadata is evaluated without the "
+                            f"`env` context")
+    return problems
+
+
 # --------------------------------------------------------------------------- #
 # stdlib fallback: an indentation scan of exactly the keys we assert on
 # --------------------------------------------------------------------------- #
@@ -107,6 +129,15 @@ def check_text(text, is_action):
             re.match(r"^\s+using:\s*composite\s*(#.*)?$", line) for line in lines)
         if not using_composite:
             return problems
+
+        # metadata lives above `runs:`; expressions there are rejected by GitHub
+        for line in lines:
+            if re.match(r"^runs\s*:", line):
+                break
+            if "${{" in line and not line.lstrip().startswith("#"):
+                problems.append("metadata contains an expression; metadata is "
+                                "evaluated without the `env` context")
+                break
 
         in_steps = False
         steps_indent = 0
@@ -140,8 +171,10 @@ def check_text(text, is_action):
                 if match:
                     step[match.group(1)] = True
 
-        return [f"{item['name'] or 'step'}: `run:` without `shell:`"
-                for item in steps if item["run"] and not item["shell"]]
+        # keep the metadata findings collected above: this path returns early
+        return problems + [
+            f"{item['name'] or 'step'}: `run:` without `shell:`"
+            for item in steps if item["run"] and not item["shell"]]
 
     if not any(re.match(r"^permissions\s*:", line) for line in lines):
         problems.append("no top-level `permissions:`")
@@ -231,6 +264,11 @@ def main(argv):
 
     version = subprocess.run([exe, "--version"], capture_output=True, text=True)
     print(f"actionlint: {version.stdout.splitlines()[0] if version.stdout else exe}")
+    if shutil.which("shellcheck") is None:
+        # actionlint silently skips its shellcheck-backed rules without this
+        # binary, so a local pass can differ from CI, which has it preinstalled.
+        print("actionlint: shellcheck not installed, script checks are skipped "
+              "(CI runs them)")
     # No path arguments on purpose. actionlint has no composite-action mode: given
     # action.yml as an argument it parses it as a workflow and complains about a
     # missing `on:`. It checks a local action when a workflow uses it, so running

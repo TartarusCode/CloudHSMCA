@@ -6,7 +6,7 @@ description: >-
 
 inputs:
   terraform-version:
-    description: Terraform CLI version, normally `${{ env.TF_VERSION }}` from the workflow.
+    description: Terraform CLI version, normally the workflow's TF_VERSION env var.
     required: false
     default: "1.9.8"
   run-init:

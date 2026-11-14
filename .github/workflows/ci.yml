@@ -64,7 +64,8 @@ jobs:
                  seen && /^[[:space:]]*version[[:space:]]*=/ {print $3; exit}' \
               .terraform.lock.hcl 2>/dev/null | tr -d '"'
           )
-          configs=$(( $(ls -d modules/*/ examples/*/ | wc -l) + 1 ))
+          set -- modules/*/ examples/*/
+          configs=$(( $# + 1 ))
           {
             echo "### Terraform validation"
             echo
