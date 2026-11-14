@@ -13,6 +13,9 @@
 #   tests/lambda   — modules/roles-anywhere's Lambda: the CAChainPublished
 #                    activation path, the scheduled refresh, the no-chain skip,
 #                    and the CRL itself, verified with openssl
+#   modules/alb-mtls/tests — the ALB trust-store consumer: its locals, the
+#                    activation path (bundle to S3, ModifyTrustStore), the
+#                    add-then-remove CRL rotation, and the CRL via openssl
 #
 # usage: tests/run-all.sh
 set -uo pipefail
@@ -42,6 +45,7 @@ run "asl invariants (hsm-ca, no consumer coupling)" python3 "$HERE/asl_invariant
 run "crypto (kms_ca_tool.py)" bash "$HERE/crypto/test_kms_ca_tool.sh" "$HsmCa"
 run "ceremony (hsm_ceremony.sh)" bash "$HERE/ceremony/run.sh" "$HsmCa"
 run "lambda (activation + CRL refresh)" python3 "$HERE/lambda/test_lambda.py" "$RolesAnywhere"
+run "alb-mtls consumer (trust store + CRL rotation)" bash "$ROOT/modules/alb-mtls/tests/run-all.sh" "$ROOT/modules/alb-mtls"
 
 echo
 if [ "$fail" -eq 0 ]; then

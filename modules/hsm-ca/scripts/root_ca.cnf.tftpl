@@ -7,7 +7,8 @@
 #   2. `openssl x509 -req -extfile root_ca.cnf -extensions v3_root_ca ...`
 #      for an independent cross-check of anything this module issues.
 #
-# Constraints enforced by IAM Roles Anywhere / RFC 5280:
+# Constraints required by RFC 5280 and by every consumer (Roles Anywhere,
+# an ALB mTLS trust store, a TLS stack):
 #   basicConstraints  critical, CA:TRUE
 #   keyUsage          critical, keyCertSign + cRLSign only
 #   subjectKeyIdentifier / authorityKeyIdentifier  required for chain building

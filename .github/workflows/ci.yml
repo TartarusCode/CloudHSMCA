@@ -87,11 +87,12 @@ jobs:
 
       - name: compile python
         run: |
-          python -m compileall -q tests modules/hsm-ca/scripts modules/roles-anywhere
+          python -m compileall -q tests modules/hsm-ca/scripts modules/roles-anywhere modules/alb-mtls
 
       - name: syntax check the shell tools
         run: |
           for f in modules/hsm-ca/scripts/*.sh.tftpl modules/hsm-ca/scripts/*.sh \
+                   scripts/*.sh modules/*/tests/*.sh modules/*/tests/*/*.sh \
                    tests/*.sh tests/*/*.sh; do
             [ -f "$f" ] || continue
             bash -n "$f"

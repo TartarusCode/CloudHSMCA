@@ -14,7 +14,7 @@
 # each configuration would download its own copy of the providers.
 
 MODULE   ?= .
-MODULES  := modules/hsm-ca modules/roles-anywhere
+MODULES  := modules/hsm-ca modules/roles-anywhere modules/alb-mtls
 TF       ?= terraform
 EXAMPLES := $(patsubst %/main.tf,%,$(wildcard examples/*/main.tf))
 CONFIGS  := $(MODULE) $(MODULES) $(EXAMPLES)

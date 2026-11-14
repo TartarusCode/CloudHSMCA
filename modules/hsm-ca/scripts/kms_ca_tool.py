@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-kms_ca_tool.py — issue X.509 artifacts for an AWS IAM Roles Anywhere PKI whose
-private keys never exist in a file: the Intermediate CA key lives in AWS KMS
+kms_ca_tool.py — issue X.509 artifacts for a PKI whose private keys never
+exist in a file: the Intermediate CA key lives in AWS KMS
 (asymmetric SIGN_VERIFY) and the offline Root CA key lives in AWS CloudHSM.
 
 Why this file exists
@@ -36,8 +36,8 @@ Subcommands
   create-intermediate-csr CSR for the KMS Intermediate CA key
   sign-csr                issue a certificate for a CSR (Root signs Intermediate)
   sign-leaf-csr           issue a clientAuth leaf for a workload
-  generate-crl            build a DER CRL and (optionally) import it into
-                          IAM Roles Anywhere
+  generate-crl            build a CRL (DER and PEM) and, optionally, import it
+                          into a consumer that accepts one (IAM Roles Anywhere)
 
 Extension sets come from the OpenSSL configuration rendered by Terraform
 (scripts/root_ca.cnf.tftpl, scripts/intermediate_ca.cnf.tftpl) so there is one
@@ -746,7 +746,8 @@ def cmd_sign_leaf_csr(args) -> None:
 
     issuer_ski = issuer.extensions.get_extension_for_class(
         x509.SubjectKeyIdentifier).value
-    # IAM Roles Anywhere contract for workload certificates.
+    # The clientAuth leaf profile every consumer expects: Roles Anywhere, an
+    # ALB mTLS trust store, a TLS server that accepts client certificates.
     extensions = [
         (x509.BasicConstraints(ca=False, path_length=None), True),
         (x509.KeyUsage(digital_signature=True, content_commitment=False,
@@ -932,7 +933,7 @@ def build_signer(args) -> Signer:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Issue Roles Anywhere X.509 artifacts with KMS or CloudHSM keys.")
+        description="Issue X.509 artifacts with KMS or CloudHSM keys.")
     sub = parser.add_subparsers(dest="command", required=True)
 
     def common(p):

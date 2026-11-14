@@ -2,7 +2,7 @@
 # The durable foundation
 #
 # Everything the PKI needs that outlives a ceremony, in the same module as the
-# ceremony and the Roles Anywhere runtime — one apply, no cross-stack hand-over:
+# ceremony — one apply, no cross-stack hand-over:
 #
 #  * aws_s3_bucket           tooling, issued certificates, CRLs and revocation
 #                            input. Versioned, Object-Locked, TLS-only.

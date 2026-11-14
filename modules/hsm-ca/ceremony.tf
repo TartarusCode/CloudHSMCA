@@ -630,7 +630,7 @@ data "aws_iam_policy_document" "intermediate_ca_key" {
 }
 
 resource "aws_kms_key" "intermediate_ca" {
-  description = "${var.name} IAM Roles Anywhere Intermediate CA (${var.intermediate_key_spec})"
+  description = "${var.name} Intermediate CA Signing Key (${var.intermediate_key_spec})"
   key_usage   = "SIGN_VERIFY"
   # `key_spec` exists in aws 5.x but is gone in 6.x; `customer_master_key_spec`
   # is accepted by both, which the declared range needs.

@@ -215,3 +215,27 @@ variable "crl_validity_days" {
   type        = number
   default     = 7
 }
+
+variable "enable_alb_mtls" {
+  description = "Create the ALB mutual-TLS consumer (ELBv2 trust store + activation/CRL Lambda). false = no trust store."
+  type        = bool
+  default     = false
+}
+
+variable "alb_mtls_name" {
+  description = "S3 prefix name for the ALB trust store artifacts (alb-mtls/<name>/). Empty = the CA's name."
+  type        = string
+  default     = ""
+}
+
+variable "alb_trust_store_name" {
+  description = "Explicit ELBv2 trust store name (max 32 chars). Empty = <ca_name>-alb-mtls."
+  type        = string
+  default     = ""
+}
+
+variable "alb_revoked_serials_ssm_param" {
+  description = "SSM parameter holding revoked serials as JSON for the ALB CRL. Empty = issue an empty CRL."
+  type        = string
+  default     = ""
+}

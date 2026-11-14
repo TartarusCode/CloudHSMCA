@@ -1,7 +1,7 @@
 # Tests
 
-Five offline harnesses across the two modules. None needs an AWS account, an HSM,
-or credentials.
+Seven offline harnesses across the three modules. None needs an AWS account, an
+HSM, or credentials.
 
 ```bash
 make test        # or: tests/run-all.sh
@@ -14,6 +14,8 @@ make test        # or: tests/run-all.sh
 | `tests/crypto/test_kms_ca_tool.sh` | `modules/hsm-ca` |
 | `tests/ceremony/run.sh` | `modules/hsm-ca` |
 | `tests/lambda/test_lambda.py` | `modules/roles-anywhere` |
+| `modules/alb-mtls/tests/module/smoke.sh` | `modules/alb-mtls` |
+| `modules/alb-mtls/tests/lambda/test_lambda.py` | `modules/alb-mtls` |
 
 ## `module/smoke.sh`
 
@@ -104,3 +106,39 @@ behaviour, Roles Anywhere's acceptance of the CRL, and EventBridge actually
 delivering the event to the consumer's rule. The first real bootstrap is the test
 for those; the failure paths are built to fail loudly and tear down rather than
 leave an HSM billing.
+
+## Live Sandbox Verification ($0 No-HSM Smoke Test)
+
+Three of the four live-only unknowns can be proved without a CloudHSM instance:
+
+```bash
+# after terraform apply with auto_bootstrap = false and enable_roles_anywhere = true
+./scripts/verify_live_control_plane.sh examples/complete
+./scripts/verify_live_control_plane.sh examples/complete --restore-pending
+```
+
+What it does, in about a minute, for **$0.00**:
+
+1. asserts the placeholder trust anchor exists and is `DISABLED`;
+2. builds a two-certificate chain locally — an ephemeral openssl Root CA plus an
+   Intermediate signed by the **real deployed KMS key** (`kms_ca_tool.py
+   create-intermediate-csr` + `sign-csr`), verified with `openssl verify`;
+3. writes it to the stack's `root_ca.pem`, `intermediate_ca.pem` and
+   `ca_bundle.pem` SSM parameters, where the ceremony would write it;
+4. emits a synthetic `cloudhsmca.pki` / `CAChainPublished` with
+   `aws events put-events` and fails if EventBridge reports `FailedEntryCount`;
+5. polls `get-trust-anchor` and `list-crls` for up to 60 s and asserts the anchor
+   is `ENABLED` with two certificates **and** an enabled CRL.
+
+That single run exercises `CreateTrustAnchor`'s placeholder acceptance, the
+EventBridge rule and its delivery, the consumer Lambda, the KMS key policy's
+`CaSignDigestOnly` delegation (the Lambda signs the CRL with the real key), and
+Roles Anywhere accepting `ImportCrl`.
+
+`--restore-pending` resets the three parameters to `PENDING-CEREMONY` and disables
+the anchor, so a real ceremony can run afterwards. The script mutates a deployed
+stack: use a sandbox.
+
+The fourth unknown — CloudHSM control-plane timing (cluster activation, HSM
+`ACTIVE`, the ENI `configure-cli` step) — still needs one real ceremony, and costs
+about $1.50/hour while it runs.

@@ -4,6 +4,27 @@ All notable changes to this repository are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the module follows
 semantic versioning once it is tagged.
 
+## [0.5.0] - 2026-11-14
+
+### Added
+
+- `modules/alb-mtls`: the second consumer — an ELBv2 trust store for ALB mutual
+  TLS, created once against a placeholder bundle and then kept current by a sync
+  Lambda triggered by `CAChainPublished` and a 24-hour schedule. CRL rotation adds
+  the new CRL before removing the previous `RevocationId`, so there is never a
+  window with no revocation data. Wired into the composite behind
+  `enable_alb_mtls` (default `false`); `alb_trust_store_arn` is an output.
+- `scripts/verify_live_control_plane.sh`: a $0, no-HSM smoke test that builds a
+  chain with the deployed KMS key, publishes it, emits a synthetic
+  `CAChainPublished` and asserts the trust anchor and CRL come up.
+  `--restore-pending` puts the stack back.
+
+### Changed
+
+- `modules/hsm-ca` is fully workload-agnostic in name too: the KMS key description
+  is `<name> Intermediate CA Signing Key`, and the ceremony's description mentions
+  no consumer.
+
 ## [0.4.0] - 2026-11-13
 
 Breaking: the PKI engine and the workload consumers are separate modules joined by

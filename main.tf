@@ -50,3 +50,17 @@ module "roles_anywhere" {
   log_retention_days = var.log_retention_days
   tags               = var.tags
 }
+
+module "alb_mtls" {
+  source = "./modules/alb-mtls"
+  count  = var.enable_alb_mtls ? 1 : 0
+
+  ca_contract = module.hsm_ca.ca_contract
+
+  name                      = var.alb_mtls_name
+  trust_store_name          = var.alb_trust_store_name
+  revoked_serials_ssm_param = var.alb_revoked_serials_ssm_param
+  crl_validity_days         = var.crl_validity_days
+  log_retention_days        = var.log_retention_days
+  tags                      = var.tags
+}

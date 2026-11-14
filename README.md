@@ -11,8 +11,8 @@ A hardware-backed internal PKI, built for roughly **$20/year** instead of the
   (`SIGN_VERIFY`, ECC), so its private key never leaves AWS's FIPS 140-3 Level 3
   fleet;
 - consumers turn certificates into whatever they need: temporary AWS credentials
-  (IAM Roles Anywhere), an mTLS trust store (ALB, API Gateway), a VPN, or plain
-  PEMs for internal TLS.
+  (IAM Roles Anywhere), an ELBv2 trust store for ALB mutual TLS, an API Gateway
+  authorizer, a VPN, or plain PEMs for internal TLS.
 
 | | steady-state cost |
 |---|---|
@@ -20,7 +20,7 @@ A hardware-backed internal PKI, built for roughly **$20/year** instead of the
 | Lambda, S3, SSM, Step Functions, EventBridge | cents |
 | CloudHSM | **$0/hr** — no HSM exists outside a ceremony run (~$1.50/hr for one) |
 
-## Two modules and one contract
+## Three modules and one contract
 
 ```
 modules/hsm-ca            the PKI engine — knows nothing about workloads
@@ -32,9 +32,13 @@ modules/hsm-ca            the PKI engine — knows nothing about workloads
         │  SSM: /<name>/pki/{root_ca,intermediate_ca,ca_bundle}.pem
         │  EventBridge: source=cloudhsmca.pki  detail-type=CAChainPublished
         ▼
-modules/roles-anywhere    one consumer among many
+modules/roles-anywhere    consumer 1: temporary AWS credentials
   roles_anywhere.tf       placeholder trust anchor, workload roles, profiles
   crl_issuer_lambda.tf    activation + 24h CRL refresh (one Lambda, two triggers)
+
+modules/alb-mtls          consumer 2: ALB mutual TLS
+  main.tf                 S3 placeholder bundle + aws_lb_trust_store
+  sync_lambda.tf          activation + 24h CRL rotation (add new, then remove old)
 ```
 
 `modules/hsm-ca` emits `ca_contract` — ARNs, SSM parameter names, the artifact
@@ -90,7 +94,8 @@ change for it.
 
 ## Quick start
 
-Composite (PKI + Roles Anywhere), fast path:
+Composite (PKI + Roles Anywhere by default, ALB mTLS behind
+`enable_alb_mtls`), fast path:
 
 ```bash
 cd examples/complete
@@ -180,9 +185,11 @@ be covered.
 ```
 .
 ├── main.tf variables.tf outputs.tf versions.tf   composite: hsm_ca + roles_anywhere
+├── scripts/verify_live_control_plane.sh   $0 smoke test against a deployed stack
 ├── modules/
 │   ├── hsm-ca/          engine: cluster, KMS key, ceremony, SSM, bucket, event
-│   └── roles-anywhere/  consumer: trust anchor, profiles, roles, CRL Lambda
+│   ├── roles-anywhere/  consumer: trust anchor, profiles, roles, CRL Lambda
+│   └── alb-mtls/        consumer: ELBv2 trust store + activation/CRL Lambda
 ├── tests/               five offline harnesses (see tests/README.md)
 └── examples/
     ├── complete/          composite, auto_bootstrap = false
@@ -192,7 +199,7 @@ be covered.
 
 ## Testing
 
-Five offline harnesses, **no AWS account, no HSM, no credentials**:
+Seven offline harnesses, **no AWS account, no HSM, no credentials**:
 
 | harness | proves |
 |---|---|
@@ -200,7 +207,9 @@ Five offline harnesses, **no AWS account, no HSM, no credentials**:
 | `tests/asl_invariants.py` | the rendered state machine: cleanup on `States.ALL`, cause preservation, SSM readiness, the backup gate, and that it ends with `PublishCaReadyEvent` and has **no** `rolesanywhere` coupling |
 | `tests/crypto` | the whole X.509 chain — root, Intermediate, leaf, CRL — with local stand-ins for KMS and CloudHSM |
 | `tests/ceremony` | `hsm_ceremony.sh.tftpl` rendered by Terraform and executed against a stub `cloudhsm-cli` that really signs (base64 `r\|\|s`, as Client SDK 5 returns) |
-| `tests/lambda` | the consumer's Lambda: the `CAChainPublished` activation (update + enable + import), the scheduled refresh, the no-chain skip, the no-chain activation failure, and the CRL itself via openssl |
+| `tests/lambda` | the Roles Anywhere Lambda: the `CAChainPublished` activation (update + enable + import), the scheduled refresh, the no-chain skip, the no-chain activation failure, and the CRL itself via openssl |
+| `modules/alb-mtls/tests/module` | the trust store's locals and the 32-character name rule |
+| `modules/alb-mtls/tests/lambda` | the ALB sync Lambda: `ModifyTrustStore` against the uploaded object version, the pre-publication skip, the add-then-remove rotation order, and the CRL via openssl |
 
 ```bash
 make init        # one init per configuration, into one shared provider cache
@@ -212,8 +221,14 @@ make -j4 check   # fmt, validate (all three modules), examples, lint, all five h
 `make clean` keeps it; `make cache-clean` drops it.
 
 What the harnesses cannot prove — CloudHSM control-plane timing, KMS policy
-enforcement, Roles Anywhere accepting the CRL, `UpdateTrustAnchor` itself — is
-listed in [`tests/README.md`](tests/README.md).
+enforcement, `CreateTrustAnchor` accepting the placeholder, EventBridge delivery,
+Roles Anywhere accepting the CRL — is listed in [`tests/README.md`](tests/README.md),
+together with the **$0 no-HSM** script that does cover all of it except the HSM:
+
+```bash
+./scripts/verify_live_control_plane.sh examples/complete           # ~60 s, $0.00
+./scripts/verify_live_control_plane.sh examples/complete --restore-pending
+```
 
 ## Requirements
 

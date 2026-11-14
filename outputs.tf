@@ -79,3 +79,18 @@ output "cloudhsm_backup_guard_policy_arn" {
   description = "Attach this policy to every principal that can manage CloudHSM (it denies backup deletion)."
   value       = module.hsm_ca.cloudhsm_backup_guard_policy_arn
 }
+
+output "alb_trust_store_arn" {
+  description = "ELBv2 trust store ARN for aws_lb_listener.mutual_authentication (null when enable_alb_mtls = false)."
+  value       = try(module.alb_mtls[0].trust_store_arn, null)
+}
+
+output "alb_trust_store_name" {
+  description = "ELBv2 trust store name (null when disabled)."
+  value       = try(module.alb_mtls[0].trust_store_name, null)
+}
+
+output "alb_sync_function_name" {
+  description = "ALB trust-store activation + CRL rotation Lambda (null when disabled)."
+  value       = try(module.alb_mtls[0].sync_function_name, null)
+}
