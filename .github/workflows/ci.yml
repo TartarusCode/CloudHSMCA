@@ -19,7 +19,10 @@ concurrency:
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 env:
-  TF_VERSION: "1.9.8"
+  # Current release. The module declares `required_version = ">= 1.6.0"`, and
+  # pinning the floor here would mean never testing the CLI that consumers
+  # actually run.
+  TF_VERSION: "1.17.2"
   TFLINT_VERSION: "v0.53.0"
   ACTIONLINT_VERSION: "1.7.7"
   MODULE: "."

@@ -6,9 +6,8 @@ description: >-
 
 inputs:
   terraform-version:
-    description: Terraform CLI version, normally the workflow's TF_VERSION env var.
-    required: false
-    default: "1.9.8"
+    description: Terraform CLI version. Required, so the pin lives in the caller's TF_VERSION.
+    required: true
   run-init:
     description: >-
       Run `make init` after the cache is restored. "false" is for a job that only
