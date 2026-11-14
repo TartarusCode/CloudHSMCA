@@ -31,6 +31,9 @@ REGION="${AWS_REGION:-${AWS_DEFAULT_REGION:-}}"
 TIMEOUT=60
 RESTORE=0
 STACK_DIR=""
+# Where the Roles Anywhere consumer reads revoked serials from. The module's
+# default; override with --revocations-key if the stack changed it.
+REVOCATIONS_KEY="revocations/revoked.json"
 
 usage() {
   sed -n '2,26p' "$0" | sed 's/^# \{0,1\}//'
@@ -45,6 +48,7 @@ while [ $# -gt 0 ]; do
     --restore-pending) RESTORE=1 ;;
     --timeout) TIMEOUT="${2:?--timeout needs a number}"; shift ;;
     --region) REGION="${2:?--region needs a value}"; shift ;;
+    --revocations-key) REVOCATIONS_KEY="${2:?--revocations-key needs a value}"; shift ;;
     -h|--help) usage 0 ;;
     -*) usage 1 ;;
     *) STACK_DIR="$1" ;;
@@ -59,6 +63,14 @@ command -v aws >/dev/null || fail "the AWS CLI is required"
 command -v python3 >/dev/null || fail "python3 is required"
 command -v openssl >/dev/null || fail "openssl is required"
 [ -f "$TOOL" ] || fail "missing $TOOL"
+
+# kms_ca_tool.py imports these lazily, so a missing one surfaces as a traceback
+# halfway through the run. An `aws login` session additionally needs the `crt`
+# extra for botocore, which is not installed by plain boto3.
+if ! python3 -c "import boto3, cryptography, awscrt" >/dev/null 2>&1; then
+  fail "python3 needs boto3, cryptography and the awscrt extra: \
+uv pip install 'boto3[crt]' cryptography"
+fi
 
 # --------------------------------------------------------------------------- #
 # stack outputs
@@ -128,7 +140,9 @@ step1() {
     --region "$REGION" --output json)" || fail "get-trust-anchor failed"
   python3 - "$anchor" <<'PY'
 import json, sys
-a = json.load(sys.stdin)["trustAnchor"]
+# The script itself arrives on stdin (`python3 - ... <<'PY'`), so the payload
+# must come from argv, not sys.stdin.
+a = json.loads(sys.argv[1])["trustAnchor"]
 enabled = a.get("enabled")
 src = json.dumps(a.get("source", {}))
 print("[verify]   enabled=%s certificates=%d" % (enabled, src.count("BEGIN CERTIFICATE")))
@@ -152,6 +166,13 @@ O = cloudhsmca smoke
 OU = Live Control Plane Verification
 CN = cloudhsmca smoke Intermediate CA
 
+# A CSR has no issuer yet, so it must not ask for an authority key identifier;
+# the certificate profile below adds it at signing time.
+[intermediate_csr_ext]
+basicConstraints = critical,CA:TRUE,pathlen:0
+keyUsage = critical,keyCertSign,cRLSign
+subjectKeyIdentifier = hash
+
 [intermediate_ext]
 basicConstraints = critical,CA:TRUE,pathlen:0
 keyUsage = critical,keyCertSign,cRLSign
@@ -167,17 +188,21 @@ CNF
     -addext "subjectKeyIdentifier=hash" \
     -out "$WORK/root_ca.pem" 2>/dev/null || fail "could not create the local Root CA"
 
-  python3 "$TOOL" create-intermediate-csr --signer kms --region "$REGION" \
-    --kms-key-id "$KMS_ARN" --cnf "$WORK/smoke.cnf" \
-    --dn-section intermediate_dn --extensions intermediate_ext \
-    --out "$WORK/intermediate.csr" >/dev/null 2>&1 \
-    || fail "create-intermediate-csr failed — the key policy may not allow this caller to GetPublicKey"
+  if ! python3 "$TOOL" create-intermediate-csr --signer kms --region "$REGION" \
+      --kms-key-id "$KMS_ARN" --cnf "$WORK/smoke.cnf" \
+      --dn-section intermediate_dn --extensions intermediate_csr_ext \
+      --out "$WORK/intermediate.csr" >"$WORK/csr.log" 2>&1; then
+    sed 's/^/[verify]   /' "$WORK/csr.log" >&2
+    fail "create-intermediate-csr failed: the key policy must allow this caller kms:Sign (the CSR is signed by the KMS key) — add it to allowed_kms_signer_role_arns"
+  fi
 
-  python3 "$TOOL" sign-csr --signer local --local-key "$WORK/root.key" \
-    --issuer-cert "$WORK/root_ca.pem" --csr "$WORK/intermediate.csr" \
-    --cnf "$WORK/smoke.cnf" --extensions intermediate_ext --days 1825 \
-    --out "$WORK/intermediate_ca.pem" >/dev/null 2>&1 \
-    || fail "sign-csr failed"
+  if ! python3 "$TOOL" sign-csr --signer local --local-key "$WORK/root.key" \
+      --issuer-cert "$WORK/root_ca.pem" --csr "$WORK/intermediate.csr" \
+      --cnf "$WORK/smoke.cnf" --extensions intermediate_ext --days 1825 \
+      --out "$WORK/intermediate_ca.pem" >"$WORK/sign.log" 2>&1; then
+    sed 's/^/[verify]   /' "$WORK/sign.log" >&2
+    fail "sign-csr failed"
+  fi
 
   openssl verify -CAfile "$WORK/root_ca.pem" "$WORK/intermediate_ca.pem" >/dev/null \
     || fail "the synthetic chain does not verify"
@@ -198,6 +223,24 @@ step3() {
   put_param "$ROOT_PARAM" "$WORK/root_ca.pem"
   put_param "$INTER_PARAM" "$WORK/intermediate_ca.pem"
   put_param "$CA_BUNDLE_PARAM" "$WORK/ca_bundle.pem"
+}
+
+# --------------------------------------------------------------------------- #
+# 3b. seed one revoked serial
+#
+# Roles Anywhere rejects a CRL that revokes nothing ("At least one of the
+# included CRLs doesn't include a revoked certificate"), so the import half of
+# this check needs a non-empty revocation list. Serial 1 stands in for a real
+# revocation; --restore-pending puts the empty list back.
+# --------------------------------------------------------------------------- #
+seed_revocation() {
+  log "3b/5 seeding one revoked serial in s3://$ARTIFACT_BUCKET/$REVOCATIONS_KEY"
+  # The reason is an RFC 5280 code name, not free text: the issuer maps it and
+# rejects anything else with "unknown revocation reason".
+  printf '{"revoked":[{"serial":"0x01","reason":"key_compromise"}]}\n' >"$WORK/revoked.json"
+  aws s3 cp --region "$REGION" "$WORK/revoked.json" \
+    "s3://$ARTIFACT_BUCKET/$REVOCATIONS_KEY" >/dev/null \
+    || fail "could not write the revocation list to s3://$ARTIFACT_BUCKET/$REVOCATIONS_KEY"
 }
 
 # --------------------------------------------------------------------------- #
@@ -224,12 +267,13 @@ PY
   entries="$(python3 - "$EVENT_BUS" "$EVENT_SOURCE" "$DETAIL_TYPE" "$detail" <<'PY'
 import json, sys
 bus, source, detail_type, detail = sys.argv[1:5]
-print(json.dumps({"Entries": [{
+# --entries takes the array itself, not an {"Entries": ...} envelope.
+print(json.dumps([{
     "EventBusName": bus,
     "Source": source,
     "DetailType": detail_type,
     "Detail": detail,
-}]}))
+}]))
 PY
 )"
   local response
@@ -237,7 +281,7 @@ PY
     || fail "put-events failed"
   python3 - "$response" <<'PY'
 import json, sys
-r = json.load(sys.stdin)
+r = json.loads(sys.argv[1])
 if r.get("FailedEntryCount"):
     sys.exit("[verify] FAIL: EventBridge dropped the event: %s" % json.dumps(r.get("Entries")))
 print("[verify]   event accepted")
@@ -255,17 +299,23 @@ step5() {
   while :; do
     local anchor crls state
     anchor="$(aws rolesanywhere get-trust-anchor --trust-anchor-id "$anchor_id" \
-      --region "$REGION" --output json 2>/dev/null || echo '{}')"
-    crls="$(aws rolesanywhere list-crls --trust-anchor-id "$anchor_id" \
-      --region "$REGION" --output json 2>/dev/null || echo '{}')"
+      --region "$REGION" --output json 2>&1)" \
+      || { log "get-trust-anchor failed: $anchor"; return 1; }
+    # list-crls takes no trust-anchor argument: it returns every CRL in the
+    # account and Region, so the anchor is matched on the ARN below. Swallowing
+    # a usage error here once made this loop report zero CRLs forever.
+    crls="$(aws rolesanywhere list-crls --region "$REGION" --output json 2>&1)" \
+      || { log "list-crls failed: $crls"; return 1; }
 
     state="$(python3 - "$anchor" "$crls" <<'PY'
 import json, sys
 a = json.loads(sys.argv[1])
 c = json.loads(sys.argv[2])
 anchor = a.get("trustAnchor", {})
+arn = anchor.get("trustAnchorArn", "")
 certs = json.dumps(anchor.get("source", {})).count("BEGIN CERTIFICATE")
-crls = [x for x in c.get("crls", []) if x.get("enabled")]
+crls = [x for x in c.get("crls", [])
+        if x.get("enabled") and x.get("trustAnchorArn") == arn]
 print("%s %d %d" % (bool(anchor.get("enabled")), certs, len(crls)))
 PY
 )"
@@ -299,6 +349,10 @@ restore() {
   done
   aws rolesanywhere disable-trust-anchor --trust-anchor-id "$TRUST_ANCHOR_ID" \
     --region "$REGION" >/dev/null || log "WARNING: could not disable the trust anchor"
+  printf '{"revoked":[]}\n' >"$WORK/revoked-empty.json"
+  aws s3 cp --region "$REGION" "$WORK/revoked-empty.json" \
+    "s3://$ARTIFACT_BUCKET/$REVOCATIONS_KEY" >/dev/null \
+    || log "WARNING: could not reset the revocation list"
   log "restored"
 }
 
@@ -310,6 +364,7 @@ fi
 step1
 step2
 step3
+seed_revocation
 step4
 step5
 log "done. Run with --restore-pending to reset the stack for a real ceremony."

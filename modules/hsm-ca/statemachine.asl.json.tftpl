@@ -45,14 +45,13 @@
     },
     "ListBackups": {
       "Type": "Task",
-      "Comment": "Newest first: the READY one at index 0 is what a rotation restores from.",
+      "Comment": "SortAscending=false puts the newest backup at index 0; that is what a rotation restores from.",
       "Resource": "arn:aws:states:::aws-sdk:cloudhsmv2:describeBackups",
       "Parameters": {
         "Filters": {
           "clusterIds": ["${cluster_id}"]
         },
-        "SortBy": "time",
-        "SortOrder": "desc"
+        "SortAscending": false
       },
       "ResultPath": "$.backups",
       "Catch": [
@@ -613,8 +612,7 @@
         "Filters": {
           "clusterIds": ["${cluster_id}"]
         },
-        "SortBy": "time",
-        "SortOrder": "desc"
+        "SortAscending": false
       },
       "ResultPath": "$.finalBackups",
       "Catch": [

@@ -325,13 +325,15 @@ def main():
         sys.exit("FAIL: handler signed a CRL with no trust anchor to import it against")
     os.environ["TRUST_ANCHOR_ARN"] = saved_anchor
 
-    # 5. the empty-revocation-set variant must still be a valid CRL
+    # 5. nothing revoked: Roles Anywhere rejects an empty CRL
+    #    ("At least one of the included CRLs doesn't include a revoked
+    #    certificate"), so the handler must not attempt the import at all.
     os.environ.pop("REVOCATIONS_S3_URI")
     sink.clear()
-    handler_module.handler({}, None)
-    empty = x509.load_pem_x509_crl(sink["crlData"])
-    assert list(empty) == [], list(empty)
-    print("empty-revocation CRL is valid, 0 entries")
+    skipped = handler_module.handler({}, None)
+    assert skipped.get("skipped") == "no-revocations", skipped
+    assert not sink, "an empty revocation list still produced a CRL: %r" % (sink,)
+    print("empty revocation list: skipped ImportCrl (%s)" % skipped["skipped"])
 
     print("\nLAMBDA HARNESS: PASS (work dir %s)" % WORK)
 

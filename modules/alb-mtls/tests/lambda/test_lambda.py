@@ -62,6 +62,35 @@ def load_handler():
     return module, source
 
 
+def _check_kwargs(service, operation, kwargs):
+    """Validate a stub call against the real botocore model when it is installed.
+
+    A hand-written stub only proves the handler agrees with itself: this harness
+    happily accepted `add_trust_store_revocations(Revocations=[...])`, which the
+    live API rejects with ParamValidationError because the parameter is
+    RevocationContents and each element is an S3Bucket/S3Key/S3ObjectVersion
+    triple. Checking the model turns the stub into a statement about the API.
+    """
+    try:
+        import botocore.session
+    except ImportError:
+        return
+    model = botocore.session.get_session().get_service_model(service)
+    shape = model.operation_model(operation).input_shape
+    allowed = set((shape.members or {}) if shape else {})
+    unknown = sorted(set(kwargs) - allowed)
+    assert not unknown, "%s:%s does not accept %s (accepts %s)" % (
+        service, operation, unknown, sorted(allowed))
+    for key, value in kwargs.items():
+        member = (shape.members or {}).get(key)
+        # list-of-structure parameters: check the element keys too
+        inner = getattr(getattr(member, "member", None), "members", None)
+        if inner and isinstance(value, (list, tuple)) and value and isinstance(value[0], dict):
+            bad = sorted(set(value[0]) - set(inner))
+            assert not bad, "%s:%s.%s element does not accept %s (accepts %s)" % (
+                service, operation, key, bad, sorted(inner))
+
+
 class _ParameterNotFound(Exception):
     pass
 
@@ -74,6 +103,8 @@ class _Ssm:
         self._state = state
 
     def get_parameter(self, Name, WithDecryption=True):
+        _check_kwargs("ssm", "GetParameter",
+                      {"Name": Name, "WithDecryption": WithDecryption})
         value = self._state["params"].get(Name)
         if value is None:
             raise _ParameterNotFound(Name)
@@ -82,10 +113,14 @@ class _Ssm:
 
 class _Kms:
     def get_public_key(self, KeyId):
+        _check_kwargs("kms", "GetPublicKey", {"KeyId": KeyId})
         return {"SigningAlgorithms": ["ECDSA_SHA_384", "ECDSA_SHA_256"],
                 "KeySpec": "ECC_NIST_P384"}
 
     def sign(self, KeyId, Message, MessageType, SigningAlgorithm):
+        _check_kwargs("kms", "Sign", {"KeyId": KeyId, "Message": Message,
+                                     "MessageType": MessageType,
+                                     "SigningAlgorithm": SigningAlgorithm})
         assert MessageType == "DIGEST", MessageType
         assert SigningAlgorithm == "ECDSA_SHA_384", SigningAlgorithm
         assert len(Message) == 48, "a P-384 digest must be 48 bytes"
@@ -98,6 +133,9 @@ class _S3:
         self._state = state
 
     def put_object(self, Bucket, Key, Body, ContentType, ServerSideEncryption):
+        _check_kwargs("s3", "PutObject", {
+            "Bucket": Bucket, "Key": Key, "Body": Body,
+            "ContentType": ContentType, "ServerSideEncryption": ServerSideEncryption})
         assert ServerSideEncryption == "AES256", ServerSideEncryption
         self._state["calls"].append(("s3.put", Key))
         self._state["puts"] = self._state.get("puts", 0) + 1
@@ -113,22 +151,35 @@ class _Elbv2:
     def modify_trust_store(self, TrustStoreArn, CaCertificatesBundleS3Bucket,
                            CaCertificatesBundleS3Key,
                            CaCertificatesBundleS3ObjectVersion):
+        _check_kwargs("elbv2", "ModifyTrustStore", {
+            "TrustStoreArn": TrustStoreArn,
+            "CaCertificatesBundleS3Bucket": CaCertificatesBundleS3Bucket,
+            "CaCertificatesBundleS3Key": CaCertificatesBundleS3Key,
+            "CaCertificatesBundleS3ObjectVersion": CaCertificatesBundleS3ObjectVersion})
         self._state["calls"].append(("elbv2.modify", CaCertificatesBundleS3ObjectVersion))
         self._state["bundle_version"] = CaCertificatesBundleS3ObjectVersion
         return {"TrustStores": [{"TrustStoreArn": TrustStoreArn}]}
 
     def describe_trust_store_revocations(self, TrustStoreArn):
+        _check_kwargs("elbv2", "DescribeTrustStoreRevocations",
+                      {"TrustStoreArn": TrustStoreArn})
         return {"TrustStoreRevocations": list(self._state["revocations"])}
 
-    def add_trust_store_revocations(self, TrustStoreArn, Revocations):
-        self._state["calls"].append(("elbv2.add", Revocations[0]["RevocationS3ObjectVersion"]))
+    def add_trust_store_revocations(self, TrustStoreArn, RevocationContents):
+        _check_kwargs("elbv2", "AddTrustStoreRevocations",
+                      {"TrustStoreArn": TrustStoreArn,
+                       "RevocationContents": RevocationContents})
+        self._state["calls"].append(
+            ("elbv2.add", RevocationContents[0]["S3ObjectVersion"]))
         new = {"RevocationId": "rev-new-%d" % (len(self._state["calls"])),
                "RevocationType": "CRL",
-               "RevocationS3ObjectVersion": Revocations[0]["RevocationS3ObjectVersion"]}
+               "RevocationS3ObjectVersion": RevocationContents[0]["S3ObjectVersion"]}
         self._state["revocations"].append(new)
         return {"TrustStoreRevocations": [new]}
 
     def remove_trust_store_revocations(self, TrustStoreArn, RevocationIds):
+        _check_kwargs("elbv2", "RemoveTrustStoreRevocations",
+                      {"TrustStoreArn": TrustStoreArn, "RevocationIds": RevocationIds})
         self._state["calls"].append(("elbv2.remove", list(RevocationIds)))
         self._state["revocations"] = [
             r for r in self._state["revocations"] if r["RevocationId"] not in RevocationIds]

@@ -445,11 +445,15 @@ data "archive_file" "sync" {
 
           added = elbv2.add_trust_store_revocations(
               TrustStoreArn=trust_store_arn,
-              Revocations=[{
+              # The parameter is RevocationContents and each element is an
+              # S3Bucket/S3Key/S3ObjectVersion triple — not Revocations and not
+              # RevocationS3*. The live API rejects anything else with
+              # ParamValidationError.
+              RevocationContents=[{
                   "RevocationType": "CRL",
-                  "RevocationS3Bucket": bucket,
-                  "RevocationS3Key": crl_key,
-                  "RevocationS3ObjectVersion": crl_version,
+                  "S3Bucket": bucket,
+                  "S3Key": crl_key,
+                  "S3ObjectVersion": crl_version,
               }],
           ).get("TrustStoreRevocations", [])
           new_ids = [r["RevocationId"] for r in added]
@@ -523,11 +527,21 @@ data "aws_iam_policy_document" "sync" {
     resources = ["${var.ca_contract.artifacts_bucket_arn}/${local.prefix}/*"]
   }
 
+  # The Describe actions do not support resource-level permissions, so scoping
+  # them to the trust store ARN denies every call. Only the mutating actions can
+  # be pinned to the trust store.
   statement {
-    sid = "TrustStoreRevocations"
+    sid = "DescribeTrustStores"
     actions = [
       "elasticloadbalancing:DescribeTrustStores",
       "elasticloadbalancing:DescribeTrustStoreRevocations",
+    ]
+    resources = ["*"]
+  }
+
+  statement {
+    sid = "RotateTrustStoreContent"
+    actions = [
       "elasticloadbalancing:ModifyTrustStore",
       "elasticloadbalancing:AddTrustStoreRevocations",
       "elasticloadbalancing:RemoveTrustStoreRevocations",

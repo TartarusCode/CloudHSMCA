@@ -401,6 +401,18 @@ data "archive_file" "crl_issuer" {
                                  % algorithms)
 
           revoked = load_revocations(s3, os.environ.get("REVOCATIONS_S3_URI", ""))
+          if not revoked:
+              # Roles Anywhere refuses a CRL with no revoked certificate:
+              #   ValidationException: At least one of the included CRLs doesn't
+              #   include a revoked certificate.
+              # An empty CRL is valid X.509 but is not accepted here, so publish
+              # nothing until something is actually revoked. The next tick after
+              # the first revocation imports normally.
+              LOG.info("no revoked serials: skipping ImportCrl "
+                       "(Roles Anywhere rejects an empty CRL)")
+              return {"ok": True, "skipped": "no-revocations",
+                      "reason": event.get("reason", "scheduled")}
+
           crl_number = int(time.time())
           now, next_update, revoked_seq, extensions = build_crl(
               subject_der, akid, revoked, crl_number, validity_days)
