@@ -23,6 +23,9 @@ env:
   # pinning the floor here would mean never testing the CLI that consumers
   # actually run.
   TF_VERSION: "1.17.2"
+  # The floor the module declares in required_version, tested against the 1.6
+  # line. A patch release, not 1.6.0: the configs must work on every 1.6.x.
+  TF_MIN_VERSION: "1.6.6"
   TFLINT_VERSION: "v0.53.0"
   ACTIONLINT_VERSION: "1.7.7"
   MODULE: "."
@@ -55,6 +58,23 @@ jobs:
       - name: gates (one init, then the independent checks in parallel)
         run: make -j4 fmt-check validate examples
 
+      # required_version says ">= 1.6.0", which is a claim until something runs
+      # it. This downloads the oldest supported line and validates all seven
+      # configurations with it, against the plugin cache the step above filled —
+      # so the download is the only new network traffic.
+      - name: Verify minimum Terraform floor (${{ env.TF_MIN_VERSION }})
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/tf-floor
+          curl -fsSL -o /tmp/tf-floor/terraform.zip \
+            "https://releases.hashicorp.com/terraform/${TF_MIN_VERSION}/terraform_${TF_MIN_VERSION}_linux_amd64.zip"
+          unzip -o -q /tmp/tf-floor/terraform.zip -d /tmp/tf-floor
+          /tmp/tf-floor/terraform version
+          # `validate` alone covers the four modules; `examples` adds the three
+          # examples, which is what makes this all seven configurations.
+          make validate examples TF=/tmp/tf-floor/terraform
+
       - name: summary
         if: success()
         shell: bash
@@ -77,6 +97,7 @@ jobs:
             echo "| terraform | \`${TF_VERSION}\` |"
             echo "| hashicorp/aws | \`${aws_version:-unknown}\` |"
             echo "| configurations | ${configs} |"
+            echo "| terraform floor | \`${TF_MIN_VERSION}\` (all ${configs}) |"
             echo "| triggered by | \`${GITHUB_EVENT_NAME}\` |"
           } >> "$GITHUB_STEP_SUMMARY"
 
