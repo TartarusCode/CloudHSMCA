@@ -25,6 +25,11 @@ output "start_bootstrap_command" {
   value       = module.hsm_ca.start_bootstrap_command
 }
 
+output "start_rotation_command" {
+  description = "Start an intermediate rotation (needs a READY cluster backup). Prints the execution ARN."
+  value       = module.hsm_ca.start_rotation_command
+}
+
 output "cloudhsm_cluster_id" {
   description = "Durable cluster shell. Its backups escrow the Root CA key."
   value       = module.hsm_ca.cloudhsm_cluster_id

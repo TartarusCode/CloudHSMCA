@@ -50,7 +50,7 @@ output "start_bootstrap_command" {
     "aws stepfunctions start-execution",
     "--state-machine-arn", aws_sfn_state_machine.ceremony.arn,
     "--name", "bootstrap-$(date -u +%Y%m%dT%H%M%SZ)",
-    "--input", jsonencode({ mode = "BOOTSTRAP" }),
+    "--input", "'${jsonencode({ mode = "BOOTSTRAP" })}'",
     "--query", "executionArn", "--output", "text",
   ])
 }
@@ -61,7 +61,7 @@ output "start_rotation_command" {
     "aws stepfunctions start-execution",
     "--state-machine-arn", aws_sfn_state_machine.ceremony.arn,
     "--name", "rotate-$(date -u +%Y%m%dT%H%M%SZ)",
-    "--input", jsonencode({ mode = "ROTATE_INTERMEDIATE" }),
+    "--input", "'${jsonencode({ mode = "ROTATE_INTERMEDIATE" })}'",
     "--query", "executionArn", "--output", "text",
   ])
 }

@@ -64,10 +64,12 @@ lint: ## tflint the whole tree (needs tflint + the aws ruleset plugin)
 	tflint --init
 	tflint --recursive --format compact
 
-docs: ## Regenerate the input/output tables (needs terraform-docs)
+docs: ## Regenerate the BEGIN_TF_DOCS tables in every README (needs terraform-docs)
 	@command -v terraform-docs >/dev/null 2>&1 || { \
 	  echo "terraform-docs not installed: https://terraform-docs.io"; exit 1; }
-	terraform-docs markdown table --output-file README.md --output-mode inject $(MODULE)
+	@for m in $(MODULE) $(MODULES); do \
+	  terraform-docs markdown table --output-file README.md --output-mode inject $$m; \
+	done
 
 test: init ## Run every offline harness (no AWS account needed)
 	bash tests/run-all.sh
