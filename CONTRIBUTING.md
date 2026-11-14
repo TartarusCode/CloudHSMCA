@@ -17,11 +17,11 @@
 
 ```bash
 make init        # one init per configuration, into one shared provider cache
-make -j4 check   # fmt-check, validate, examples, lint, and all seven harnesses
+make -j4 check   # fmt-check, validate, examples, lint, workflow-lint, all seven harnesses
 ```
 
 `make check` is what CI runs (`fmt-check`, validate on all three modules and
-every example, `tflint`, and `tests/run-all.sh`). `make -j4 check` runs the independent
+every example, `tflint`, `workflow-lint`, and `tests/run-all.sh`). `make -j4 check` runs the independent
 gates in parallel: `init` is a single target, so the slots cannot race each other
 in the provider cache.
 

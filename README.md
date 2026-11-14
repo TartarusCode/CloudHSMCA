@@ -322,7 +322,7 @@ No resources.
 
 ```bash
 make init        # one init per configuration, into one shared provider cache
-make -j4 check   # fmt, validate, tflint and seven offline harnesses (~40 s)
+make -j4 check   # fmt, validate, tflint, workflow lint and seven offline harnesses (~40 s)
 ```
 
 The offline harnesses need no AWS account: they exercise the X.509 chain, the

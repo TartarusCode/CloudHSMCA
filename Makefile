@@ -31,7 +31,7 @@ export TF_PLUGIN_CACHE_DIR
 export TF_PLUGIN_CACHE_MAY_BREAK_DEPENDENCY_LOCK_FILE = true
 
 .DEFAULT_GOAL := help
-.PHONY: help init fmt fmt-check validate examples lint docs test check clean cache-clean
+.PHONY: help init fmt fmt-check validate examples lint workflow-lint docs test check clean cache-clean
 
 help: ## Show this help
 	@grep -hE '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) \
@@ -68,6 +68,9 @@ lint: ## tflint the whole tree (needs tflint + the aws ruleset plugin)
 	tflint --init
 	tflint --recursive --format compact
 
+workflow-lint: ## Validate the workflows and composite actions (structural checks + actionlint)
+	@python3 scripts/workflow_lint.py
+
 docs: ## Regenerate the BEGIN_TF_DOCS tables in every README (needs terraform-docs)
 	@command -v terraform-docs >/dev/null 2>&1 || { \
 	  echo "terraform-docs not installed: https://terraform-docs.io"; exit 1; }
@@ -80,7 +83,7 @@ test: init ## Run every offline harness (no AWS account needed)
 
 # `make -j4 check`: init runs once, then fmt-check and lint start immediately
 # while the rest wait on it. Nothing here writes shared state.
-check: fmt-check lint validate examples test ## Everything CI runs
+check: fmt-check lint workflow-lint validate examples test ## Everything CI runs
 	@echo
 	@echo "check: OK"
 

@@ -15,6 +15,7 @@ concurrency:
 env:
   TF_VERSION: "1.9.8"
   TFLINT_VERSION: "v0.53.0"
+  ACTIONLINT_VERSION: "1.7.7"
   MODULE: "."
 
   # One provider cache for every configuration. `make init` populates it once,
@@ -28,6 +29,7 @@ env:
 jobs:
   terraform:
     name: fmt, validate, examples
+    timeout-minutes: 10
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -49,6 +51,7 @@ jobs:
 
   tflint:
     name: tflint
+    timeout-minutes: 5
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -62,6 +65,7 @@ jobs:
 
   tests:
     name: offline harnesses
+    timeout-minutes: 10
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -107,9 +111,28 @@ jobs:
 
   hygiene:
     name: repository hygiene
+    timeout-minutes: 5
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+
+      - name: install actionlint
+        shell: bash
+        run: |
+          set -euo pipefail
+          dir=/usr/local/bin
+          if [ ! -w "$dir" ]; then
+            dir="$HOME/.local/bin"
+            mkdir -p "$dir"
+            echo "$dir" >> "$GITHUB_PATH"
+          fi
+          bash <(curl -sSfL https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash) \
+            "$ACTIONLINT_VERSION" "$dir"
+          "$dir/actionlint" --version
+
+      - name: workflow and action lint
+        shell: bash
+        run: make workflow-lint
 
       - name: no private key material
         run: |
