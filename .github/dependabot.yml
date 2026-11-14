@@ -19,7 +19,11 @@ updates:
       prefix: "chore(deps)"
 
   - package-ecosystem: github-actions
-    directory: "/"
+    directories:
+      - "/"
+      # Composite actions carry their own `uses:` references; Dependabot only
+      # looks at .github/workflows unless the directory is listed.
+      - "/.github/actions/setup-terraform-env"
     schedule:
       interval: weekly
     groups:

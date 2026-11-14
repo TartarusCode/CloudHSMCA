@@ -1,0 +1,48 @@
+name: Set up Terraform
+description: >-
+  Install the pinned Terraform CLI, restore the shared provider cache, and
+  optionally initialise every configuration. Used by the validation and the
+  harness job so the setup exists once.
+
+inputs:
+  terraform-version:
+    description: Terraform CLI version, normally `${{ env.TF_VERSION }}` from the workflow.
+    required: false
+    default: "1.9.8"
+  run-init:
+    description: >-
+      Run `make init` after the cache is restored. "false" is for a job that only
+      needs the CLI.
+    required: false
+    default: "true"
+
+runs:
+  using: composite
+  steps:
+    # terraform_wrapper: false keeps the CLI's own stdout and exit codes. The
+    # wrapper adds a Node.js layer, and the harnesses parse `terraform console`
+    # output directly.
+    - name: terraform
+      uses: hashicorp/setup-terraform@v4
+      with:
+        terraform_version: ${{ inputs.terraform-version }}
+        terraform_wrapper: false
+
+    # No lock file is tracked here, so `**/versions.tf` is what the key tracks.
+    # A scheduled run salts the key with its run id, giving the weekly drift run
+    # its own cache entry instead of overwriting the one pull requests reuse.
+    - name: provider cache
+      uses: actions/cache@v6
+      with:
+        path: ${{ env.TF_PLUGIN_CACHE_DIR }}
+        key: tf-plugins-${{ runner.os }}-${{ hashFiles('**/versions.tf') }}-${{ github.event_name == 'schedule' && github.run_id || 'cached' }}
+        restore-keys: tf-plugins-${{ runner.os }}-
+
+    - name: terraform version
+      shell: bash
+      run: terraform version
+
+    - name: initialize every configuration
+      if: inputs.run-init == 'true'
+      shell: bash
+      run: make init

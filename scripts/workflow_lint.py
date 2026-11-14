@@ -231,7 +231,11 @@ def main(argv):
 
     version = subprocess.run([exe, "--version"], capture_output=True, text=True)
     print(f"actionlint: {version.stdout.splitlines()[0] if version.stdout else exe}")
-    result = subprocess.run([exe, "-color", *sorted(workflows), *sorted(actions)], cwd=root)
+    # No path arguments on purpose. actionlint has no composite-action mode: given
+    # action.yml as an argument it parses it as a workflow and complains about a
+    # missing `on:`. It checks a local action when a workflow uses it, so running
+    # it against the repository (cwd=root) is what actually covers the composite.
+    result = subprocess.run([exe, "-color"], cwd=root)
     if result.returncode != 0:
         print("workflow-lint: FAIL (actionlint)", file=sys.stderr)
         return result.returncode

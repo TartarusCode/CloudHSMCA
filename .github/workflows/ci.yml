@@ -4,13 +4,19 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
+  # No lock file is tracked, so nothing pins the provider set. The weekly run
+  # resolves `hashicorp/aws` fresh (TF_CLI_ARGS_init below) and fails if a new
+  # provider release breaks the module.
+  schedule:
+    - cron: "0 8 * * 1"
 
 permissions:
   contents: read
 
 concurrency:
-  group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 env:
   TF_VERSION: "1.9.8"
@@ -20,11 +26,16 @@ env:
 
   # One provider cache for every configuration. `make init` populates it once,
   # so the providers are downloaded and stored a single time instead of once per
-  # directory, and the cache action below carries it between runs. The dependency
-  # lock file is not tracked (see .gitignore), so the cache may resolve without
+  # directory, and the cache action carries it between runs. The dependency lock
+  # file is not tracked (see .gitignore), so the cache may resolve without
   # pinning package hashes into one.
   TF_PLUGIN_CACHE_DIR: ${{ github.workspace }}/.terraform-plugin-cache
   TF_PLUGIN_CACHE_MAY_BREAK_DEPENDENCY_LOCK_FILE: "true"
+
+  # A cache hit hands back provider versions that already satisfy the ranges in
+  # versions.tf, so without this the weekly run would test the same versions as
+  # the last pull request. -upgrade makes it ask the registry for the newest.
+  TF_CLI_ARGS_init: ${{ github.event_name == 'schedule' && '-upgrade' || '' }}
 
 jobs:
   terraform:
@@ -34,20 +45,36 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - uses: hashicorp/setup-terraform@v4
+      - uses: ./.github/actions/setup-terraform-env
         with:
-          terraform_version: ${{ env.TF_VERSION }}
-          terraform_wrapper: false
-
-      - uses: actions/cache@v6
-        with:
-          path: ${{ env.TF_PLUGIN_CACHE_DIR }}
-          key: tf-providers-${{ runner.os }}-${{ env.TF_VERSION }}-${{ hashFiles('**/versions.tf') }}
-          restore-keys: |
-            tf-providers-${{ runner.os }}-${{ env.TF_VERSION }}-
+          terraform-version: ${{ env.TF_VERSION }}
 
       - name: gates (one init, then the independent checks in parallel)
         run: make -j4 fmt-check validate examples
+
+      - name: summary
+        if: success()
+        shell: bash
+        run: |
+          set -euo pipefail
+          # init just wrote this even though it is never committed; that is where
+          # the resolved provider version lives.
+          aws_version=$(
+            awk '/provider "registry\.terraform\.io\/hashicorp\/aws"/{seen=1}
+                 seen && /^[[:space:]]*version[[:space:]]*=/ {print $3; exit}' \
+              .terraform.lock.hcl 2>/dev/null | tr -d '"'
+          )
+          configs=$(( $(ls -d modules/*/ examples/*/ | wc -l) + 1 ))
+          {
+            echo "### Terraform validation"
+            echo
+            echo "| item | value |"
+            echo "| --- | --- |"
+            echo "| terraform | \`${TF_VERSION}\` |"
+            echo "| hashicorp/aws | \`${aws_version:-unknown}\` |"
+            echo "| configurations | ${configs} |"
+            echo "| triggered by | \`${GITHUB_EVENT_NAME}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
 
   tflint:
     name: tflint
@@ -60,6 +87,16 @@ jobs:
         with:
           tflint_version: ${{ env.TFLINT_VERSION }}
 
+      # `tflint --init` fetches the aws ruleset named in .tflint.hcl; keying on
+      # that file means a version bump re-downloads and nothing else does.
+      - name: tflint plugin cache
+        uses: actions/cache@v6
+        with:
+          path: ~/.tflint.d/plugins
+          key: tflint-plugins-${{ runner.os }}-${{ hashFiles('.tflint.hcl') }}
+          restore-keys: |
+            tflint-plugins-${{ runner.os }}-
+
       - name: tflint
         run: make lint
 
@@ -70,21 +107,28 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - uses: hashicorp/setup-terraform@v4
+      # The harnesses run `terraform console`, so they need providers, not just
+      # the CLI: run-init keeps its default of "true".
+      - uses: ./.github/actions/setup-terraform-env
         with:
-          terraform_version: ${{ env.TF_VERSION }}
-          terraform_wrapper: false
+          terraform-version: ${{ env.TF_VERSION }}
 
       - uses: actions/setup-python@v7
         with:
           python-version: "3.11"
 
-      - uses: actions/cache@v6
+      # cryptography and boto3 are unpinned on purpose (CI is the drift check),
+      # so the key follows the files that import them: a harness change is what
+      # should invalidate the wheel cache.
+      - name: python wheel cache
+        uses: actions/cache@v6
         with:
-          path: ${{ env.TF_PLUGIN_CACHE_DIR }}
-          key: tf-providers-${{ runner.os }}-${{ env.TF_VERSION }}-${{ hashFiles('**/versions.tf') }}
+          path: |
+            ~/.cache/uv
+            ~/.cache/pip
+          key: py-wheels-${{ runner.os }}-${{ hashFiles('modules/**/run.sh', 'modules/**/test_*.py') }}
           restore-keys: |
-            tf-providers-${{ runner.os }}-${{ env.TF_VERSION }}-
+            py-wheels-${{ runner.os }}-
 
       - name: python dependencies
         run: |
@@ -106,8 +150,25 @@ jobs:
 
       # The harnesses need providers (`terraform console` renders the OpenSSL
       # profiles and the ceremony script), so `test` depends on `init`.
-      - name: offline harnesses (five harnesses, one suite)
-        run: make test
+      - name: offline harnesses (seven harnesses, one suite)
+        shell: bash
+        run: make test 2>&1 | tee "$RUNNER_TEMP/harnesses.log"
+
+      - name: summary
+        if: success()
+        shell: bash
+        run: |
+          set -euo pipefail
+          passed=$(grep -cE '^-- .*: PASS$' "$RUNNER_TEMP/harnesses.log" || true)
+          {
+            echo "### Offline harnesses"
+            echo
+            echo "| item | value |"
+            echo "| --- | --- |"
+            echo "| suites passed | ${passed} |"
+            echo "| python | \`$(python --version 2>&1 | awk '{print $2}')\` |"
+            echo "| triggered by | \`${GITHUB_EVENT_NAME}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
 
   hygiene:
     name: repository hygiene
