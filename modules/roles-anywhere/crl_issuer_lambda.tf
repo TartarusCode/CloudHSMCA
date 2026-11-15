@@ -402,15 +402,25 @@ data "archive_file" "crl_issuer" {
 
           revoked = load_revocations(s3, os.environ.get("REVOCATIONS_S3_URI", ""))
           if not revoked:
-              # Roles Anywhere refuses a CRL with no revoked certificate:
+              # Roles Anywhere refuses a CRL that revokes nothing:
               #   ValidationException: At least one of the included CRLs doesn't
               #   include a revoked certificate.
-              # An empty CRL is valid X.509 but is not accepted here, so publish
-              # nothing until something is actually revoked. The next tick after
-              # the first revocation imports normally.
-              LOG.info("no revoked serials: skipping ImportCrl "
-                       "(Roles Anywhere rejects an empty CRL)")
+              # Nothing to import — but a CRL imported earlier is still active and
+              # would keep revoking serials the list no longer names, so retire
+              # every enabled CRL for this anchor. ListCrls is account-wide, so
+              # the anchor is matched on trustAnchorArn.
+              retired = []
+              for existing in rolesanywhere.list_crls().get("crls", []):
+                  if existing.get("trustAnchorArn") != trust_anchor_arn:
+                      continue
+                  if not existing.get("enabled"):
+                      continue
+                  rolesanywhere.disable_crl(crlId=existing["crlId"])
+                  retired.append(existing["crlId"])
+              LOG.info("no revoked serials: nothing to import, retired %d CRL(s) %s",
+                       len(retired), retired)
               return {"ok": True, "skipped": "no-revocations",
+                      "disabledCrls": retired,
                       "reason": event.get("reason", "scheduled")}
 
           crl_number = int(time.time())
@@ -541,7 +551,6 @@ data "aws_iam_policy_document" "crl_issuer" {
     actions = [
       "rolesanywhere:ImportCrl",
       "rolesanywhere:GetCrl",
-      "rolesanywhere:ListCrls",
       "rolesanywhere:EnableCrl",
       "rolesanywhere:DisableCrl",
     ]
@@ -549,6 +558,15 @@ data "aws_iam_policy_document" "crl_issuer" {
       "arn:${var.ca_contract.partition}:rolesanywhere:${var.ca_contract.region}:${var.ca_contract.account_id}:trust-anchor/*",
       "arn:${var.ca_contract.partition}:rolesanywhere:${var.ca_contract.region}:${var.ca_contract.account_id}:crl/*",
     ]
+  }
+
+  # ListCrls returns every CRL in the account and Region, so it supports no
+  # resource-level permission: scoping it to a trust-anchor or crl ARN denies the
+  # call. Scoping is done on the response instead, by trustAnchorArn.
+  statement {
+    sid       = "ListCrlsForRetirement"
+    actions   = ["rolesanywhere:ListCrls"]
+    resources = ["*"]
   }
 
   statement {

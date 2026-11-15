@@ -4,6 +4,59 @@ All notable changes to this repository are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the module follows
 semantic versioning once it is tagged.
 
+## [0.5.1] - 2026-11-15
+
+Everything here came out of the first live sandbox run: an apply in us-west-2 with
+both consumers enabled, then `scripts/verify_live_control_plane.sh` against it. The
+offline harnesses had all passed; none of these were visible without calling AWS.
+
+### Fixed
+
+- The ceremony state machine could not be created at all: `describeBackups` was
+  called with `SortBy`/`SortOrder`, which the API does not have, so
+  `aws_sfn_state_machine` failed with `SCHEMA_VALIDATION_FAILED`. Both call sites
+  use `SortAscending: false`, which still puts the newest backup at index 0 for
+  every `$.backups.Backups[0]` consumer.
+- `CreateHsmFromBackup` passed `BackupId` to `cloudhsmv2:createHsm`, which accepts
+  only `ClusterId` and `AvailabilityZone`. No parameter is needed for the restore:
+  CloudHSM restores the cluster's most recent backup onto the new HSM itself, and
+  `RequireReadyBackupRequested` still refuses to create one unless a `READY` backup
+  exists.
+- The Roles Anywhere CRL Lambda could never import its first CRL. With no
+  revocation list in the bucket, `GetObject` returned `AccessDenied` rather than
+  `NoSuchKey` (the role has no `s3:ListBucket`), and `ImportCrl` rejects a CRL that
+  revokes nothing. The module now seeds `revocations/revoked.json` with
+  `{"revoked": []}` (content changes are ignored, so operator edits survive).
+- An emptied revocation list no longer leaves a stale CRL active: the handler lists
+  the account's CRLs, matches them by `trustAnchorArn`, and disables every enabled
+  one before returning `{"skipped": "no-revocations"}`. `rolesanywhere:ListCrls`
+  moved to its own `*` statement — it is account-wide and supports no
+  resource-level permission.
+- `modules/alb-mtls` called `add_trust_store_revocations(Revocations=[{
+  RevocationS3Bucket, ... }])`. The parameter is `RevocationContents` and each
+  element is an `S3Bucket`/`S3Key`/`S3ObjectVersion` triple. The same policy also
+  denied `DescribeTrustStoreRevocations` by pinning it to the trust store ARN;
+  `Describe*` supports no resource-level permission, so it is now a separate `*`
+  statement and only `ModifyTrustStore` and the revocation add/remove calls are
+  scoped to the trust store.
+- `scripts/verify_live_control_plane.sh`, four defects: two blocks passed their
+  JSON payload in `argv` but read `sys.stdin` (which is the program); `put-events`
+  received `{"Entries": [...]}` instead of the array; `list-crls
+  --trust-anchor-id` is not a flag that exists, and the `|| echo '{}'` around it
+  turned a usage error into "zero CRLs forever"; and the CSR profile carried an
+  `authorityKeyIdentifier` that a CSR cannot have. The seed revocation also needed
+  a real RFC 5280 reason code.
+
+### Added
+
+- `tests/asl_invariants.py` validates every `aws-sdk:<service>:<action>` parameter
+  block against the botocore service model — 16 operations, no exceptions — and
+  asserts that every `createHsm` passes only `ClusterId` and `AvailabilityZone`
+  with the READY gate ahead of the rotation call.
+- Both Lambda harnesses validate their stub keyword arguments against the same
+  models. Hand-written stubs only prove the handler agrees with itself: the ALB
+  harness happily exercised a call the live API rejects.
+
 ## [0.5.0] - 2026-11-14
 
 First tagged release. The module is usable end to end: one apply creates the

@@ -185,20 +185,9 @@ def check_aws_sdk_parameters(states, check):
         print("  SKIP  aws-sdk parameters (botocore not installed; CI installs boto3)")
         return
 
-    # Known, unfixed defect. cloudhsmv2:createHsm takes only ClusterId,
-    # AvailabilityZone and IpAddress: Root key material comes back by creating a
-    # *cluster* from the backup (createCluster with SourceBackupId) and then an
-    # HSM in it, so the rotation path needs a second cluster, not a BackupId.
-    # Listing it here keeps the gate honest instead of silently passing: it is
-    # reported, counted, and passes only because it is explicitly known.
-    known = {
-        ("CreateHsmFromBackup", "cloudhsmv2", "createHsm", "BackupId"):
-            "rotation must createCluster(SourceBackupId=...) first; tracked, not fixed",
-    }
-
     session = botocore.session.get_session()
     problems = []
-    acknowledged = []
+    checked = 0
     checked = 0
     pattern = re.compile(r"^arn:aws:states:::aws-sdk:([a-z0-9-]+):([A-Za-z0-9]+)$")
     for name, state in states.items():
@@ -217,20 +206,10 @@ def check_aws_sdk_parameters(states, check):
             continue
         allowed = set((operation.input_shape.members or {}) if operation.input_shape else {})
         unknown = sorted(key for key in keys if key not in allowed)
-        for key in unknown:
-            if (name, service, action, key) in known:
-                acknowledged.append("%s: %s:%s.%s — %s"
-                                    % (name, service, action, key,
-                                       known[(name, service, action, key)]))
-            else:
-                problems.append("%s: %s:%s does not accept %s (accepts %s)"
-                                % (name, service, action, key, sorted(allowed)))
+        if unknown:
+            problems.append("%s: %s:%s does not accept %s (accepts %s)"
+                            % (name, service, action, unknown, sorted(allowed)))
         checked += 1
-
-    if acknowledged:
-        print("  KNOWN  %d acknowledged parameter defect(s):" % len(acknowledged))
-        for line in acknowledged:
-            print("         " + line)
 
     check(not problems,
           "%d aws-sdk operations expose only fields the service accepts" % checked,
@@ -374,11 +353,15 @@ def main():
     # --- 3. bootstrap vs rotation -----------------------------------------
     print("\nbootstrap vs rotation:")
     hsm_creates = find_tasks(defn, ":cloudhsmv2:createHsm")
-    with_backup = [n for n in hsm_creates
-                   if "BackupId" in json.dumps(states[n].get("Parameters", {}))]
-    without_backup = [n for n in hsm_creates if n not in with_backup]
-    check(bool(with_backup), "a rotation CreateHsm restores from BackupId", str(with_backup))
-    check(bool(without_backup), "a bootstrap CreateHsm passes no BackupId", str(without_backup))
+    # CreateHsm accepts ClusterId, AvailabilityZone and IpAddress — nothing else.
+    # A backup is not a parameter: CloudHSM restores the cluster's most recent
+    # backup onto a new HSM by itself, which is why the READY gate before the
+    # rotation call is the thing that makes the restore predictable.
+    stray = [n for n in hsm_creates
+             if set(states[n].get("Parameters", {})) - {"ClusterId", "AvailabilityZone"}]
+    check(not stray, "every CreateHsm passes only ClusterId and AvailabilityZone", str(stray))
+    check(len(hsm_creates) >= 2, "bootstrap and rotation each create an HSM",
+          str(hsm_creates))
 
     mode_choice = [n for n, s in states.items()
                    if s.get("Type") == "Choice" and "$.mode" in json.dumps(s)]
@@ -391,6 +374,9 @@ def main():
                   if "Backups[0].State" in json.dumps(s) and "READY" in json.dumps(s)]
     check(len(ready_gate) >= 2, "READY backups gate both restore and completion",
           str(ready_gate))
+    check(path_exists(defn, "RequireReadyBackupRequested",
+                      lambda n, s: n == "CreateHsmFromBackup"),
+          "the READY backup gate precedes the rotation HSM")
 
     # --- 4. success path ordering -----------------------------------------
     print("\nsuccess path (delete, confirm gone, confirm backup, then exit):")

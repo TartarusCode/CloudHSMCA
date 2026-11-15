@@ -187,12 +187,11 @@
     },
     "CreateHsmFromBackup": {
       "Type": "Task",
-      "Comment": "Restores the Root key material from the cluster backup into the new HSM.",
+      "Comment": "CreateHsm takes only ClusterId and AvailabilityZone. Because this cluster has a backup, CloudHSM restores the cluster's most recent backup onto the new HSM — SourceBackupId exists only on CreateCluster, never here. VerifyBackupForRotation has already proved a READY backup exists.",
       "Resource": "arn:aws:states:::aws-sdk:cloudhsmv2:createHsm",
       "Parameters": {
         "ClusterId": "${cluster_id}",
-        "AvailabilityZone": "${availability_zone}",
-        "BackupId.$": "$.backups.Backups[0].BackupId"
+        "AvailabilityZone": "${availability_zone}"
       },
       "ResultPath": "$.hsm",
       "Retry": [

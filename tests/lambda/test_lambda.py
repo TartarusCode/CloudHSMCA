@@ -137,25 +137,61 @@ class _S3:
         self.puts.append(kwargs["Key"])
 
 
+def _check_kwargs(service, operation, kwargs):
+    """Validate a stub call against the real botocore model when installed.
+
+    A hand-written stub only proves the handler agrees with itself. This harness
+    once accepted kms:Sign and ImportCrl shapes by construction and could not see
+    that a live call would be rejected; checking the model makes each stub a
+    statement about the API.
+    """
+    try:
+        import botocore.session
+    except ImportError:
+        return
+    model = botocore.session.get_session().get_service_model(service)
+    shape = model.operation_model(operation).input_shape
+    allowed = set((shape.members or {}) if shape else {})
+    unknown = sorted(set(kwargs) - allowed)
+    assert not unknown, "%s:%s does not accept %s (accepts %s)" % (
+        service, operation, unknown, sorted(allowed))
+
+
 class _RolesAnywhere:
     def __init__(self, sink):
         self._sink = sink
 
     def update_trust_anchor(self, trustAnchorId, source):
+        _check_kwargs("rolesanywhere", "UpdateTrustAnchor",
+                      {"trustAnchorId": trustAnchorId, "source": source})
         self._sink["trustAnchorId"] = trustAnchorId
         self._sink["trustAnchorSource"] = source
         return {"trustAnchor": {"trustAnchorId": trustAnchorId}}
 
     def enable_trust_anchor(self, trustAnchorId):
+        _check_kwargs("rolesanywhere", "EnableTrustAnchor", {"trustAnchorId": trustAnchorId})
         self._sink["enabledTrustAnchor"] = trustAnchorId
         return {"trustAnchor": {"trustAnchorId": trustAnchorId, "enabled": True}}
 
     def import_crl(self, name, crlData, trustAnchorArn, enabled):
+        _check_kwargs("rolesanywhere", "ImportCrl",
+                      {"name": name, "crlData": crlData,
+                       "trustAnchorArn": trustAnchorArn, "enabled": enabled})
         self._sink["name"] = name
         self._sink["crlData"] = crlData
         return {"crl": {"crlId": "crl-123",
                         "crlArn": "arn:aws:rolesanywhere:us-west-2:1111:crl/123",
                         "name": name, "enabled": enabled}}
+
+    def list_crls(self):
+        # Retiring stale CRLs is decided on trustAnchorArn, so the stub returns a
+        # CRL for another anchor and an already disabled one alongside the live one.
+        return {"crls": list(self._sink.get("existingCrls", []))}
+
+    def disable_crl(self, crlId):
+        _check_kwargs("rolesanywhere", "DisableCrl", {"crlId": crlId})
+        self._sink.setdefault("disabledCrls", []).append(crlId)
+        return {"crl": {"crlId": crlId, "enabled": False}}
 
     def get_crl(self, crlId):
         assert crlId == "crl-123"
@@ -328,12 +364,21 @@ def main():
     # 5. nothing revoked: Roles Anywhere rejects an empty CRL
     #    ("At least one of the included CRLs doesn't include a revoked
     #    certificate"), so the handler must not attempt the import at all.
-    os.environ.pop("REVOCATIONS_S3_URI")
+    os.environ.pop("REVOCATIONS_S3_URI")   # unset list == nothing revoked
+    anchor_arn = os.environ["TRUST_ANCHOR_ARN"]
     sink.clear()
+    sink["existingCrls"] = [
+        {"crlId": "crl-live", "trustAnchorArn": anchor_arn, "enabled": True},
+        {"crlId": "crl-already-off", "trustAnchorArn": anchor_arn, "enabled": False},
+        {"crlId": "crl-other-anchor",
+         "trustAnchorArn": "arn:aws:rolesanywhere:us-west-2:1111:trust-anchor/other",
+         "enabled": True},
+    ]
     skipped = handler_module.handler({}, None)
     assert skipped.get("skipped") == "no-revocations", skipped
-    assert not sink, "an empty revocation list still produced a CRL: %r" % (sink,)
-    print("empty revocation list: skipped ImportCrl (%s)" % skipped["skipped"])
+    assert skipped["disabledCrls"] == ["crl-live"], skipped
+    assert "crlData" not in sink, "an empty revocation list still produced a CRL"
+    print("empty revocation list: no import, retired %s" % skipped["disabledCrls"])
 
     print("\nLAMBDA HARNESS: PASS (work dir %s)" % WORK)
 
