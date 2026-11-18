@@ -44,7 +44,7 @@ output "crl_issuer_function_name" {
 }
 
 output "crl_issuer_role_arn" {
-  description = "Role that installs the chain and signs CRLs. The core key policy matches it by aws:PrincipalArn under <name>-*."
+  description = "Role that installs the chain and signs CRLs. The core key policy must list this exact ARN in allowed_kms_signer_role_arns."
   value       = aws_iam_role.crl_issuer.arn
 }
 

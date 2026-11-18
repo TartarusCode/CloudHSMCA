@@ -161,6 +161,15 @@ class _RolesAnywhere:
     def __init__(self, sink):
         self._sink = sink
 
+    def get_trust_anchor(self, trustAnchorId):
+        _check_kwargs("rolesanywhere", "GetTrustAnchor",
+                      {"trustAnchorId": trustAnchorId})
+        return {"trustAnchor": {
+            "trustAnchorId": trustAnchorId,
+            "enabled": self._sink.get("enabledTrustAnchor") == trustAnchorId,
+            "source": self._sink.get("trustAnchorSource", {}),
+        }}
+
     def update_trust_anchor(self, trustAnchorId, source):
         _check_kwargs("rolesanywhere", "UpdateTrustAnchor",
                       {"trustAnchorId": trustAnchorId, "source": source})
@@ -183,14 +192,26 @@ class _RolesAnywhere:
                         "crlArn": "arn:aws:rolesanywhere:us-west-2:1111:crl/123",
                         "name": name, "enabled": enabled}}
 
-    def list_crls(self):
-        # Retiring stale CRLs is decided on trustAnchorArn, so the stub returns a
-        # CRL for another anchor and an already disabled one alongside the live one.
-        return {"crls": list(self._sink.get("existingCrls", []))}
+    def list_crls(self, **kwargs):
+        # ListCrls is account-wide and paginated. Serve two per page so the
+        # handler must follow nextToken to find all of its own CRLs.
+        token = kwargs.get("nextToken")
+        all_crls = list(self._sink.get("existingCrls", []))
+        offset = int(token) if token else 0
+        page = all_crls[offset:offset + 2]
+        result = {"crls": page}
+        if offset + 2 < len(all_crls):
+            result["nextToken"] = str(offset + 2)
+        return result
 
     def disable_crl(self, crlId):
         _check_kwargs("rolesanywhere", "DisableCrl", {"crlId": crlId})
         self._sink.setdefault("disabledCrls", []).append(crlId)
+        return {"crl": {"crlId": crlId, "enabled": False}}
+
+    def delete_crl(self, crlId):
+        _check_kwargs("rolesanywhere", "DeleteCrl", {"crlId": crlId})
+        self._sink.setdefault("deletedCrls", []).append(crlId)
         return {"crl": {"crlId": crlId, "enabled": False}}
 
     def get_crl(self, crlId):
@@ -294,11 +315,27 @@ def main():
     print("\n[3] scheduled tick with the chain published: refresh only")
     fake_boto3._bundle = bundle_pem
     sink.clear()
+    # The committed chain is already installed: reconciliation must be a no-op.
+    sink["trustAnchorSource"] = {
+        "sourceType": "CERTIFICATE_BUNDLE",
+        "sourceData": {"x509CertificateData": bundle_pem},
+    }
+    sink["enabledTrustAnchor"] = os.environ["TRUST_ANCHOR_ID"]
     refreshed = handler_module.handler({"reason": "scheduled-refresh"}, None)
     assert refreshed.get("activated") is False, refreshed
-    assert "enabledTrustAnchor" not in sink, "a refresh must not touch the anchor"
+    assert refreshed.get("chainReconciled") is False, refreshed
     assert "crlData" in sink, "a refresh must import a CRL"
-    print("refreshed without touching the trust anchor")
+    print("refreshed without touching a matching trust anchor")
+
+    # --- path C2: the scheduled tick repairs a drifted trust anchor --------
+    print("\n[3b] scheduled tick with a drifted trust anchor: reconcile")
+    sink.pop("trustAnchorSource", None)
+    reconciled = handler_module.handler({"reason": "scheduled-refresh"}, None)
+    assert reconciled.get("chainReconciled") is True, reconciled
+    repaired = sink.get("trustAnchorSource", {}).get("sourceData", {}).get(
+        "x509CertificateData", "")
+    assert repaired == bundle_pem, repaired[:60]
+    print("scheduled reconciliation re-installed the committed chain")
 
     # --- path D: an activation event with no chain is a hard failure --------
     print("\n[4] CAChainPublished with no chain: fail loudly")
@@ -368,15 +405,21 @@ def main():
     anchor_arn = os.environ["TRUST_ANCHOR_ARN"]
     sink.clear()
     sink["existingCrls"] = [
-        {"crlId": "crl-live", "trustAnchorArn": anchor_arn, "enabled": True},
-        {"crlId": "crl-already-off", "trustAnchorArn": anchor_arn, "enabled": False},
-        {"crlId": "crl-other-anchor",
+        {"crlId": "crl-live", "name": "crl-1",
+         "trustAnchorArn": anchor_arn, "enabled": True},
+        {"crlId": "crl-already-off", "name": "crl-0",
+         "trustAnchorArn": anchor_arn, "enabled": False},
+        {"crlId": "crl-other-anchor", "name": "other-crl-1",
          "trustAnchorArn": "arn:aws:rolesanywhere:us-west-2:1111:trust-anchor/other",
          "enabled": True},
+        # A second page: the old single-page loop never saw this owned CRL.
+        {"crlId": "crl-second-page", "name": "crl-2",
+         "trustAnchorArn": anchor_arn, "enabled": True},
     ]
     skipped = handler_module.handler({}, None)
     assert skipped.get("skipped") == "no-revocations", skipped
-    assert skipped["disabledCrls"] == ["crl-live"], skipped
+    assert sorted(skipped["disabledCrls"]) == ["crl-live", "crl-second-page"], skipped
+    assert sorted(sink["deletedCrls"]) == ["crl-already-off", "crl-live", "crl-second-page"], sink
     assert "crlData" not in sink, "an empty revocation list still produced a CRL"
     print("empty revocation list: no import, retired %s" % skipped["disabledCrls"])
 

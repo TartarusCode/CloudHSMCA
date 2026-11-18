@@ -22,9 +22,17 @@ MODULE="${1:-$(cd "$HERE/../../modules/hsm-ca" && pwd)}"
 HARNESS="$(mktemp -d)"
 STUB="$HARNESS/stub"
 export HARNESS STUB_DIR="$STUB"
-mkdir -p "$STUB" "$HARNESS/pki" "$HARNESS/work" "$HARNESS/scripts" "$HARNESS/fakebin"
+mkdir -p "$STUB" "$HARNESS/pki" "$HARNESS/work" "$HARNESS/scripts" "$HARNESS/fakebin" "$HARNESS/cloudhsm-etc"
 echo NOT_STARTED > "$STUB/state"
 trap 'rm -rf "$HARNESS"' EXIT
+
+# A separate commissioning CA claims the cluster. Its private key is served
+# through the SSM stub; the certificate is public and goes into the config.
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:secp384r1 -nodes \
+  -keyout "$STUB/commissioning-key.pem" -out "$STUB/commissioning-ca.pem" \
+  -sha384 -days 3650 -subj "/O=harness/CN=harness commissioning CA" \
+  -addext "basicConstraints=critical,CA:TRUE" \
+  -addext "keyUsage=critical,keyCertSign,cRLSign" 2>/dev/null
 
 echo "module: $MODULE"
 echo "work:   $HARNESS"
@@ -71,7 +79,7 @@ chmod +x "$HARNESS/fakebin/aws" "$HARNESS/fakebin/cloudhsm-cli"
 # --- render the ceremony exactly as Terraform does ---------------------------
 RENDERED="$HARNESS/work/rendered.sh"
 python3 - "$MODULE" "$RENDERED" <<'PY'
-import json, subprocess, sys
+import json, os, subprocess, sys
 
 module, out_path = sys.argv[1], sys.argv[2]
 cfg = {
@@ -92,6 +100,17 @@ cfg = {
     "s3_root_ca_cnf": "scripts/root_ca.cnf",
     "s3_intermediate_cnf": "scripts/intermediate_ca.cnf",
     "cu_username": "pki-cu", "cloudhsm_cli_rpm": "https://example/rpm",
+    "commissioning_ca_cert": open(os.path.join(os.environ["STUB_DIR"], "commissioning-ca.pem")).read(),
+    "commissioning_key_ssm_param": "/corp-pki/pki/ceremony/commissioning-key",
+    "commissioning_signed_cert": "",
+    # The curl stub creates an empty RPM, whose SHA-256 is the well-known digest
+    # of no bytes; the ceremony must verify it before installing.
+    "cloudhsm_cli_rpm_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "uv_version": "0.5.11",
+    "uv_installer_sha256": "",
+    "s3_tool_version": "v1",
+    "s3_root_cnf_version": "v1",
+    "s3_inter_cnf_version": "v1",
 }
 expr = 'jsonencode(templatefile("scripts/hsm_ceremony.sh.tftpl", {ceremony_config = %s}))' % (
     json.dumps(json.dumps(cfg)))
@@ -170,6 +189,7 @@ PY
 
 # --- point the fixed production paths at the sandbox ------------------------
 sed -e "s#/opt/pki#$HARNESS/pki#g" \
+    -e "s#/opt/cloudhsm/etc#$HARNESS/cloudhsm-etc#g" \
     -e "s#/opt/cloudhsm/bin/cloudhsm-cli#$HARNESS/fakebin/cloudhsm-cli#g" \
     -e "s#/opt/cloudhsm/bin/configure-cli#$HARNESS/fakebin/configure-cli#g" \
     -e "s#/var/log/pki-ceremony.log#$HARNESS/pki-ceremony.log#g" \
@@ -207,5 +227,57 @@ echo "--- HSM calls ---"; grep -E "generate-asymmetric|sign ecdsa" "$STUB/cloudh
 echo "--- KMS calls ---"; cat "$STUB/kms-calls.log"
 
 [ "$(cat "$STUB/state")" = "COMPLETE" ] || { echo "FAIL: ceremony state is not COMPLETE" >&2; exit 1; }
+
+# --- claim scenario: a fresh cluster is UNINITIALIZED ----------------------
+# This is the first apply's real starting point. The ceremony must sign the
+# cluster CSR with the commissioning CA, call InitializeCluster, install the
+# client trust anchor, and only then activate.
+echo
+echo "=== claim scenario: cluster starts UNINITIALIZED ==="
+echo NOT_STARTED > "$STUB/state"
+rm -f "$STUB/activated" "$STUB/claimed" "$STUB/initialize.log" \
+      "$STUB/cluster.csr" "$STUB/cluster-csr-key.pem"
+cd "$HARNESS"
+rm -rf "$HARNESS/pki"; mkdir -p "$HARNESS/pki"
+if ! HSM_STUB_UNINITIALIZED=1 bash "$STUB/ceremony.sh" > "$HARNESS/claim.log" 2>&1; then
+  echo "FAIL: the ceremony did not complete on an UNINITIALIZED cluster" >&2
+  tail -25 "$HARNESS/claim.log" >&2
+  exit 1
+fi
+grep -q "claiming uninitialized cluster" "$HARNESS/claim.log" \
+  || { echo "FAIL: the claim phase never ran" >&2; exit 1; }
+grep -q "cluster claimed: INITIALIZED" "$HARNESS/claim.log" \
+  || { echo "FAIL: the cluster never reached INITIALIZED" >&2; exit 1; }
+[ -s "$STUB/initialize.log" ] \
+  || { echo "FAIL: InitializeCluster was never called" >&2; exit 1; }
+[ "$(cat "$STUB/state")" = "COMPLETE" ] \
+  || { echo "FAIL: claim-run ceremony state is not COMPLETE" >&2; exit 1; }
+openssl verify -CAfile "$STUB/commissioning-ca.pem" "$HARNESS/pki/cluster-cert.pem" >/dev/null \
+  || { echo "FAIL: signed cluster certificate does not chain to the commissioning CA" >&2; exit 1; }
+cmp -s "$STUB/commissioning-ca.pem" "$HARNESS/cloudhsm-etc/customerCA.crt" \
+  || { echo "FAIL: the commissioning CA was not installed as the client trust anchor" >&2; exit 1; }
+echo "claim verified: CSR signed, InitializeCluster called, trust anchor installed"
+
+# --- supply-chain gate: a wrong RPM hash aborts before credentials ---------
+echo
+echo "=== supply-chain gate: wrong CLI RPM checksum ==="
+sed '/cloudhsm_cli_rpm_sha256/ s/[0-9a-f]\{64\}/deadbeef/' \
+  "$STUB/ceremony.sh" > "$STUB/ceremony-badhash.sh"
+grep -q 'deadbeef' "$STUB/ceremony-badhash.sh" \
+  || { echo "FAIL: could not inject a bad RPM hash into the rendered script" >&2; exit 1; }
+echo NOT_STARTED > "$STUB/state"
+: > "$STUB/aws.log"
+if HSM_STUB_UNINITIALIZED=1 bash "$STUB/ceremony-badhash.sh" > "$HARNESS/badhash.log" 2>&1; then
+  echo "FAIL: the ceremony installed a CLI RPM with a wrong checksum" >&2
+  exit 1
+fi
+grep -q "CloudHSM CLI RPM checksum mismatch" "$HARNESS/badhash.log" \
+  || { echo "FAIL: the checksum mismatch was not reported" >&2; tail -10 "$HARNESS/badhash.log" >&2; exit 1; }
+if grep -q "get-parameter .*hsm-admin-password" "$STUB/aws.log"; then
+  echo "FAIL: the ceremony read the admin password before verifying the CLI package" >&2
+  exit 1
+fi
+echo "verified: bad RPM hash aborted before any credential read"
+
 echo
 echo "CEREMONY HARNESS: PASS"

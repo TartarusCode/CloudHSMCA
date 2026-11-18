@@ -53,8 +53,11 @@ variable "workload_profiles" {
     aws:PrincipalTag/x509Subject/OU and /CN.
   EOT
   type = map(object({
-    description                = optional(string, "Managed by cloudhsmca")
-    session_duration_seconds   = optional(number, 3600)
+    description              = optional(string, "Managed by cloudhsmca")
+    session_duration_seconds = optional(number, 3600)
+    # IAM roles have a 3600 s floor; Roles Anywhere profiles accept 900 s.
+    # Leave null to floor the role automatically, or set an explicit ceiling.
+    role_max_session_duration  = optional(number)
     managed_policy_arns        = optional(list(string), [])
     session_policy_json        = optional(string)
     accept_role_session_name   = optional(bool, true)
@@ -71,6 +74,14 @@ variable "workload_profiles" {
       p.session_duration_seconds >= 900 && p.session_duration_seconds <= 43200
     ])
     error_message = "session_duration_seconds must be between 900 and 43200 (STS limits)."
+  }
+
+  validation {
+    condition = alltrue([
+      for p in values(var.workload_profiles) :
+      p.role_max_session_duration == null || (p.role_max_session_duration >= 3600 && p.role_max_session_duration <= 43200)
+    ])
+    error_message = "role_max_session_duration must be between 3600 and 43200 (IAM role limit)."
   }
 
   validation {

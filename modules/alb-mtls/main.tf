@@ -2,9 +2,10 @@
 # The trust store, bootstrapped with a placeholder bundle
 #
 # elbv2:CreateTrustStore needs a PEM CA bundle in S3 at creation time, but the
-# real chain only exists after a ceremony. So a throwaway self-signed certificate
-# is uploaded first, the trust store is created against that object version, and
-# the sync Lambda overwrites both when CAChainPublished arrives.
+# real chain only exists after a ceremony. A checked-in, public-only placeholder
+# certificate is uploaded first (its key never enters Terraform state), the trust
+# store is created against that object version, and the sync Lambda overwrites
+# both when CAChainPublished arrives.
 #
 # ignore_changes on the object is what makes the overwrite stick: without it every
 # plan would restore the placeholder; ignore_changes on the trust store's object
@@ -16,32 +17,13 @@ locals {
   prefix = "alb-mtls/${local.name}"
 }
 
-resource "tls_private_key" "placeholder" {
-  algorithm   = "ECDSA"
-  ecdsa_curve = "P384"
-}
-
-resource "tls_self_signed_cert" "placeholder" {
-  private_key_pem = tls_private_key.placeholder.private_key_pem
-
-  is_ca_certificate = true
-  allowed_uses      = ["cert_signing", "crl_signing"]
-
-  # One year: nothing validates against this certificate while the trust store has
-  # no listeners attached, but an expired bundle is rejected by CreateTrustStore,
-  # and a delayed apply must not spend a short window.
-  validity_period_hours = 8760
-
-  subject {
-    common_name  = "${local.name} ALB mTLS placeholder — not a certificate authority"
-    organization = "placeholder"
-  }
-}
-
+# The certificate is checked in as public material only; its private key was
+# generated outside Terraform and destroyed. A state reader therefore has no
+# signing authority over a listener that points at this trust store.
 resource "aws_s3_object" "placeholder_bundle" {
   bucket        = var.ca_contract.artifacts_bucket
   key           = local.bundle_key
-  content       = tls_self_signed_cert.placeholder.cert_pem
+  content       = file("${path.module}/placeholder_ca.pem")
   content_type  = "application/x-pem-file"
   tags          = local.tags
   force_destroy = false

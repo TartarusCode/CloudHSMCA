@@ -49,7 +49,7 @@ variable "kms_deletion_window_in_days" {
 }
 
 variable "allowed_kms_signer_role_arns" {
-  description = "IAM role ARNs besides the ceremony host allowed to sign with the Intermediate key. null = every role named <name>-*."
+  description = "Exact IAM role ARNs besides the ceremony host allowed to sign with the Intermediate key. null = the composite stack's designated CRL issuer role only; workload roles are never implied by a pattern."
   type        = list(string)
   default     = null
 }
@@ -134,6 +134,38 @@ variable "cloudhsm_cli_rpm" {
   default     = "https://s3.amazonaws.com/cloudhsmv2-software/CloudHsmClient/Amzn2023/cloudhsm-cli-latest.amzn2023.x86_64.rpm"
 }
 
+variable "cloudhsm_cli_rpm_sha256" {
+  description = "SHA-256 of the CloudHSM CLI RPM, verified before the ceremony installs it. Required for a bootstrap."
+  type        = string
+  default     = ""
+}
+
+variable "uv_version" {
+  description = "Exact uv release the ceremony installs."
+  type        = string
+  default     = "0.5.11"
+}
+
+variable "uv_installer_sha256" {
+  description = "Optional SHA-256 of the uv install script."
+  type        = string
+  default     = ""
+}
+
+variable "commissioning_ca" {
+  description = "The approved CA that claims a new CloudHSM cluster (public certificate plus an SSM SecureString parameter holding the key, or a pre-signed cluster certificate). Required for the first bootstrap of an UNINITIALIZED cluster."
+  type = object({
+    certificate                = string
+    key_ssm_param              = optional(string, "")
+    signed_cluster_certificate = optional(string, "")
+  })
+  default = {
+    certificate                = ""
+    key_ssm_param              = ""
+    signed_cluster_certificate = ""
+  }
+}
+
 variable "event_bus_name" {
   description = "EventBridge bus for CAChainPublished. Consumers must subscribe to the same bus."
   type        = string
@@ -183,8 +215,10 @@ variable "enable_roles_anywhere" {
 variable "workload_profiles" {
   description = "One Roles Anywhere profile + IAM role per workload class, keyed by a short stable name."
   type = map(object({
-    description                = optional(string, "Managed by cloudhsmca")
-    session_duration_seconds   = optional(number, 3600)
+    description              = optional(string, "Managed by cloudhsmca")
+    session_duration_seconds = optional(number, 3600)
+    # IAM role ceiling: leave null to floor at 3600 automatically.
+    role_max_session_duration  = optional(number)
     managed_policy_arns        = optional(list(string), [])
     session_policy_json        = optional(string)
     accept_role_session_name   = optional(bool, true)
@@ -201,6 +235,14 @@ variable "workload_profiles" {
       p.session_duration_seconds >= 900 && p.session_duration_seconds <= 43200
     ])
     error_message = "session_duration_seconds must be between 900 and 43200 (STS limits)."
+  }
+
+  validation {
+    condition = alltrue([
+      for p in values(var.workload_profiles) :
+      p.role_max_session_duration == null || (p.role_max_session_duration >= 3600 && p.role_max_session_duration <= 43200)
+    ])
+    error_message = "role_max_session_duration must be between 3600 and 43200 (IAM role limit)."
   }
 }
 
@@ -235,7 +277,7 @@ variable "alb_trust_store_name" {
 }
 
 variable "alb_revoked_serials_ssm_param" {
-  description = "SSM parameter holding revoked serials as JSON for the ALB CRL. Empty = issue an empty CRL."
+  description = "SSM parameter holding revoked serials as JSON for the ALB CRL. Empty = do not rotate the CRL; set to a parameter containing {\"revoked\": []} to explicitly clear serials. A configured but missing or invalid parameter fails closed."
   type        = string
   default     = ""
 }

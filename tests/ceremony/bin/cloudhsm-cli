@@ -92,8 +92,15 @@ def main():
                     "curve": args[args.index("--curve") + 1]}},
                 "private_key": {"key-reference": "0x2", "key-info": {}, "attributes": {
                     "key-type": "ec", "class": "private-key",
-                    "extractable": attrs.get(("--private-attributes", "extractable"), "true"),
-                    "sign": attrs.get(("--private-attributes", "sign"), "false")}},
+                    # SDK 5 reports these as JSON booleans. Support explicit
+                    # stub modes so the ceremony's extractability gate can be
+                    # tested for false/true/missing/string values.
+                    "extractable": (
+                        os.environ.get("HSM_STUB_EXTRACTABLE") == "true"
+                        if os.environ.get("HSM_STUB_EXTRACTABLE") in ("true", "false")
+                        else attrs.get(("--private-attributes", "extractable"), "true") != "false"
+                    ),
+                    "sign": attrs.get(("--private-attributes", "sign"), "false") == "true"}},
             }})
 
         elif args[:3] == ["crypto", "sign", "ecdsa"]:

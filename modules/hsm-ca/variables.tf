@@ -67,12 +67,20 @@ variable "allowed_kms_signer_role_arns" {
     certificates without the core module having to know it exists — no circular
     key policy, no cross-stack resource reference.
 
-    Defaults to every role whose name starts with "<name>-", which covers the
-    conventional consumer role names in this repository. Narrow it, or pass
-    explicit ARNs, if your naming differs.
+    An empty list is the safe default: only the ceremony host can sign. Pass the
+    exact ARNs of designated signing services (for example the CRL issuer) to
+    grant them access. Wildcards are rejected because a workload role that
+    matches the pattern would otherwise enter the CA key's authorization
+    boundary; the digest-only conditions cannot distinguish a CRL from a
+    certificate signature.
   EOT
   type        = list(string)
-  default     = null
+  default     = []
+
+  validation {
+    condition     = alltrue([for arn in var.allowed_kms_signer_role_arns : !can(regex("[*?]", arn))])
+    error_message = "allowed_kms_signer_role_arns must contain exact IAM role ARNs; wildcards would admit workload roles."
+  }
 }
 
 variable "root_key_curve" {
@@ -157,6 +165,11 @@ variable "auto_bootstrap" {
   EOT
   type        = bool
   default     = false
+
+  validation {
+    condition     = !var.auto_bootstrap || var.enable_bootstrap
+    error_message = "auto_bootstrap = true starts mode=BOOTSTRAP and requires enable_bootstrap = true."
+  }
 }
 
 variable "auto_bootstrap_timeout_seconds" {
@@ -181,6 +194,49 @@ variable "cloudhsm_cli_rpm" {
   description = "AWS CloudHSM Client SDK 5 CLI package for Amazon Linux 2023."
   type        = string
   default     = "https://s3.amazonaws.com/cloudhsmv2-software/CloudHsmClient/Amzn2023/cloudhsm-cli-latest.amzn2023.x86_64.rpm"
+}
+
+variable "cloudhsm_cli_rpm_sha256" {
+  description = "SHA-256 of the CloudHSM CLI RPM. Required: the ceremony verifies the download before installing a package that can reach the root key."
+  type        = string
+  default     = ""
+}
+
+variable "uv_version" {
+  description = "Exact uv release the ceremony installs."
+  type        = string
+  default     = "0.5.11"
+}
+
+variable "uv_installer_sha256" {
+  description = "Optional SHA-256 of the uv install script. Strongly recommended; without it the installer is pinned only by uv_version."
+  type        = string
+  default     = ""
+}
+
+###############################################################################
+# Cluster commissioning
+###############################################################################
+
+variable "commissioning_ca" {
+  description = <<-EOT
+    The separate, approved CA that claims a NEW CloudHSM cluster. Terraform
+    creates clusters UNINITIALIZED; the ceremony must sign the cluster CSR and
+    call InitializeCluster before it can activate the cluster. The private key
+    never enters Terraform state: supply either an SSM SecureString parameter
+    name holding it, or a pre-signed cluster certificate (fully offline mode).
+    The certificate is public and is installed as the client's trust anchor.
+  EOT
+  type = object({
+    certificate                = string
+    key_ssm_param              = optional(string, "")
+    signed_cluster_certificate = optional(string, "")
+  })
+  default = {
+    certificate                = ""
+    key_ssm_param              = ""
+    signed_cluster_certificate = ""
+  }
 }
 
 variable "event_bus_name" {

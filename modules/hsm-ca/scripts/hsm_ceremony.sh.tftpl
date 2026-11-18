@@ -73,6 +73,15 @@ S3_ROOT_CNF=$(cfg s3_root_ca_cnf)
 S3_INTER_CNF=$(cfg s3_intermediate_cnf)
 CU_USER=$(cfg cu_username)
 CLI_RPM=$(cfg cloudhsm_cli_rpm)
+CLI_RPM_SHA256=$(cfg cloudhsm_cli_rpm_sha256)
+UV_VERSION=$(cfg uv_version)
+UV_INSTALLER_SHA256=$(cfg uv_installer_sha256)
+S3_TOOL_VERSION=$(cfg s3_tool_version)
+S3_ROOT_CNF_VERSION=$(cfg s3_root_cnf_version)
+S3_INTER_CNF_VERSION=$(cfg s3_inter_cnf_version)
+COMMISSIONING_CA_CERT=$(cfg commissioning_ca_cert)
+COMMISSIONING_KEY_PARAM=$(cfg commissioning_key_ssm_param)
+COMMISSIONING_SIGNED_CERT=$(cfg commissioning_signed_cert)
 
 export AWS_REGION=$REGION
 export AWS_DEFAULT_REGION=$REGION
@@ -128,12 +137,23 @@ mark_state IN_PROGRESS
 # --- 1. packages ------------------------------------------------------------
 log "installing jq, openssl, curl and the CloudHSM Client SDK 5 CLI"
 dnf install -y -q jq openssl ca-certificates curl tar gzip >/dev/null
+[ -n "$CLI_RPM_SHA256" ] && [ "$CLI_RPM_SHA256" != "null" ] \
+  || die "cloudhsm_cli_rpm_sha256 is required: refusing to install an unverified CLI package"
 curl -fsSL -o /tmp/cloudhsm-cli.rpm "$CLI_RPM"
+printf '%s  %s\n' "$CLI_RPM_SHA256" /tmp/cloudhsm-cli.rpm | sha256sum -c - \
+  || die "CloudHSM CLI RPM checksum mismatch"
 dnf install -y -q /tmp/cloudhsm-cli.rpm >/dev/null
 [ -x "$CLI" ] || die "cloudhsm-cli not installed at $CLI"
 
 log "configuring cloudhsm-cli for HSM ENI $HSM_IP"
 /opt/cloudhsm/bin/configure-cli -a "$HSM_IP"
+# The client must trust the commissioning CA before any TLS to the HSM,
+# including `cluster activate`. This is public certificate material only.
+[ -n "$COMMISSIONING_CA_CERT" ] && [ "$COMMISSIONING_CA_CERT" != "null" ] \
+  || die "commissioning_ca.certificate is required to trust the HSM cluster"
+CCERT="$PKI_DIR/commissioning-ca.pem"
+printf '%s\n' "$COMMISSIONING_CA_CERT" > "$CCERT"
+install -m 644 "$CCERT" /opt/cloudhsm/etc/customerCA.crt
 if systemctl cat cloudhsm-cli >/dev/null 2>&1; then
   systemctl enable --now cloudhsm-cli
   log "cloudhsm-cli service restarted"
@@ -143,8 +163,15 @@ fi
 
 # --- 2. python tooling (uv, isolated) ---------------------------------------
 if ! command -v uv >/dev/null 2>&1; then
-  log "installing uv"
-  curl -LsSf https://astral.sh/uv/install.sh | sh >/dev/null
+  log "installing uv $UV_VERSION"
+  curl -LsSf -o /tmp/uv-install.sh https://astral.sh/uv/install.sh
+  if [ -n "$UV_INSTALLER_SHA256" ] && [ "$UV_INSTALLER_SHA256" != "null" ]; then
+    printf '%s  %s\n' "$UV_INSTALLER_SHA256" /tmp/uv-install.sh | sha256sum -c - \
+      || die "uv installer checksum mismatch"
+  else
+    log "WARNING: uv_installer_sha256 is unset; the installer is version-pinned only"
+  fi
+  UV_VERSION="$UV_VERSION" sh /tmp/uv-install.sh >/dev/null
 fi
 command -v uv >/dev/null 2>&1 || die "uv is unavailable; refusing to fall back to system pip"
 log "creating $VENV and installing cryptography + boto3"
@@ -156,9 +183,16 @@ print("cryptography", cryptography.__version__, "boto3", boto3.__version__)
 PY
 
 log "fetching the CA tooling and rendered OpenSSL profiles from s3://$BUCKET"
-aws s3api get-object --bucket "$BUCKET" --key "$S3_TOOL"      "$TOOL"           >/dev/null
-aws s3api get-object --bucket "$BUCKET" --key "$S3_ROOT_CNF"  "$PKI_DIR/root_ca.cnf"        >/dev/null
-aws s3api get-object --bucket "$BUCKET" --key "$S3_INTER_CNF" "$PKI_DIR/intermediate_ca.cnf" >/dev/null
+s3get() { # s3get <key> <dest> <version-id>
+  if [ -n "$3" ] && [ "$3" != "null" ]; then
+    aws s3api get-object --bucket "$BUCKET" --key "$1" --version-id "$3" "$2" >/dev/null
+  else
+    aws s3api get-object --bucket "$BUCKET" --key "$1" "$2" >/dev/null
+  fi
+}
+s3get "$S3_TOOL"      "$TOOL"                      "$S3_TOOL_VERSION"
+s3get "$S3_ROOT_CNF"  "$PKI_DIR/root_ca.cnf"       "$S3_ROOT_CNF_VERSION"
+s3get "$S3_INTER_CNF" "$PKI_DIR/intermediate_ca.cnf" "$S3_INTER_CNF_VERSION"
 chmod 700 "$TOOL"
 
 # --- 3. wait for the cluster, then activate it ------------------------------
@@ -167,14 +201,64 @@ for _ in $(seq 1 40); do
   STATE=$(aws cloudhsmv2 describe-clusters --filters clusterIds="$CLUSTER_ID" \
             --query 'Clusters[0].State' --output text 2>/dev/null || echo UNKNOWN)
   case "$STATE" in
-    ACTIVE|INITIALIZED) break ;;
+    ACTIVE|INITIALIZED|UNINITIALIZED) break ;;
     *) log "cluster state=$STATE — waiting" ; sleep 30 ;;
   esac
 done
 case "$STATE" in
-  ACTIVE|INITIALIZED) log "cluster state=$STATE" ;;
+  ACTIVE|INITIALIZED|UNINITIALIZED) log "cluster state=$STATE" ;;
   *) die "cluster never reached a usable state (last: $STATE)" ;;
 esac
+
+# --- 3a. claim a fresh cluster (UNINITIALIZED -> INITIALIZED) ---------------
+# A Terraform-created cluster starts UNINITIALIZED and has a cluster CSR. It
+# cannot be activated until that CSR is signed by the approved commissioning CA
+# and InitializeCluster succeeds. This is the only code path that owns that
+# transition; activation below only runs from INITIALIZED/ACTIVE.
+if [ "$STATE" = "UNINITIALIZED" ]; then
+  log "claiming uninitialized cluster with the commissioning CA"
+  CSR=$(aws cloudhsmv2 describe-clusters --filters clusterIds="$CLUSTER_ID" \
+          --query 'Clusters[0].Certificates.ClusterCsr' --output text 2>/dev/null || true)
+  [ -n "$CSR" ] && [ "$CSR" != "None" ] \
+    || die "cluster $CLUSTER_ID is UNINITIALIZED but has no CSR to sign"
+  CSR_FILE="$PKI_DIR/cluster.csr"
+  CERT_FILE="$PKI_DIR/cluster-cert.pem"
+  printf '%s\n' "$CSR" > "$CSR_FILE"
+
+  if [ -n "$COMMISSIONING_SIGNED_CERT" ] && [ "$COMMISSIONING_SIGNED_CERT" != "null" ]; then
+    log "using the operator-supplied pre-signed cluster certificate"
+    printf '%s\n' "$COMMISSIONING_SIGNED_CERT" > "$CERT_FILE"
+  elif [ -n "$COMMISSIONING_KEY_PARAM" ] && [ "$COMMISSIONING_KEY_PARAM" != "null" ]; then
+    log "signing the cluster CSR with the commissioning key from SSM"
+    COMMISSIONING_KEY=$(get_secret "$COMMISSIONING_KEY_PARAM")
+    [ -n "$COMMISSIONING_KEY" ] || die "commissioning signing key is empty in SSM"
+    KEY_FILE="$PKI_DIR/commissioning-key.pem"
+    printf '%s\n' "$COMMISSIONING_KEY" > "$KEY_FILE"
+    chmod 600 "$KEY_FILE"
+    openssl x509 -req -in "$CSR_FILE" -CA "$CCERT" -CAkey "$KEY_FILE" \
+      -CAcreateserial -days 375 -sha384 -out "$CERT_FILE" \
+      || die "could not sign the cluster CSR with the commissioning CA"
+    shred -u "$KEY_FILE" 2>/dev/null || rm -f "$KEY_FILE"
+  else
+    die "an UNINITIALIZED cluster needs commissioning_ca.key_ssm_param or signed_cluster_certificate"
+  fi
+
+  aws cloudhsmv2 initialize-cluster --cluster-id "$CLUSTER_ID" \
+    --signed-cert "file://$CERT_FILE" --trust-anchor "file://$CCERT" \
+    || die "InitializeCluster failed for $CLUSTER_ID"
+  for _ in $(seq 1 40); do
+    STATE=$(aws cloudhsmv2 describe-clusters --filters clusterIds="$CLUSTER_ID" \
+              --query 'Clusters[0].State' --output text 2>/dev/null || echo UNKNOWN)
+    case "$STATE" in
+      INITIALIZED|ACTIVE) break ;;
+      *) log "cluster state=$STATE after InitializeCluster — waiting" ; sleep 15 ;;
+    esac
+  done
+  case "$STATE" in
+    INITIALIZED|ACTIVE) log "cluster claimed: $STATE" ;;
+    *) die "cluster never left INITIALIZE_IN_PROGRESS (last: $STATE)" ;;
+  esac
+fi
 
 ADMIN_PW=$(get_secret "$SSM_ADMIN_PW")
 CU_PW=$(get_secret "$SSM_CU_PW")
@@ -210,8 +294,12 @@ hsm_cu "key generate-asymmetric-pair ec --curve $ROOT_CURVE \
   --private-attributes extractable=false sign=true" > "$OUT" 2>&1 || true
 require_ok "key generate-asymmetric-pair" "$OUT"
 
-if [ "$(pick_json < "$OUT" | jq -r '.data.private_key.attributes.extractable // "unknown"')" != "false" ]; then
-  die "root private key is extractable — refusing to continue"
+# `jq`'s `//` operator treats a JSON boolean `false` as absent, so the obvious
+# `.extractable // "unknown"` turns the required `false` into `"unknown"` and
+# aborts a correct ceremony. Require the boolean itself: only literal JSON
+# false passes; true, missing and string values all fail here.
+if ! pick_json < "$OUT" | jq -e '.data.private_key.attributes.extractable == false' >/dev/null; then
+  die "root private key is not confirmed non-extractable (extractable must be the JSON boolean false)"
 fi
 log "root private key confirmed non-extractable"
 

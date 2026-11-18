@@ -20,6 +20,7 @@ case "$svc" in
     case "$name" in
       *hsm-admin-password) echo "AdminPass-123" ;;
       *hsm-cu-password)    echo "CuPass-456" ;;
+      *commissioning-key)  cat "$STUB/commissioning-key.pem" ;;
       *ceremony/state)     cat "$STUB/state" 2>/dev/null || echo "NOT_STARTED" ;;
       *)                   echo "PENDING-CEREMONY" ;;
     esac
@@ -31,7 +32,34 @@ case "$svc" in
     case "$name" in */ceremony/state) printf '%s' "$value" > "$STUB/state" ;; esac
     ;;
   "cloudhsmv2 describe-clusters")
-    if [ ! -f "$STUB/activated" ]; then echo INITIALIZED; touch "$STUB/activated"; else echo ACTIVE; fi
+    query=$(val --query "$@")
+    if [[ "$query" == *ClusterCsr* ]]; then
+      if [ ! -f "$STUB/cluster.csr" ]; then
+        openssl req -new -newkey ec -pkeyopt ec_paramgen_curve:secp384r1 -nodes \
+          -keyout "$STUB/cluster-csr-key.pem" -subj "/CN=cluster-csr" \
+          -out "$STUB/cluster.csr" 2>/dev/null
+      fi
+      cat "$STUB/cluster.csr"
+    elif [ "${HSM_STUB_UNINITIALIZED:-0}" = "1" ] && [ ! -f "$STUB/claimed" ]; then
+      echo UNINITIALIZED
+    elif [ ! -f "$STUB/activated" ]; then
+      echo INITIALIZED; touch "$STUB/activated"
+    else
+      echo ACTIVE
+    fi
+    ;;
+  "cloudhsmv2 initialize-cluster")
+    signed=$(val --signed-cert "$@"); trust=$(val --trust-anchor "$@")
+    signed=${signed#file://}; trust=${trust#file://}
+    [ -s "$signed" ] || { echo "stub: missing signed cluster certificate" >&2; exit 1; }
+    [ -s "$trust" ]  || { echo "stub: missing trust anchor" >&2; exit 1; }
+    openssl verify -CAfile "$trust" "$signed" >/dev/null 2>&1 || {
+      echo "stub: signed cluster certificate does not chain to the trust anchor" >&2
+      exit 1
+    }
+    echo "initialize-cluster $signed $trust" >> "$STUB/initialize.log"
+    touch "$STUB/claimed"
+    echo "INITIALIZE_IN_PROGRESS"
     ;;
   "s3api get-object")
     key=$(val --key "$@"); out="${!#}"

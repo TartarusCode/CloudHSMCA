@@ -48,6 +48,12 @@ S3_TOOL=$(cfg s3_kms_ca_tool)
 S3_INTER_CNF=$(cfg s3_intermediate_cnf)
 CU_USER=$(cfg cu_username)
 CLI_RPM=$(cfg cloudhsm_cli_rpm)
+CLI_RPM_SHA256=$(cfg cloudhsm_cli_rpm_sha256)
+UV_VERSION=$(cfg uv_version)
+UV_INSTALLER_SHA256=$(cfg uv_installer_sha256)
+S3_TOOL_VERSION=$(cfg s3_tool_version)
+S3_INTER_CNF_VERSION=$(cfg s3_inter_cnf_version)
+COMMISSIONING_CA_CERT=$(cfg commissioning_ca_cert)
 
 export AWS_REGION=$REGION
 export AWS_DEFAULT_REGION=$REGION
@@ -61,7 +67,11 @@ mark_state IN_PROGRESS
 
 # --- tooling ---------------------------------------------------------------
 dnf install -y -q jq openssl ca-certificates curl tar gzip >/dev/null
+[ -n "$CLI_RPM_SHA256" ] && [ "$CLI_RPM_SHA256" != "null" ] \
+  || { echo "cloudhsm_cli_rpm_sha256 is required: refusing to install an unverified CLI package"; exit 1; }
 curl -fsSL -o /tmp/cloudhsm-cli.rpm "$CLI_RPM"
+printf '%s  %s\n' "$CLI_RPM_SHA256" /tmp/cloudhsm-cli.rpm | sha256sum -c - \
+  || { echo "CloudHSM CLI RPM checksum mismatch"; exit 1; }
 dnf install -y -q /tmp/cloudhsm-cli.rpm >/dev/null
 [ -x "$CLI" ] || { echo "cloudhsm-cli missing at $CLI"; exit 1; }
 
@@ -69,18 +79,35 @@ dnf install -y -q /tmp/cloudhsm-cli.rpm >/dev/null
 # was rendered before the HSM existed.
 [ -n "$${CEREMONY_HSM_IP:-}" ] || { echo "CEREMONY_HSM_IP is required"; exit 1; }
 /opt/cloudhsm/bin/configure-cli -a "$CEREMONY_HSM_IP"
+# The client must trust the cluster's commissioning CA before any HSM TLS.
+[ -n "$COMMISSIONING_CA_CERT" ] && [ "$COMMISSIONING_CA_CERT" != "null" ] \
+  || { echo "commissioning_ca.certificate is required to trust the HSM cluster"; exit 1; }
+printf '%s\n' "$COMMISSIONING_CA_CERT" > "$PKI_DIR/commissioning-ca.pem"
+install -m 644 "$PKI_DIR/commissioning-ca.pem" /opt/cloudhsm/etc/customerCA.crt
 if systemctl cat cloudhsm-cli >/dev/null 2>&1; then
   systemctl enable --now cloudhsm-cli
 fi
 
 if ! command -v uv >/dev/null 2>&1; then
-  curl -LsSf https://astral.sh/uv/install.sh | sh >/dev/null
+  curl -LsSf -o /tmp/uv-install.sh https://astral.sh/uv/install.sh
+  if [ -n "$UV_INSTALLER_SHA256" ] && [ "$UV_INSTALLER_SHA256" != "null" ]; then
+    printf '%s  %s\n' "$UV_INSTALLER_SHA256" /tmp/uv-install.sh | sha256sum -c - \
+      || { echo "uv installer checksum mismatch"; exit 1; }
+  fi
+  UV_VERSION="$UV_VERSION" sh /tmp/uv-install.sh >/dev/null
 fi
 uv venv --python 3.11 "$VENV" >/dev/null
 uv pip install --python "$VENV/bin/python" "cryptography>=42" "boto3>=1.34" >/dev/null
 
-aws s3api get-object --bucket "$BUCKET" --key "$S3_TOOL" "$PKI_DIR/kms_ca_tool.py" >/dev/null
-aws s3api get-object --bucket "$BUCKET" --key "$S3_INTER_CNF" "$PKI_DIR/intermediate_ca.cnf" >/dev/null
+s3get() { # s3get <key> <dest> <version-id>
+  if [ -n "$3" ] && [ "$3" != "null" ]; then
+    aws s3api get-object --bucket "$BUCKET" --key "$1" --version-id "$3" "$2" >/dev/null
+  else
+    aws s3api get-object --bucket "$BUCKET" --key "$1" "$2" >/dev/null
+  fi
+}
+s3get "$S3_TOOL" "$PKI_DIR/kms_ca_tool.py" "$S3_TOOL_VERSION"
+s3get "$S3_INTER_CNF" "$PKI_DIR/intermediate_ca.cnf" "$S3_INTER_CNF_VERSION"
 chmod 700 "$PKI_DIR/kms_ca_tool.py"
 
 # --- inputs ----------------------------------------------------------------

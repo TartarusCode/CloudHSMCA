@@ -59,9 +59,15 @@ variable "trust_store_name" {
 }
 
 variable "revoked_serials_ssm_param" {
-  description = "SSM parameter holding the revoked serials as JSON ({\"revoked\":[{\"serial\":\"0x0a1b\",\"revoked_at\":...,\"reason\":...}]}). Empty = issue an empty CRL."
+  description = "Optional SSM parameter holding revoked serials as JSON. Empty = read the shared S3 revocation object instead. An explicit {\"revoked\": []} clears serials; a configured but missing or invalid parameter fails closed."
   type        = string
   default     = ""
+}
+
+variable "revocations_s3_key" {
+  description = "S3 key inside the CA artifact bucket holding the revocation JSON shared with the Roles Anywhere consumer."
+  type        = string
+  default     = "revocations/revoked.json"
 }
 
 variable "crl_validity_days" {

@@ -20,6 +20,7 @@ Proves:
 usage: python3 modules/alb-mtls/tests/lambda/test_lambda.py [module-dir]
 """
 import datetime
+import hashlib
 import io
 import json
 import os
@@ -141,12 +142,35 @@ class _S3:
         self._state["puts"] = self._state.get("puts", 0) + 1
         version = "v%d" % self._state["puts"]
         self._state["objects"][Key] = Body
+        self._state.setdefault("versions", {})[Key] = version
         return {"VersionId": version}
+
+    def get_object(self, Bucket, Key):
+        _check_kwargs("s3", "GetObject", {"Bucket": Bucket, "Key": Key})
+        body = self._state["objects"].get(Key)
+        if body is None:
+            raise RuntimeError("NoSuchKey")
+        return {"Body": io.BytesIO(body)}
+
+    def head_object(self, Bucket, Key):
+        _check_kwargs("s3", "HeadObject", {"Bucket": Bucket, "Key": Key})
+        body = self._state["objects"].get(Key)
+        if body is None:
+            raise RuntimeError("NoSuchKey")
+        return {"ETag": '"%s"' % hashlib.md5(body).hexdigest(),
+                "VersionId": self._state.get("versions", {}).get(Key)}
 
 
 class _Elbv2:
     def __init__(self, state):
         self._state = state
+
+    def describe_trust_stores(self, TrustStoreArns):
+        _check_kwargs("elbv2", "DescribeTrustStores", {"TrustStoreArns": TrustStoreArns})
+        return {"TrustStores": [{
+            "TrustStoreArn": TrustStoreArns[0],
+            "CaCertificatesBundleS3ObjectVersion": self._state.get("bundle_version"),
+        }]}
 
     def modify_trust_store(self, TrustStoreArn, CaCertificatesBundleS3Bucket,
                            CaCertificatesBundleS3Key,
@@ -343,6 +367,58 @@ def main():
         print("refused to activate without a chain:", str(exc)[:70], "...")
     else:
         sys.exit("FAIL: activation ran with no chain to install")
+
+    # --- path E: configured source missing / blank / unset -----------------
+    print("\n[5] configured but missing revocation source: fail closed")
+    state["params"]["/corp-pki/pki/ca_bundle.pem"] = bundle_pem
+    state["params"].pop("/corp-pki/pki/revoked-serials", None)
+    state["calls"].clear()
+    try:
+        handler_module.handler({"reason": "scheduled-refresh"}, None)
+    except RuntimeError as exc:
+        assert "keeping the last known-good CRL" in str(exc), exc
+        assert not any(c[0].startswith("elbv2.") for c in state["calls"]), state["calls"]
+        print("refused to clear revocations on a missing source:", str(exc)[:60], "...")
+    else:
+        sys.exit("FAIL: a missing configured source silently cleared the CRL")
+
+    print("\n[6] unconfigured source: skip CRL rotation entirely")
+    os.environ["REVOKED_SERIALS_PARAM"] = ""
+    state["calls"].clear()
+    skipped = handler_module.handler({"reason": "scheduled-refresh"}, None)
+    assert skipped.get("skipped") == "revocations-unset", skipped
+    assert not any(c[0].startswith("elbv2.") for c in state["calls"]), state["calls"]
+    print("unset source:", skipped)
+
+    print("\n[7] shared S3 source (default): revoked serials reach the ALB CRL")
+    os.environ["REVOKED_SERIALS_PARAM"] = ""
+    os.environ["REVOCATIONS_S3_URI"] = "s3://corp-pki-pki-artifacts/revocations/revoked.json"
+    state["objects"]["revocations/revoked.json"] = json.dumps(
+        {"revoked": [{"serial": "0x0a1b2c"}]}).encode()
+    state["calls"].clear()
+    shared = handler_module.handler({"reason": "scheduled-refresh"}, None)
+    assert shared.get("revokedSerials") == 1, shared
+    print("shared S3 revocation object produced", shared.get("revokedSerials"), "serial(s)")
+
+    print("\n[8] explicit empty list: clear serials on purpose")
+    state["objects"]["revocations/revoked.json"] = json.dumps({"revoked": []}).encode()
+    state["revocations"] = [{"RevocationId": "rev-old", "RevocationType": "CRL"}]
+    state["calls"].clear()
+    cleared = handler_module.handler({"reason": "scheduled-refresh"}, None)
+    assert cleared.get("revokedSerials") == 0, cleared
+    assert any(c[0] == "elbv2.remove" for c in state["calls"]), state["calls"]
+    print("explicit empty list removed the old revocation:", cleared.get("revokedSerials"))
+
+    print("\n[9] configured but unreadable shared source: fail closed")
+    state["objects"].pop("revocations/revoked.json", None)
+    state["calls"].clear()
+    try:
+        handler_module.handler({"reason": "scheduled-refresh"}, None)
+    except RuntimeError as exc:
+        assert "keeping the last known-good CRL" in str(exc), exc
+        print("refused to clear revocations on a missing object:", str(exc)[:60], "...")
+    else:
+        sys.exit("FAIL: a missing shared revocation object silently cleared the CRL")
 
     print("\nALB-MTLS LAMBDA HARNESS: PASS (work dir %s)" % WORK)
 

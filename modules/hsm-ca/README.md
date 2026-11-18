@@ -56,12 +56,12 @@ consumer, so the engine and any consumer can be applied in either order.
 
 ## KMS key policy
 
-The Intermediate key accepts signatures only from `aws:PrincipalArn` values matching
-`allowed_kms_signer_role_arns` (default
-`arn:aws:iam::<account>:role/<name>-*`, which is why consumer roles are named
-`<ca_name>-…`) **and** only with `kms:MessageType = DIGEST` plus the key's own
-signing algorithm. A principal that holds `kms:Sign` in its identity policy still
-cannot make this key sign anything that is not a digest.
+The Intermediate key accepts signatures only from exact `aws:PrincipalArn` values in
+`allowed_kms_signer_role_arns` (plus the ceremony host). Wildcards are rejected by
+variable validation: a workload role named `<ca_name>-…` must never enter the CA
+key's authorization boundary. The composite stack passes its designated CRL issuer
+ARN; a caller with separate consumers passes their exact ARNs. Signing still
+requires `kms:MessageType = DIGEST` plus the key's own signing algorithm.
 
 The administration statement uses the account root principal and enumerates the 17
 non-cryptographic lifecycle actions. It grants neither `kms:Sign` nor
@@ -170,7 +170,7 @@ No modules.
 
 | Name | Description | Type | Default | Required |
 |------|-------------|------|---------|:--------:|
-| <a name="input_allowed_kms_signer_role_arns"></a> [allowed\_kms\_signer\_role\_arns](#input\_allowed\_kms\_signer\_role\_arns) | IAM role ARNs, besides the ceremony host, allowed to use the Intermediate CA<br>key for signing: kms:Sign under the digest-only conditions, plus<br>GetPublicKey/DescribeKey. This is how a consumer module signs CRLs or leaf<br>certificates without the core module having to know it exists — no circular<br>key policy, no cross-stack resource reference.<br><br>Defaults to every role whose name starts with "<name>-", which covers the<br>conventional consumer role names in this repository. Narrow it, or pass<br>explicit ARNs, if your naming differs. | `list(string)` | `null` | no |
+| <a name="input_allowed_kms_signer_role_arns"></a> [allowed\_kms\_signer\_role\_arns](#input\_allowed\_kms\_signer\_role\_arns) | IAM role ARNs, besides the ceremony host, allowed to use the Intermediate CA<br>key for signing: kms:Sign under the digest-only conditions, plus<br>GetPublicKey/DescribeKey. This is how a consumer module signs CRLs or leaf<br>certificates without the core module having to know it exists — no circular<br>key policy, no cross-stack resource reference.<br><br>An empty list is the safe default: only the ceremony host can sign. Pass the<br>exact ARNs of designated signing services (for example the CRL issuer) to<br>grant them access. Wildcards are rejected because a workload role that<br>matches the pattern would otherwise enter the CA key's authorization<br>boundary; the digest-only conditions cannot distinguish a CRL from a<br>certificate signature. | `list(string)` | `[]` | no |
 | <a name="input_artifact_bucket_name"></a> [artifact\_bucket\_name](#input\_artifact\_bucket\_name) | Explicit bucket name for the ceremony tooling, issued certificates, CRLs and audit copies. Empty = generated unique name. | `string` | `""` | no |
 | <a name="input_auto_bootstrap"></a> [auto\_bootstrap](#input\_auto\_bootstrap) | false (default) — `terraform apply` lands in under a minute and the operator<br>  starts the ceremony out of band:<br>  `terraform output -raw start_bootstrap_command | bash`.<br><br>true — apply runs the ceremony itself (a terraform\_data local-exec that<br>  starts the execution and polls until SUCCEEDED). The ceremony takes ~15-45<br>  minutes and needs the AWS CLI on the machine running apply. | `bool` | `false` | no |
 | <a name="input_auto_bootstrap_timeout_seconds"></a> [auto\_bootstrap\_timeout\_seconds](#input\_auto\_bootstrap\_timeout\_seconds) | How long the auto\_bootstrap waiter polls the execution before failing the apply. | `number` | `3600` | no |

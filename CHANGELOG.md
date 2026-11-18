@@ -4,6 +4,70 @@ All notable changes to this repository are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the module follows
 semantic versioning once it is tagged.
 
+## [Unreleased]
+
+Security and correctness pass over a full audit. Most items are offline-verified by
+the harnesses; the cloud-side acceptance points are called out below.
+
+### Fixed
+
+- **IAM prefix**: the ceremony execution role granted `cloudhsmv2:*`, which is not
+  an IAM action namespace; it now grants `cloudhsm:CreateHsm/DeleteHsm/
+  DescribeClusters/DescribeBackups/InitializeCluster`. The `aws-sdk:cloudhsmv2:`
+  Step Functions integration identifiers are unchanged.
+- **First bootstrap could never complete**: a new cluster is `UNINITIALIZED`, but
+  nothing signed its CSR or called `InitializeCluster`. The ceremony now claims
+  the cluster with a separate commissioning CA (`commissioning_ca`), installs that
+  CA as the client trust anchor, and only then activates. The key stays out of
+  Terraform state (SSM SecureString or a pre-signed cluster certificate).
+- **State machine variables**: poll counters and the resolved mode are workflow
+  variables (`$hsmPoll`, `$mode`, …) with `.$` expression assignments; routing and
+  failure causes read those variables instead of overwriting payload paths.
+- **Backup field and escrow**: gates read `BackupState`, and the escrow check now
+  requires a *new* backup relative to a pre-run baseline. The verified backup id
+  is committed to SSM before the host is terminated or the chain announced.
+- **Failure cleanup**: every post-allocation failure (poll exhaustion, non-success
+  SSM status, teardown/backup failure) records `$.error` and re-enters
+  stage-appropriate cleanup before re-raising the original cause.
+- **SSM eventual consistency**: `getCommandInvocation` retries only
+  `SSM.InvocationNotFound`; permanent errors still go through cleanup.
+- **Cluster lease**: a conditional, execution-owned DynamoDB lease prevents
+  overlapping ceremonies; a lease whose owner is terminal is reclaimed.
+- **`jq` boolean**: the root-key extractability check tested `false // "unknown"`,
+  which `jq` treats as absent. It now requires the JSON boolean `false`.
+- **Supply chain**: the CloudHSM CLI RPM checksum is mandatory and verified before
+  any credential read; tooling and OpenSSL profiles are fetched by S3 version id;
+  `uv` is version-pinned and its installer checksum is optional but recommended.
+- **CRL quota**: Roles Anywhere allows two CRLs per anchor. The handler pages
+  `ListCrls`, imports the new CRL before retiring the old generation, and deletes
+  owned CRLs (not just disables them).
+- **Chain reconciliation**: both consumer Lambdas reconcile the installed chain on
+  every invocation, so a missed event or late consumer self-heals on the scheduled
+  tick. Read-back verifies the anchor/trust store retained the committed generation.
+- **ALB revocation source**: the ALB consumer now reads the same S3 revocation
+  object as Roles Anywhere by default; an SSM parameter is an explicit override.
+  A configured but missing/blank/invalid source fails closed instead of clearing
+  the installed CRL. An explicit `{"revoked": []}` is the only way to clear.
+- **Placeholder CA**: the ALB placeholder is a checked-in public certificate; its
+  private key is generated outside Terraform and destroyed, so state readers have
+  no signing authority over a listener.
+- **KMS Intermediate guard**: `prevent_destroy` blocks an accidental replacement
+  or destruction of the signing key while the published chain uses it.
+- **Rotation-only plans**: `enable_bootstrap = false` renders out the bootstrap
+  states instead of indexing `bootstrap_objects[0]`; `auto_bootstrap = true`
+  requires `enable_bootstrap = true`.
+- **Signer allowlist**: the default is now an empty list (ceremony host only), and
+  wildcard ARNs are rejected; the composite stack passes its exact CRL issuer ARN.
+- **Session durations**: a profile may request 900–3599 s, while the IAM role
+  ceiling is floored at 3600 s (or an explicit `role_max_session_duration`).
+- **Live-verification restore**: `--restore-pending` requires `--confirm-sandbox`,
+  restores only a snapshot taken by a prior run in the same account and CA, reads
+  every write back, and exits nonzero on a partial restore.
+
+Still requires live AWS: `UNINITIALIZED → INITIALIZED → ACTIVE` on a disposable
+cluster, KMS key-policy authorization, the CRL quota behavior, and listener
+enforcement. The offline harnesses prove ordering and shape, not service acceptance.
+
 ## [0.5.1] - 2026-11-15
 
 Everything here came out of the first live sandbox run: an apply in us-west-2 with

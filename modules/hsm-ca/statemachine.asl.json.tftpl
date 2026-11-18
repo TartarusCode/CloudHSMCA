@@ -14,7 +14,116 @@
         "teardownPoll": 0,
         "backupPoll": 0
       },
+      "Next": "AcquireClusterLease"
+    },
+    "AcquireClusterLease": {
+      "Type": "Task",
+      "Comment": "One conditional lease per cluster, owned by this execution. Without it two bootstrap/rotation runs can create duplicate HSMs and overwrite the same CA artifacts. The lease is reclaimed when its owner execution reaches a terminal state, so an aborted or timed-out run cannot block the cluster forever.",
+      "Resource": "arn:aws:states:::aws-sdk:dynamodb:putItem",
+      "Parameters": {
+        "TableName": "${lease_table}",
+        "Item": {
+          "lease_id": { "S": "${cluster_id}" },
+          "owner_arn": { "S.$": "$$.Execution.Id" },
+          "acquired_at": { "S.$": "$$.State.EnteredTime" }
+        },
+        "ConditionExpression": "attribute_not_exists(lease_id) OR owner_arn = :owner",
+        "ExpressionAttributeValues": {
+          ":owner": { "S.$": "$$.Execution.Id" }
+        }
+      },
+      "ResultPath": "$.leaseAcquired",
+      "Retry": [
+        {
+          "ErrorEquals": ["DynamoDB.ProvisionedThroughputExceededException"],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.leaseError",
+          "Next": "DescribeLeaseOwner"
+        }
+      ],
       "Next": "DescribeCluster"
+    },
+    "DescribeLeaseOwner": {
+      "Type": "Task",
+      "Comment": "Read the conflicting lease so its owner's execution status can decide whether it is stale.",
+      "Resource": "arn:aws:states:::aws-sdk:dynamodb:getItem",
+      "Parameters": {
+        "TableName": "${lease_table}",
+        "Key": { "lease_id": { "S": "${cluster_id}" } },
+        "ConsistentRead": true
+      },
+      "ResultPath": "$.lease",
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.leaseLookupError",
+          "Next": "StealClusterLease"
+        }
+      ],
+      "Next": "DescribeLeaseExecution"
+    },
+    "DescribeLeaseExecution": {
+      "Type": "Task",
+      "Comment": "A lease whose owner is no longer running is stale; a running owner means a genuine concurrent ceremony.",
+      "Resource": "arn:aws:states:::aws-sdk:sfn:describeExecution",
+      "Parameters": {
+        "executionArn.$": "$.lease.Item.owner_arn.S"
+      },
+      "ResultPath": "$.leaseExecution",
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.leaseExecutionError",
+          "Next": "StealClusterLease"
+        }
+      ],
+      "Next": "IsLeaseStale"
+    },
+    "IsLeaseStale": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.leaseExecution.status",
+          "StringEquals": "RUNNING",
+          "Next": "FailClusterBusy"
+        },
+        {
+          "Variable": "$.leaseExecution.status",
+          "StringEquals": "WAITING",
+          "Next": "FailClusterBusy"
+        }
+      ],
+      "Default": "StealClusterLease"
+    },
+    "StealClusterLease": {
+      "Type": "Task",
+      "Comment": "Reclaim a lease left by a terminal execution, then retry the conditional acquire.",
+      "Resource": "arn:aws:states:::aws-sdk:dynamodb:deleteItem",
+      "Parameters": {
+        "TableName": "${lease_table}",
+        "Key": { "lease_id": { "S": "${cluster_id}" } }
+      },
+      "ResultPath": "$.leaseStolen",
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.leaseStealError",
+          "Next": "FailClusterBusy"
+        }
+      ],
+      "Next": "AcquireClusterLease"
+    },
+    "FailClusterBusy": {
+      "Type": "Fail",
+      "Error": "ClusterBusy",
+      "Cause": "Another ceremony execution still holds this cluster's lease. Wait for it to finish or reconcile it before starting a new run."
     },
     "DescribeCluster": {
       "Type": "Task",
@@ -61,12 +170,41 @@
           "Next": "CleanupHsmOnFailure"
         }
       ],
+      "Next": "HasBaselineBackup"
+    },
+    "HasBaselineBackup": {
+      "Type": "Choice",
+      "Comment": "Snapshot the newest backup id before this run allocates anything. The escrow check must see a NEW backup, not this baseline.",
+      "Choices": [
+        {
+          "Variable": "$.backups.Backups[0].BackupId",
+          "IsPresent": true,
+          "Next": "SetBackupBaseline"
+        }
+      ],
+      "Default": "SetNoBaseline"
+    },
+    "SetBackupBaseline": {
+      "Type": "Pass",
+      "Parameters": {
+        "backupId.$": "$.backups.Backups[0].BackupId"
+      },
+      "ResultPath": "$.baseline",
+      "Next": "ChooseMode"
+    },
+    "SetNoBaseline": {
+      "Type": "Pass",
+      "Result": {
+        "backupId": ""
+      },
+      "ResultPath": "$.baseline",
       "Next": "ChooseMode"
     },
     "ChooseMode": {
       "Type": "Choice",
       "Comment": "An explicit {\"mode\":\"BOOTSTRAP\"|\"ROTATE_INTERMEDIATE\"} in the execution input wins; otherwise infer it from the cluster state.",
       "Choices": [
+%{ if bootstrap_enabled }
         {
           "And": [
             {
@@ -80,6 +218,7 @@
           ],
           "Next": "SetBootstrapMode"
         },
+%{ endif }
         {
           "And": [
             {
@@ -93,6 +232,14 @@
           ],
           "Next": "SetRotateModeRequested"
         },
+%{ if bootstrap_enabled }
+        {
+          "Comment": "Never initialized: no key material exists, so this run creates the Root CA.",
+          "Variable": "$.cluster.Clusters[0].State",
+          "StringEquals": "UNINITIALIZED",
+          "Next": "SetBootstrapMode"
+        },
+%{ endif }
         {
           "Comment": "A mode was supplied but is not one of the two values: refuse rather than guess.",
           "And": [
@@ -107,17 +254,12 @@
               }
             }
           ],
-          "Next": "FailInvalidMode"
-        },
-        {
-          "Comment": "Never initialized: no key material exists, so this run creates the Root CA.",
-          "Variable": "$.cluster.Clusters[0].State",
-          "StringEquals": "UNINITIALIZED",
-          "Next": "SetBootstrapMode"
+          "Next": "RecordInvalidMode"
         }
       ],
       "Default": "RequireReadyBackupInferred"
     },
+%{ if bootstrap_enabled }
     "SetBootstrapMode": {
       "Type": "Pass",
       "Assign": {
@@ -125,6 +267,7 @@
       },
       "Next": "CreateHsmNoBackup"
     },
+%{ endif }
     "SetRotateModeRequested": {
       "Type": "Pass",
       "Comment": "Requested explicitly: still require a READY backup before restoring it.",
@@ -151,15 +294,16 @@
               "IsPresent": true
             },
             {
-              "Variable": "$.backups.Backups[0].State",
+              "Variable": "$.backups.Backups[0].BackupState",
               "StringEquals": "READY"
             }
           ],
           "Next": "CreateHsmFromBackup"
         }
       ],
-      "Default": "FailNoReadyBackup"
+      "Default": "RecordNoReadyBackup"
     },
+%{ if bootstrap_enabled }
     "CreateHsmNoBackup": {
       "Type": "Task",
       "Resource": "arn:aws:states:::aws-sdk:cloudhsmv2:createHsm",
@@ -185,6 +329,7 @@
       ],
       "Next": "CheckHsmState"
     },
+%{ endif }
     "CreateHsmFromBackup": {
       "Type": "Task",
       "Comment": "CreateHsm takes only ClusterId and AvailabilityZone. Because this cluster has a backup, CloudHSM restores the cluster's most recent backup onto the new HSM — SourceBackupId exists only on CreateCluster, never here. VerifyBackupForRotation has already proved a READY backup exists.",
@@ -220,7 +365,7 @@
           "clusterIds": ["${cluster_id}"]
         }
       },
-      "ResultPath": "$.hsmPoll",
+      "ResultPath": "$.hsmState",
       "Catch": [
         {
           "ErrorEquals": ["States.ALL"],
@@ -236,15 +381,15 @@
         {
           "And": [
             {
-              "Variable": "$.hsmPoll.Clusters[0].Hsms[0].HsmId",
+              "Variable": "$.hsmState.Clusters[0].Hsms[0].HsmId",
               "IsPresent": true
             },
             {
-              "Variable": "$.hsmPoll.Clusters[0].Hsms[0].HsmId",
+              "Variable": "$.hsmState.Clusters[0].Hsms[0].HsmId",
               "StringEqualsPath": "$.hsm.Hsm.HsmId"
             },
             {
-              "Variable": "$.hsmPoll.Clusters[0].Hsms[0].State",
+              "Variable": "$.hsmState.Clusters[0].Hsms[0].State",
               "StringEquals": "ACTIVE"
             }
           ],
@@ -257,12 +402,12 @@
       "Type": "Choice",
       "Choices": [
         {
-          "Variable": "$.hsmPoll",
+          "Variable": "$hsmPoll",
           "NumericLessThan": 90,
           "Next": "WaitForHsm"
         }
       ],
-      "Default": "FailHsmNotReady"
+      "Default": "RecordHsmNotReady"
     },
     "WaitForHsm": {
       "Type": "Wait",
@@ -272,7 +417,7 @@
     "IncrementHsmPoll": {
       "Type": "Pass",
       "Assign": {
-        "hsmPoll": "States.MathAdd($.hsmPoll, 1)"
+        "hsmPoll.$": "States.MathAdd($hsmPoll, 1)"
       },
       "Next": "CheckHsmState"
     },
@@ -377,12 +522,12 @@
       "Type": "Choice",
       "Choices": [
         {
-          "Variable": "$.ssmPoll",
+          "Variable": "$ssmPoll",
           "NumericLessThan": 60,
           "Next": "WaitForSsm"
         }
       ],
-      "Default": "FailSsmAgentNotOnline"
+      "Default": "RecordSsmNotReady"
     },
     "WaitForSsm": {
       "Type": "Wait",
@@ -392,24 +537,30 @@
     "IncrementSsmPoll": {
       "Type": "Pass",
       "Assign": {
-        "ssmPoll": "States.MathAdd($.ssmPoll, 1)"
+        "ssmPoll.$": "States.MathAdd($ssmPoll, 1)"
       },
       "Next": "DescribeSsmInstance"
     },
-    "ChooseCeremonyScript": {
+    "ChooseCeremonyScript": %{ if bootstrap_enabled }{
       "Type": "Choice",
+      "Comment": "Route by the resolved mode (a workflow variable set by the mode states), not by the raw execution input.",
       "Choices": [
         {
-          "Variable": "$.mode",
+          "Variable": "$mode",
           "StringEquals": "BOOTSTRAP",
           "Next": "RunBootstrapCeremony"
         }
       ],
       "Default": "RunRotationCeremony"
-    },
+    }%{ else }{
+      "Type": "Pass",
+      "Comment": "Bootstrap is disabled: this deployment is rotation-only.",
+      "Next": "RunRotationCeremony"
+    }%{ endif },
+%{ if bootstrap_enabled }
     "RunBootstrapCeremony": {
       "Type": "Task",
-      "Comment": "Initializes the cluster (cloudhsm-cli cluster activate), generates the non-exportable Root key, self-signs the Root CA and signs the Intermediate.",
+      "Comment": "Claims an UNINITIALIZED cluster (InitializeCluster), activates it, generates the non-exportable Root key, self-signs the Root CA and signs the Intermediate.",
       "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
       "Parameters": {
         "InstanceIds.$": "States.Array($.host.Instances[0].InstanceId)",
@@ -431,6 +582,7 @@
       ],
       "Next": "PollCommandInvocation"
     },
+%{ endif }
     "RunRotationCeremony": {
       "Type": "Task",
       "Comment": "Signs a new Intermediate CSR with the restored Root key. No Root generation, no re-activation.",
@@ -457,12 +609,21 @@
     },
     "PollCommandInvocation": {
       "Type": "Task",
+      "Comment": "The command id exists before GetCommandInvocation can see the invocation; retry only that documented eventual-consistency condition. Every other error is permanent and goes through cleanup.",
       "Resource": "arn:aws:states:::aws-sdk:ssm:getCommandInvocation",
       "Parameters": {
         "CommandId.$": "$.command.Command.CommandId",
         "InstanceId.$": "$.host.Instances[0].InstanceId"
       },
       "ResultPath": "$.invocation",
+      "Retry": [
+        {
+          "ErrorEquals": ["SSM.InvocationNotFound"],
+          "IntervalSeconds": 5,
+          "MaxAttempts": 6,
+          "BackoffRate": 1.5
+        }
+      ],
       "Catch": [
         {
           "ErrorEquals": ["States.ALL"],
@@ -495,7 +656,7 @@
               "StringEquals": "Cancelled"
             }
           ],
-          "Next": "FailCeremonyCommand"
+          "Next": "RecordCeremonyCommandFailure"
         }
       ],
       "Default": "GuardCommandPolls"
@@ -504,12 +665,12 @@
       "Type": "Choice",
       "Choices": [
         {
-          "Variable": "$.commandPoll",
+          "Variable": "$commandPoll",
           "NumericLessThan": 240,
           "Next": "WaitForCommand"
         }
       ],
-      "Default": "FailCommandTimeout"
+      "Default": "RecordCommandTimeout"
     },
     "WaitForCommand": {
       "Type": "Wait",
@@ -519,7 +680,7 @@
     "IncrementCommandPoll": {
       "Type": "Pass",
       "Assign": {
-        "commandPoll": "States.MathAdd($.commandPoll, 1)"
+        "commandPoll.$": "States.MathAdd($commandPoll, 1)"
       },
       "Next": "PollCommandInvocation"
     },
@@ -544,7 +705,7 @@
         {
           "ErrorEquals": ["States.ALL"],
           "ResultPath": "$.deleteHsmError",
-          "Next": "FailHsmDelete"
+          "Next": "RecordHsmDeleteFailure"
         }
       ],
       "Next": "PollHsmGone"
@@ -563,7 +724,7 @@
         {
           "ErrorEquals": ["States.ALL"],
           "ResultPath": "$.teardownError",
-          "Next": "FailBackupNotReady"
+          "Next": "RecordTeardownFailure"
         }
       ],
       "Next": "IsHsmGone"
@@ -584,12 +745,12 @@
       "Type": "Choice",
       "Choices": [
         {
-          "Variable": "$.teardownPoll",
+          "Variable": "$teardownPoll",
           "NumericLessThan": 60,
           "Next": "WaitForTeardown"
         }
       ],
-      "Default": "FailHsmDeletionIncomplete"
+      "Default": "RecordHsmDeletionIncomplete"
     },
     "WaitForTeardown": {
       "Type": "Wait",
@@ -599,7 +760,7 @@
     "IncrementTeardownPoll": {
       "Type": "Pass",
       "Assign": {
-        "teardownPoll": "States.MathAdd($.teardownPoll, 1)"
+        "teardownPoll.$": "States.MathAdd($teardownPoll, 1)"
       },
       "Next": "PollHsmGone"
     },
@@ -618,45 +779,87 @@
         {
           "ErrorEquals": ["States.ALL"],
           "ResultPath": "$.backupError",
-          "Next": "FailBackupNotReady"
+          "Next": "RecordBackupNotReady"
         }
       ],
       "Next": "IsBackupReady"
     },
     "IsBackupReady": {
       "Type": "Choice",
+      "Comment": "BackupState is the field name in the CloudHSM Backup API, and the escrow backup must be a NEW one: a pre-existing backup cannot prove this run's Root material was written.",
       "Choices": [
         {
           "And": [
             {
-              "Variable": "$.finalBackups.Backups[0].State",
-              "IsPresent": true
-            },
-            {
-              "Variable": "$.finalBackups.Backups[0].State",
+              "Variable": "$.finalBackups.Backups[0].BackupState",
               "StringEquals": "READY"
             },
             {
-              "Comment": "The newest backup must postdate this run, otherwise a stale backup would satisfy the check.",
               "Variable": "$.finalBackups.Backups[0].BackupId",
               "IsPresent": true
+            },
+            {
+              "Variable": "$.finalBackups.Backups[0].BackupId",
+              "StringNotEqualsPath": "$.baseline.backupId"
             }
           ],
-          "Next": "TerminateHostAfterSuccess"
+          "Next": "RecordVerifiedBackup"
         }
       ],
       "Default": "GuardBackupPolls"
+    },
+    "RecordVerifiedBackup": {
+      "Type": "Task",
+      "Comment": "Commit the verified escrow id before the host is terminated or the chain is announced, so a consumer cannot activate against an unescrowed root.",
+      "Resource": "arn:aws:states:::aws-sdk:ssm:putParameter",
+      "Parameters": {
+        "Name": "${verified_backup_param}",
+        "Value.$": "$.finalBackups.Backups[0].BackupId",
+        "Type": "String",
+        "Overwrite": true
+      },
+      "ResultPath": "$.verifiedBackup",
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "CleanupHsmOnFailure"
+        }
+      ],
+      "Next": "TerminateHostAfterSuccess"
+    },
+    "ReleaseClusterLease": {
+      "Type": "Task",
+      "Comment": "Best-effort release after the escrow is verified and the host is gone; a failed release leaves a lease that the next run reclaims from its terminal owner.",
+      "Resource": "arn:aws:states:::aws-sdk:dynamodb:deleteItem",
+      "Parameters": {
+        "TableName": "${lease_table}",
+        "Key": { "lease_id": { "S": "${cluster_id}" } },
+        "ConditionExpression": "owner_arn = :owner",
+        "ExpressionAttributeValues": {
+          ":owner": { "S.$": "$$.Execution.Id" }
+        }
+      },
+      "ResultPath": "$.leaseReleased",
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.leaseReleaseError",
+          "Next": "PublishCaReadyEvent"
+        }
+      ],
+      "Next": "PublishCaReadyEvent"
     },
     "GuardBackupPolls": {
       "Type": "Choice",
       "Choices": [
         {
-          "Variable": "$.backupPoll",
+          "Variable": "$backupPoll",
           "NumericLessThan": 120,
           "Next": "WaitForBackup"
         }
       ],
-      "Default": "FailBackupNotReady"
+      "Default": "RecordBackupNotReady"
     },
     "WaitForBackup": {
       "Type": "Wait",
@@ -666,7 +869,7 @@
     "IncrementBackupPoll": {
       "Type": "Pass",
       "Assign": {
-        "backupPoll": "States.MathAdd($.backupPoll, 1)"
+        "backupPoll.$": "States.MathAdd($backupPoll, 1)"
       },
       "Next": "PollBackup"
     },
@@ -681,10 +884,10 @@
         {
           "ErrorEquals": ["States.ALL"],
           "ResultPath": "$.terminateError",
-          "Next": "FailHostTerminate"
+          "Next": "RecordHostTerminateFailure"
         }
       ],
-      "Next": "PublishCaReadyEvent"
+      "Next": "ReleaseClusterLease"
     },
     "PublishCaReadyEvent": {
       "Type": "Task",
@@ -703,6 +906,8 @@
               "ca_bundle_ssm_param": "${ca_bundle_ssm_pem}",
               "root_ca_ssm_param": "${root_ca_ssm_pem}",
               "intermediate_ca_ssm_param": "${intermediate_ssm_pem}",
+              "verified_backup_ssm_param": "${verified_backup_param}",
+              "verified_backup_id.$": "$.finalBackups.Backups[0].BackupId",
               "artifacts_bucket": "${bucket_out}"
             }
           }
@@ -730,7 +935,7 @@
       "Type": "Fail",
       "Comment": "Publish runs after the host is terminated and the backup is READY, so there is nothing left to tear down: report the publish failure directly instead of routing through cleanup, which would delete an already-deleted HSM and terminate an already-terminated host.",
       "Error": "CaEventPublishFailed",
-      "CausePath": "States.Format('chain published to SSM and the HSM is gone, but CAChainPublished was not emitted: {} | mode={} : {}', $.error.Error, $.mode, $.error.Cause)"
+      "CausePath": "States.Format('chain published to SSM and the HSM is gone, but CAChainPublished was not emitted: {} | mode={} : {}', $.error.Error, $mode, $.error.Cause)"
     },
     "CeremonySucceeded": {
       "Type": "Succeed"
@@ -781,7 +986,7 @@
           "Next": "TerminateHostOnFailure"
         }
       ],
-      "Default": "FailOriginalCause"
+      "Default": "ReleaseClusterLeaseOnFailure"
     },
     "TerminateHostOnFailure": {
       "Type": "Task",
@@ -802,6 +1007,28 @@
         {
           "ErrorEquals": ["States.ALL"],
           "ResultPath": "$.cleanupHostError",
+          "Next": "ReleaseClusterLeaseOnFailure"
+        }
+      ],
+      "Next": "ReleaseClusterLeaseOnFailure"
+    },
+    "ReleaseClusterLeaseOnFailure": {
+      "Type": "Task",
+      "Comment": "Release the lease only after the HSM and host cleanup have been attempted. The original error survives in $.error; this task never writes it.",
+      "Resource": "arn:aws:states:::aws-sdk:dynamodb:deleteItem",
+      "Parameters": {
+        "TableName": "${lease_table}",
+        "Key": { "lease_id": { "S": "${cluster_id}" } },
+        "ConditionExpression": "owner_arn = :owner",
+        "ExpressionAttributeValues": {
+          ":owner": { "S.$": "$$.Execution.Id" }
+        }
+      },
+      "ResultPath": "$.leaseReleased",
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.leaseReleaseError",
           "Next": "FailOriginalCause"
         }
       ],
@@ -811,57 +1038,107 @@
       "Type": "Fail",
       "Comment": "Cleanup finished: re-raise the error that started it, never the cleanup outcome.",
       "Error": "CeremonyFailed",
-      "CausePath": "States.Format('{} | mode={} : {}', $.error.Error, $.mode, $.error.Cause)"
+      "CausePath": "States.Format('{} | mode={} : {}', $.error.Error, $mode, $.error.Cause)"
     },
-    "FailInvalidMode": {
-      "Type": "Fail",
-      "Error": "InvalidMode",
-      "CausePath": "States.Format('mode must be BOOTSTRAP or ROTATE_INTERMEDIATE, got {}', $.mode)"
+    "RecordInvalidMode": {
+      "Type": "Pass",
+      "Parameters": {
+        "Error": "InvalidMode",
+        "Cause.$": "States.Format('mode must be BOOTSTRAP or ROTATE_INTERMEDIATE, got {}', $.mode)"
+      },
+      "ResultPath": "$.error",
+      "Next": "ReleaseClusterLeaseOnFailure"
     },
-    "FailNoReadyBackup": {
-      "Type": "Fail",
-      "Error": "NoReadyBackup",
-      "Cause": "The cluster is initialized but has no READY backup to restore the Root key from. A rotation that created an HSM without one would start from an empty HSM and lose the Root CA."
+    "RecordNoReadyBackup": {
+      "Type": "Pass",
+      "Result": {
+        "Error": "NoReadyBackup",
+        "Cause": "The cluster is initialized but has no READY backup to restore the Root key from. A rotation that created an HSM without one would start from an empty HSM and lose the Root CA."
+      },
+      "ResultPath": "$.error",
+      "Next": "ReleaseClusterLeaseOnFailure"
     },
-    "FailHsmNotReady": {
-      "Type": "Fail",
-      "Error": "HsmNotReady",
-      "Cause": "The HSM did not reach ACTIVE within 90 polls (about 90 minutes)."
+    "RecordHsmNotReady": {
+      "Type": "Pass",
+      "Result": {
+        "Error": "HsmNotReady",
+        "Cause": "The HSM did not reach ACTIVE within 90 polls (about 90 minutes)."
+      },
+      "ResultPath": "$.error",
+      "Next": "CleanupHsmOnFailure"
     },
-    "FailSsmAgentNotOnline": {
-      "Type": "Fail",
-      "Error": "SsmAgentNotOnline",
-      "Cause": "The ceremony host never reported PingStatus Online (60 polls, 15 minutes). Check the instance profile and the ssm/ssmmessages endpoints."
+    "RecordSsmNotReady": {
+      "Type": "Pass",
+      "Result": {
+        "Error": "SsmAgentNotOnline",
+        "Cause": "The ceremony host never reported PingStatus Online (60 polls, 15 minutes). Check the instance profile and the ssm/ssmmessages endpoints."
+      },
+      "ResultPath": "$.error",
+      "Next": "CleanupHsmOnFailure"
     },
-    "FailCeremonyCommand": {
-      "Type": "Fail",
-      "Error": "CeremonyCommandFailed",
-      "CausePath": "States.JsonToString($.invocation)"
+    "RecordCeremonyCommandFailure": {
+      "Type": "Pass",
+      "Parameters": {
+        "Error": "CeremonyCommandFailed",
+        "Cause.$": "States.JsonToString($.invocation)"
+      },
+      "ResultPath": "$.error",
+      "Next": "CleanupHsmOnFailure"
     },
-    "FailCommandTimeout": {
-      "Type": "Fail",
-      "Error": "CeremonyCommandTimedOut",
-      "Cause": "No terminal command status after 240 polls (80 minutes)."
+    "RecordCommandTimeout": {
+      "Type": "Pass",
+      "Result": {
+        "Error": "CeremonyCommandTimedOut",
+        "Cause": "No terminal command status after 240 polls (80 minutes)."
+      },
+      "ResultPath": "$.error",
+      "Next": "CleanupHsmOnFailure"
     },
-    "FailHsmDelete": {
-      "Type": "Fail",
-      "Error": "HsmDeleteFailed",
-      "CausePath": "States.Format('could not delete HSM after a successful ceremony: {}', $.deleteHsmError.Cause)"
+    "RecordHsmDeleteFailure": {
+      "Type": "Pass",
+      "Parameters": {
+        "Error": "HsmDeleteFailed",
+        "Cause.$": "States.Format('could not delete HSM after a successful ceremony: {}', $.deleteHsmError.Cause)"
+      },
+      "ResultPath": "$.error",
+      "Next": "CleanupHsmOnFailure"
     },
-    "FailHsmDeletionIncomplete": {
-      "Type": "Fail",
-      "Error": "HsmDeletionIncomplete",
-      "Cause": "The HSM was asked to delete but is still present after 30 minutes: check the CloudHSM backup quota and the cluster state before assuming the billing stopped."
+    "RecordTeardownFailure": {
+      "Type": "Pass",
+      "Parameters": {
+        "Error": "TeardownCheckFailed",
+        "Cause.$": "States.Format('could not confirm the HSM was deleted: {}', $.teardownError.Cause)"
+      },
+      "ResultPath": "$.error",
+      "Next": "CleanupHsmOnFailure"
     },
-    "FailBackupNotReady": {
-      "Type": "Fail",
-      "Error": "BackupNotReady",
-      "Cause": "The HSM is gone but no READY backup appeared within 60 minutes. The Root key is not escrowed: investigate before re-running."
+    "RecordHsmDeletionIncomplete": {
+      "Type": "Pass",
+      "Result": {
+        "Error": "HsmDeletionIncomplete",
+        "Cause": "The HSM was asked to delete but is still present after 30 minutes: check the CloudHSM backup quota and the cluster state before assuming the billing stopped."
+      },
+      "ResultPath": "$.error",
+      "Next": "CleanupHsmOnFailure"
     },
-    "FailHostTerminate": {
-      "Type": "Fail",
-      "Error": "HostTerminateFailed",
-      "CausePath": "States.Format('ceremony succeeded and the HSM is gone, but the host could not be terminated: {}', $.terminateError.Cause)"
+    "RecordBackupNotReady": {
+      "Type": "Pass",
+      "Comment": "The HSM is already gone; only the privileged host still needs cleanup.",
+      "Result": {
+        "Error": "BackupNotReady",
+        "Cause": "The HSM is gone but no READY backup appeared within 60 minutes. The Root key is not escrowed: investigate before re-running."
+      },
+      "ResultPath": "$.error",
+      "Next": "CleanupHostOnFailure"
+    },
+    "RecordHostTerminateFailure": {
+      "Type": "Pass",
+      "Parameters": {
+        "Error": "HostTerminateFailed",
+        "Cause.$": "States.Format('ceremony succeeded and the HSM is gone, but the host could not be terminated: {}', $.terminateError.Cause)"
+      },
+      "ResultPath": "$.error",
+      "Next": "CleanupHostOnFailure"
     }
   }
 }

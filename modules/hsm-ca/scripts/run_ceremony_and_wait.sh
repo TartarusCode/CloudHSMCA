@@ -21,6 +21,7 @@ set -euo pipefail
 
 STATE_MACHINE_ARN="${STATE_MACHINE_ARN:?STATE_MACHINE_ARN is required}"
 SSM_CA_BUNDLE="${SSM_CA_BUNDLE:?SSM_CA_BUNDLE is required}"
+SSM_VERIFIED_BACKUP="${SSM_VERIFIED_BACKUP:-}"
 PKI_NAME="${PKI_NAME:-pki}"
 AWS_REGION="${AWS_REGION:-${AWS_DEFAULT_REGION:-us-east-1}}"
 WAIT_TIMEOUT="${WAIT_TIMEOUT:-3600}"
@@ -41,6 +42,19 @@ if bundle=$(aws ssm get-parameter --name "$SSM_CA_BUNDLE" \
       --query 'Parameter.Value' --output text 2>/dev/null); then
   certs=$(grep -c -- '-----BEGIN CERTIFICATE-----' <<<"$bundle" || true)
   if [ "${certs:-0}" -ge 2 ] && ! grep -q 'PENDING-CEREMONY' <<<"$bundle"; then
+    # A chain alone is not success: the workflow commits the verified escrow
+    # backup id only after it has observed a NEW, READY backup. Without that
+    # marker the root is not provably escrowed, so report it instead of
+    # spending another HSM hour on a rotation.
+    if [ -n "$SSM_VERIFIED_BACKUP" ]; then
+      verified=$(aws ssm get-parameter --name "$SSM_VERIFIED_BACKUP" \
+        --region "$AWS_REGION" --query 'Parameter.Value' --output text 2>/dev/null || true)
+      if [ -z "$verified" ] || [ "$verified" = "PENDING-CEREMONY" ]; then
+        log "chain is published at $SSM_CA_BUNDLE but escrow is not verified at $SSM_VERIFIED_BACKUP"
+        log "refusing to report success: inspect the cluster's READY backups before re-running"
+        exit 1
+      fi
+    fi
     log "chain already published at $SSM_CA_BUNDLE ($certs certificates): nothing to do"
     exit 0
   fi
@@ -75,6 +89,16 @@ while :; do
 
   case "$status" in
     SUCCEEDED)
+      if [ -n "$SSM_VERIFIED_BACKUP" ]; then
+        verified=$(aws ssm get-parameter --name "$SSM_VERIFIED_BACKUP" \
+          --region "$AWS_REGION" --query 'Parameter.Value' --output text 2>/dev/null || true)
+        if [ -z "$verified" ] || [ "$verified" = "PENDING-CEREMONY" ]; then
+          log "ceremony SUCCEEDED but $SSM_VERIFIED_BACKUP holds no verified escrow backup"
+          log "refusing to report success: the root must be escrowed before consumers activate"
+          exit 1
+        fi
+        log "escrow verified: backup $verified"
+      fi
       log "ceremony SUCCEEDED: the trust anchor is enabled and a CRL is imported"
       exit 0
       ;;

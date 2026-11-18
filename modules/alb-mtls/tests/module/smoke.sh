@@ -112,6 +112,19 @@ else
   fail=1
 fi
 
+echo "the placeholder is public-only (no signing key in Terraform state):"
+if grep -q 'resource "tls_private_key"' "$MODULE/main.tf"; then
+  echo "FAIL: a TLS private key is still generated into state" >&2
+  fail=1
+elif grep -qF 'file("${path.module}/placeholder_ca.pem")' "$MODULE/main.tf" \
+     && [ -s "$MODULE/placeholder_ca.pem" ] \
+     && grep -q 'BEGIN CERTIFICATE' "$MODULE/placeholder_ca.pem"; then
+  printf '  %-40s -> ok\n' "static public PEM, no private key"
+else
+  echo "FAIL: placeholder bundle is not the checked-in public PEM" >&2
+  fail=1
+fi
+
 echo
 if [ "$fail" -ne 0 ]; then
   echo "ALB-MTLS SMOKE: FAIL" >&2

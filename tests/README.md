@@ -135,9 +135,11 @@ EventBridge rule and its delivery, the consumer Lambda, the KMS key policy's
 `CaSignDigestOnly` delegation (the Lambda signs the CRL with the real key), and
 Roles Anywhere accepting `ImportCrl`.
 
-`--restore-pending` resets the three parameters to `PENDING-CEREMONY` and disables
-the anchor, so a real ceremony can run afterwards. The script mutates a deployed
-stack: use a sandbox.
+Before mutating anything the script writes `<stack-dir>/.verify-live-snapshot.json`
+(SSM values, anchor state, revocation object, account and CA name).
+`--restore-pending --confirm-sandbox` restores only that snapshot, refuses a
+snapshot from another account or CA, reads every write back, and exits nonzero on
+a partial restore. The script mutates a deployed stack: use a sandbox.
 
 The fourth unknown — CloudHSM control-plane timing (cluster activation, HSM
 `ACTIVE`, the ENI `configure-cli` step) — still needs one real ceremony, and costs

@@ -329,6 +329,73 @@ data "archive_file" "crl_issuer" {
               label, "\n".join(lines), label)
 
 
+      def list_owned_crls(rolesanywhere, trust_anchor_arn, prefix):
+          """Every CRL this deployment imported for this anchor, across pages.
+
+          ListCrls is account-wide and paginated; a single page cannot find the
+          old imports once the AWS default quota of two per anchor is reached.
+          """
+          owned = []
+          token = None
+          while True:
+              kwargs = {"nextToken": token} if token else {}
+              page = rolesanywhere.list_crls(**kwargs)
+              for crl in page.get("crls", []):
+                  if crl.get("trustAnchorArn") != trust_anchor_arn:
+                      continue
+                  if str(crl.get("name", "")).startswith(prefix + "-"):
+                      owned.append(crl)
+              token = page.get("nextToken")
+              if not token:
+                  break
+          return owned
+
+
+      def retire_crls(rolesanywhere, crls):
+          """Disable then delete CRLs owned by this deployment."""
+          disabled = []
+          deleted = []
+          for crl in crls:
+              crl_id = crl["crlId"]
+              if crl.get("enabled"):
+                  rolesanywhere.disable_crl(crlId=crl_id)
+                  disabled.append(crl_id)
+              rolesanywhere.delete_crl(crlId=crl_id)
+              deleted.append(crl_id)
+          return {"disabled": disabled, "deleted": deleted}
+
+
+      def ensure_chain(rolesanywhere, trust_anchor_id, bundle):
+          """Install the committed chain if the anchor does not already match.
+
+          Called on every invocation, not only on CAChainPublished: a missed
+          event or a failure after the bundle write then self-heals on the next
+          scheduled tick instead of leaving trust stale forever.
+          """
+          anchor = rolesanywhere.get_trust_anchor(trustAnchorId=trust_anchor_id)["trustAnchor"]
+          installed = (anchor.get("source") or {}).get("sourceData", {}).get(
+              "x509CertificateData", "")
+          if installed == bundle and anchor.get("enabled"):
+              LOG.info("trust anchor %s already matches the published chain", trust_anchor_id)
+              return False
+          rolesanywhere.update_trust_anchor(
+              trustAnchorId=trust_anchor_id,
+              source={
+                  "sourceType": "CERTIFICATE_BUNDLE",
+                  "sourceData": {"x509CertificateData": bundle},
+              })
+          rolesanywhere.enable_trust_anchor(trustAnchorId=trust_anchor_id)
+          readback = rolesanywhere.get_trust_anchor(trustAnchorId=trust_anchor_id)["trustAnchor"]
+          effective = (readback.get("source") or {}).get("sourceData", {}).get(
+              "x509CertificateData", "")
+          if effective != bundle or not readback.get("enabled"):
+              raise RuntimeError("trust anchor %s did not retain the installed chain"
+                                 % trust_anchor_id)
+          LOG.info("trust anchor %s installed %d certificates and is enabled",
+                   trust_anchor_id, bundle.count("BEGIN CERTIFICATE"))
+          return True
+
+
       # --------------------------------------------------------------------------- #
       # handler
       # --------------------------------------------------------------------------- #
@@ -365,29 +432,24 @@ data "archive_file" "crl_issuer" {
           chain_ready = bool(bundle) and "BEGIN CERTIFICATE" in bundle \
               and "PENDING-CEREMONY" not in bundle
 
-          if activation:
+          if activation and not chain_ready:
               # An event without a chain means the workflow published before it
               # wrote SSM: fail loudly, never enable an anchor without a bundle.
-              if not chain_ready:
-                  raise RuntimeError(
-                      "CAChainPublished arrived but %s holds no usable chain"
-                      % bundle_param)
-              trust_anchor_id = os.environ["TRUST_ANCHOR_ID"]
-              rolesanywhere.update_trust_anchor(
-                  trustAnchorId=trust_anchor_id,
-                  source={
-                      "sourceType": "CERTIFICATE_BUNDLE",
-                      "sourceData": {"x509CertificateData": bundle},
-                  })
-              rolesanywhere.enable_trust_anchor(trustAnchorId=trust_anchor_id)
-              LOG.info("trust anchor %s installed %d certificates and enabled",
-                       trust_anchor_id, bundle.count("BEGIN CERTIFICATE"))
-          elif bundle_param and not chain_ready:
+              raise RuntimeError(
+                  "CAChainPublished arrived but %s holds no usable chain"
+                  % bundle_param)
+          if bundle_param and not chain_ready:
               # A scheduled tick before the first ceremony: nothing to revoke
               # against yet, and an imported CRL would be useless anyway.
               LOG.info("chain not published at %s: skipping this tick", bundle_param)
               return {"ok": True, "skipped": "chain-not-published",
                       "reason": event.get("reason", "scheduled")}
+
+          # Reconcile on every invocation, not only on the event: a late
+          # consumer, a missed event, or a failure after the bundle write is
+          # repaired by the next scheduled tick.
+          trust_anchor_id = os.environ["TRUST_ANCHOR_ID"]
+          chain_reconciled = ensure_chain(rolesanywhere, trust_anchor_id, bundle)
 
           issuer_der = pem_to_der(ssm.get_parameter(Name=issuer_param)["Parameter"]["Value"])
           subject_der, akid = issuer_identity(issuer_der)
@@ -407,20 +469,15 @@ data "archive_file" "crl_issuer" {
               #   include a revoked certificate.
               # Nothing to import — but a CRL imported earlier is still active and
               # would keep revoking serials the list no longer names, so retire
-              # every enabled CRL for this anchor. ListCrls is account-wide, so
-              # the anchor is matched on trustAnchorArn.
-              retired = []
-              for existing in rolesanywhere.list_crls().get("crls", []):
-                  if existing.get("trustAnchorArn") != trust_anchor_arn:
-                      continue
-                  if not existing.get("enabled"):
-                      continue
-                  rolesanywhere.disable_crl(crlId=existing["crlId"])
-                  retired.append(existing["crlId"])
+              # every CRL owned by this deployment. ListCrls is account-wide and
+              # paginated, so walk all pages and match both anchor and name.
+              owned = list_owned_crls(rolesanywhere, trust_anchor_arn, name_prefix)
+              retired = retire_crls(rolesanywhere, owned)
               LOG.info("no revoked serials: nothing to import, retired %d CRL(s) %s",
-                       len(retired), retired)
+                       len(retired["deleted"]), retired["deleted"])
               return {"ok": True, "skipped": "no-revocations",
-                      "disabledCrls": retired,
+                      "disabledCrls": retired["disabled"],
+                      "deletedCrls": retired["deleted"],
                       "reason": event.get("reason", "scheduled")}
 
           crl_number = int(time.time())
@@ -441,6 +498,14 @@ data "archive_file" "crl_issuer" {
           crl_der = sign_crl(kms, key_arn, tbs, sig_alg_name)
           crl_pem = pem_wrap(crl_der, "X509 CRL")
           digest_sha256 = hashlib.sha256(crl_der).hexdigest()
+
+          # The default quota is two CRLs per trust anchor, and AWS has no
+          # in-place replacement for the CRL bytes. Keep at most one owned CRL
+          # live: add the new one first so revocation is never absent, then
+          # retire the previous generation. Only when a previous run already
+          # left two owned CRLs do we remove an extra before importing.
+          owned = list_owned_crls(rolesanywhere, trust_anchor_arn, name_prefix)
+          retired_before = retire_crls(rolesanywhere, owned[1:]) if len(owned) > 1 else {"disabled": [], "deleted": []}
 
           name = "%s-%s" % (name_prefix, now.strftime("%Y%m%dT%H%M%SZ"))
           imported = rolesanywhere.import_crl(
@@ -474,15 +539,21 @@ data "archive_file" "crl_issuer" {
               s3.put_object(Bucket=parsed.netloc, Key="%s/latest.pem" % base,
                             Body=crl_pem.encode("ascii"))
 
+          # The new CRL is verified and enabled; only now remove the previous
+          # generation so the quota never blocks a later refresh.
+          retired_after = retire_crls(rolesanywhere, owned[:1])
+
           LOG.info("imported CRL %s (%s) revoked=%d next_update=%s sha256=%s",
                    crl_id, name, len(revoked), next_update.isoformat(), digest_sha256)
 
           return {
               "ok": True,
               "activated": activation,
+              "chainReconciled": chain_reconciled,
               "crlId": crl_id,
               "crlArn": imported.get("crlArn"),
               "name": name,
+              "retiredCrls": retired_before["deleted"] + retired_after["deleted"],
               "revoked": len(revoked),
               "crlNumber": crl_number,
               "nextUpdate": next_update.isoformat(),
@@ -540,6 +611,7 @@ data "aws_iam_policy_document" "crl_issuer" {
   statement {
     sid = "ActivateTrustAnchor"
     actions = [
+      "rolesanywhere:GetTrustAnchor",
       "rolesanywhere:UpdateTrustAnchor",
       "rolesanywhere:EnableTrustAnchor",
     ]
@@ -553,6 +625,9 @@ data "aws_iam_policy_document" "crl_issuer" {
       "rolesanywhere:GetCrl",
       "rolesanywhere:EnableCrl",
       "rolesanywhere:DisableCrl",
+      # The default quota is two CRLs per anchor, so old owned CRLs must be
+      # deleted, not merely disabled, or the third refresh cannot import.
+      "rolesanywhere:DeleteCrl",
     ]
     resources = [
       "arn:${var.ca_contract.partition}:rolesanywhere:${var.ca_contract.region}:${var.ca_contract.account_id}:trust-anchor/*",

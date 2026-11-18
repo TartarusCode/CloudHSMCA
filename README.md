@@ -78,6 +78,29 @@ module "alb_mtls" {
 the signing algorithm, and the EventBridge source/detail-type. No consumer
 references a resource in the engine, and the engine references no consumer.
 
+### First bootstrap: the commissioning CA
+
+A Terraform-created cluster starts `UNINITIALIZED` and cannot be activated until
+its cluster CSR is signed by a separate, approved commissioning CA and
+`InitializeCluster` succeeds. Supply that CA in `commissioning_ca`:
+
+```hcl
+commissioning_ca = {
+  certificate                = file("commissioning-ca.pem")   # public trust anchor
+  key_ssm_param              = "/corp-pki/commissioning/key"  # SecureString
+  signed_cluster_certificate = ""                              # or a pre-signed cert
+}
+```
+
+The private key never enters Terraform state: either the ceremony reads it from
+the named SSM SecureString and shreds it after signing, or you pre-sign the
+cluster CSR outside the plan and pass the certificate. The certificate is
+installed as the client trust anchor (`/opt/cloudhsm/etc/customerCA.crt`) before
+activation. The ceremony verifies the CLI RPM checksum before it reads any
+credential, and every tooling/CNF object is fetched by S3 version id.
+
+`auto_bootstrap = true` requires `enable_bootstrap = true` (validated).
+
 ### Bootstrap: turnkey vs. operator-run ceremony
 
 `auto_bootstrap = false` (default) — apply the stack, then start the ceremony:
@@ -195,13 +218,19 @@ json.dump(data, open("revoked.json", "w"), indent=2)
 PY
 aws s3 cp revoked.json "s3://$(terraform output -json ca_contract | python3 -c 'import json,sys;print(json.load(sys.stdin)["artifacts_bucket"])')/revocations/revoked.json"
 
-# import immediately instead of waiting for the 24h tick
+# import immediately instead of waiting for the 24h tick. Both consumers read
+# this one object, so invoke both: a certificate revoked through this procedure
+# must be rejected by Roles Anywhere and by the ALB.
 aws lambda invoke --function-name "$(terraform output -raw crl_issuer_function_name)" \
+  --payload '{"reason":"manual-revocation"}' --cli-binary-format raw-in-base64-out /dev/stdout
+aws lambda invoke --function-name "$(terraform output -raw alb_sync_function_name)" \
   --payload '{"reason":"manual-revocation"}' --cli-binary-format raw-in-base64-out /dev/stdout
 ```
 
-For the ALB consumer, set `alb_revoked_serials_ssm_param` to an SSM parameter
-holding the same JSON; its Lambda reads it and rotates the CRL the same way.
+The ALB consumer reads the same S3 object by default. `alb_revoked_serials_ssm_param`
+remains as an explicit override for a stack that keeps a separate SSM source; an
+unset override means "use S3", and a configured but missing or invalid source
+fails closed instead of clearing the installed CRL.
 
 ### Rotate the Intermediate CA
 
@@ -262,15 +291,17 @@ No resources.
 | Name | Description | Type | Default | Required |
 |------|-------------|------|---------|:--------:|
 | <a name="input_alb_mtls_name"></a> [alb\_mtls\_name](#input\_alb\_mtls\_name) | S3 prefix name for the ALB trust store artifacts (alb-mtls/<name>/). Empty = the CA's name. | `string` | `""` | no |
-| <a name="input_alb_revoked_serials_ssm_param"></a> [alb\_revoked\_serials\_ssm\_param](#input\_alb\_revoked\_serials\_ssm\_param) | SSM parameter holding revoked serials as JSON for the ALB CRL. Empty = issue an empty CRL. | `string` | `""` | no |
+| <a name="input_alb_revoked_serials_ssm_param"></a> [alb\_revoked\_serials\_ssm\_param](#input\_alb\_revoked\_serials\_ssm\_param) | Optional SSM override for ALB revoked serials. Empty = read the shared S3 revocation object; an explicit {"revoked": []} clears serials; a configured but missing or invalid source fails closed. | `string` | `""` | no |
 | <a name="input_alb_trust_store_name"></a> [alb\_trust\_store\_name](#input\_alb\_trust\_store\_name) | Explicit ELBv2 trust store name (max 32 chars). Empty = <ca\_name>-alb-mtls. | `string` | `""` | no |
-| <a name="input_allowed_kms_signer_role_arns"></a> [allowed\_kms\_signer\_role\_arns](#input\_allowed\_kms\_signer\_role\_arns) | IAM role ARNs besides the ceremony host allowed to sign with the Intermediate key. null = every role named <name>-*. | `list(string)` | `null` | no |
+| <a name="input_allowed_kms_signer_role_arns"></a> [allowed\_kms\_signer\_role\_arns](#input\_allowed\_kms\_signer\_role\_arns) | Exact IAM role ARNs besides the ceremony host allowed to sign with the Intermediate key. null = the composite stack's designated CRL issuer only; workload roles are never implied by a pattern. | `list(string)` | `null` | no |
 | <a name="input_artifact_bucket_name"></a> [artifact\_bucket\_name](#input\_artifact\_bucket\_name) | Explicit artifact bucket name. Empty = generated unique name. | `string` | `""` | no |
 | <a name="input_auto_bootstrap"></a> [auto\_bootstrap](#input\_auto\_bootstrap) | true runs the ceremony inside terraform apply and waits for it; false (default) leaves it to the operator. | `bool` | `false` | no |
 | <a name="input_auto_bootstrap_timeout_seconds"></a> [auto\_bootstrap\_timeout\_seconds](#input\_auto\_bootstrap\_timeout\_seconds) | How long the auto\_bootstrap waiter polls before failing the apply. | `number` | `3600` | no |
 | <a name="input_availability_zone"></a> [availability\_zone](#input\_availability\_zone) | AZ for the ceremony HSM. Must be an AZ of one of var.private\_subnet\_ids. | `string` | n/a | yes |
 | <a name="input_ceremony_instance_type"></a> [ceremony\_instance\_type](#input\_ceremony\_instance\_type) | Instance type for the ephemeral ceremony host. | `string` | `"t3.small"` | no |
 | <a name="input_cloudhsm_cli_rpm"></a> [cloudhsm\_cli\_rpm](#input\_cloudhsm\_cli\_rpm) | AWS CloudHSM Client SDK 5 CLI package for Amazon Linux 2023. | `string` | `"https://s3.amazonaws.com/cloudhsmv2-software/CloudHsmClient/Amzn2023/cloudhsm-cli-latest.amzn2023.x86_64.rpm"` | no |
+| <a name="input_cloudhsm_cli_rpm_sha256"></a> [cloudhsm\_cli\_rpm\_sha256](#input\_cloudhsm\_cli\_rpm\_sha256) | SHA-256 of the CloudHSM CLI RPM, verified before the ceremony installs it. Required for a bootstrap. | `string` | `""` | no |
+| <a name="input_commissioning_ca"></a> [commissioning\_ca](#input\_commissioning\_ca) | The approved CA that claims a new CloudHSM cluster (public certificate plus an SSM SecureString parameter holding the key, or a pre-signed cluster certificate). Required for the first bootstrap of an UNINITIALIZED cluster. | <pre>object({<br>    certificate                = string<br>    key_ssm_param              = optional(string, "")<br>    signed_cluster_certificate = optional(string, "")<br>  })</pre> | <pre>{<br>  "certificate": "",<br>  "key_ssm_param": "",<br>  "signed_cluster_certificate": ""<br>}</pre> | no |
 | <a name="input_crl_validity_days"></a> [crl\_validity\_days](#input\_crl\_validity\_days) | thisUpdate -> nextUpdate window of every generated CRL. Must exceed the 24h refresh cadence. | `number` | `7` | no |
 | <a name="input_enable_alb_mtls"></a> [enable\_alb\_mtls](#input\_enable\_alb\_mtls) | Create the ALB mutual-TLS consumer (ELBv2 trust store + activation/CRL Lambda). false = no trust store. | `bool` | `false` | no |
 | <a name="input_enable_bootstrap"></a> [enable\_bootstrap](#input\_enable\_bootstrap) | true for a first-time cluster (publishes the bootstrap entrypoint and admin password); false for rotation-only. | `bool` | `true` | no |
@@ -291,8 +322,10 @@ No resources.
 | <a name="input_root_key_curve"></a> [root\_key\_curve](#input\_root\_key\_curve) | CloudHSM curve for the non-exportable Root CA key. | `string` | `"secp384r1"` | no |
 | <a name="input_root_subject"></a> [root\_subject](#input\_root\_subject) | Distinguished name of the offline Root CA. | <pre>object({<br>    country             = optional(string, "US")<br>    state               = optional(string, "Washington")<br>    locality            = optional(string, "Seattle")<br>    organization        = optional(string, "Example Corp")<br>    organizational_unit = optional(string, "Platform Security")<br>    common_name         = optional(string, "Example Corp Root CA")<br>  })</pre> | `{}` | no |
 | <a name="input_tags"></a> [tags](#input\_tags) | Tags applied to every taggable resource. Module = "cloudhsmca" is always added. | `map(string)` | `{}` | no |
+| <a name="input_uv_installer_sha256"></a> [uv\_installer\_sha256](#input\_uv\_installer\_sha256) | Optional SHA-256 of the uv install script. | `string` | `""` | no |
+| <a name="input_uv_version"></a> [uv\_version](#input\_uv\_version) | Exact uv release the ceremony installs. | `string` | `"0.5.11"` | no |
 | <a name="input_vpc_id"></a> [vpc\_id](#input\_vpc\_id) | VPC containing the private subnets for the CloudHSM cluster and the ceremony host. | `string` | n/a | yes |
-| <a name="input_workload_profiles"></a> [workload\_profiles](#input\_workload\_profiles) | One Roles Anywhere profile + IAM role per workload class, keyed by a short stable name. | <pre>map(object({<br>    description                = optional(string, "Managed by cloudhsmca")<br>    session_duration_seconds   = optional(number, 3600)<br>    managed_policy_arns        = optional(list(string), [])<br>    session_policy_json        = optional(string)<br>    accept_role_session_name   = optional(bool, true)<br>    subject_condition_operator = optional(string, "StringEquals")<br>    allowed_subject_ou         = optional(string)<br>    allowed_subject_cn         = optional(string)<br>    tags                       = optional(map(string), {})<br>  }))</pre> | `{}` | no |
+| <a name="input_workload_profiles"></a> [workload\_profiles](#input\_workload\_profiles) | One Roles Anywhere profile + IAM role per workload class, keyed by a short stable name. | <pre>map(object({<br>    description                = optional(string, "Managed by cloudhsmca")<br>    session_duration_seconds   = optional(number, 3600)<br>    role_max_session_duration  = optional(number)<br>    managed_policy_arns        = optional(list(string), [])<br>    session_policy_json        = optional(string)<br>    accept_role_session_name   = optional(bool, true)<br>    subject_condition_operator = optional(string, "StringEquals")<br>    allowed_subject_ou         = optional(string)<br>    allowed_subject_cn         = optional(string)<br>    tags                       = optional(map(string), {})<br>  }))</pre> | `{}` | no |
 
 ## Outputs
 

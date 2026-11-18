@@ -80,6 +80,7 @@ data "archive_file" "sync" {
       import logging
       import os
       import time
+      import urllib.parse
 
       import boto3
 
@@ -312,13 +313,13 @@ data "archive_file" "sync" {
               return None
 
 
-      def load_revocations_ssm(ssm, param):
-          """Revoked serials from an SSM parameter, in build_crl's shape."""
-          raw = read_parameter(ssm, param)
-          if not raw:
-              LOG.warning("no revocation list at %s: issuing an empty CRL", param or "<unset>")
-              return []
+      def parse_revoked_payload(raw, source):
+          """Parse the shared revocation JSON into build_crl's shape."""
           payload = json.loads(raw)
+          if not isinstance(payload, (dict, list)):
+              raise RuntimeError("revocation source %s is not a JSON list or object" % source)
+          if isinstance(payload, dict) and not isinstance(payload.get("revoked", []), list):
+              raise RuntimeError("revocation source %s has a non-list 'revoked' field" % source)
           entries = payload.get("revoked", payload) if isinstance(payload, dict) else payload
           revoked = []
           for entry in entries:
@@ -336,8 +337,44 @@ data "archive_file" "sync" {
                       - datetime.timedelta(days=1)),
                   "reason": reason,
               })
-          LOG.info("loaded %d revoked serials from %s", len(revoked), param)
+          LOG.info("loaded %d revoked serials from %s", len(revoked), source)
           return revoked
+
+
+      def load_revocations_ssm(ssm, param):
+          """Revoked serials from an SSM parameter, in build_crl's shape.
+
+          None means the source is intentionally unconfigured. A configured but
+          missing/blank/invalid parameter is an error: treating it as an empty
+          list would silently clear the ALB's previously installed CRL.
+          """
+          if not param:
+              return None
+          raw = read_parameter(ssm, param)
+          if raw is None or not raw.strip():
+              raise RuntimeError(
+                  "configured revocation parameter %s is missing or empty: "
+                  "keeping the last known-good CRL" % param)
+          return parse_revoked_payload(raw, param)
+
+
+      def load_revocations_s3(s3, uri):
+          """Revoked serials from the shared S3 object (the Roles Anywhere source)."""
+          if not uri:
+              return None
+          parsed = urllib.parse.urlparse(uri)
+          try:
+              body = s3.get_object(
+                  Bucket=parsed.netloc, Key=parsed.path.lstrip("/"))["Body"].read()
+          except Exception as exc:  # noqa: BLE001 - a missing key is a real failure
+              raise RuntimeError(
+                  "configured revocation object %s is unreadable (%s): "
+                  "keeping the last known-good CRL" % (uri, exc))
+          if not body or not body.strip():
+              raise RuntimeError(
+                  "configured revocation object %s is empty: "
+                  "keeping the last known-good CRL" % uri)
+          return parse_revoked_payload(body, uri)
 
 
       def put_versioned(s3, bucket, key, body, content_type):
@@ -349,6 +386,46 @@ data "archive_file" "sync" {
               ContentType=content_type,
               ServerSideEncryption="AES256",
           )["VersionId"]
+
+
+      def ensure_bundle(s3, elbv2, bucket, key, bundle, trust_store_arn):
+          """Install the committed bundle when the trust store has drifted.
+
+          Runs on every invocation, so a late consumer, a missed event, or a
+          failure after the upload is repaired by the next scheduled tick.
+          Returns the committed version when it changed the store, else None.
+          """
+          body = bundle.encode("ascii")
+          body_md5 = hashlib.md5(body).hexdigest()
+          current = elbv2.describe_trust_stores(
+              TrustStoreArns=[trust_store_arn])["TrustStores"][0]
+          installed = current.get("CaCertificatesBundleS3ObjectVersion")
+          try:
+              head = s3.head_object(Bucket=bucket, Key=key)
+              same_content = str(head.get("ETag", "")).strip('"') == body_md5
+              latest = head.get("VersionId")
+          except Exception:  # noqa: BLE001 - a missing object is drift
+              same_content, latest = False, None
+          if not same_content or not latest:
+              latest = put_versioned(s3, bucket, key, body, "application/x-pem-file")
+          if installed == latest:
+              LOG.info("trust store %s already matches the committed bundle %s",
+                       trust_store_arn, latest)
+              return None
+          elbv2.modify_trust_store(
+              TrustStoreArn=trust_store_arn,
+              CaCertificatesBundleS3Bucket=bucket,
+              CaCertificatesBundleS3Key=key,
+              CaCertificatesBundleS3ObjectVersion=latest,
+          )
+          readback = elbv2.describe_trust_stores(
+              TrustStoreArns=[trust_store_arn])["TrustStores"][0]
+          if readback.get("CaCertificatesBundleS3ObjectVersion") != latest:
+              raise RuntimeError("trust store %s did not retain bundle version %s"
+                                 % (trust_store_arn, latest))
+          LOG.info("trust store %s reconciled to bundle version %s (%d certificates)",
+                   trust_store_arn, latest, bundle.count("BEGIN CERTIFICATE"))
+          return latest
 
 
       # --------------------------------------------------------------------------- #
@@ -389,20 +466,13 @@ data "archive_file" "sync" {
 
           result = {"ok": True, "activated": activation}
 
-          if activation:
-              # The bundle is a file in the bucket first; the trust store then points at
-              # that exact object version, so a concurrent overwrite cannot half-apply.
-              version_id = put_versioned(s3, bucket, bundle_key,
-                                         bundle.encode("ascii"), "application/x-pem-file")
-              elbv2.modify_trust_store(
-                  TrustStoreArn=trust_store_arn,
-                  CaCertificatesBundleS3Bucket=bucket,
-                  CaCertificatesBundleS3Key=bundle_key,
-                  CaCertificatesBundleS3ObjectVersion=version_id,
-              )
-              result["bundleVersionId"] = version_id
-              LOG.info("trust store bundle updated to version %s (%d certificates)",
-                       version_id, bundle.count("BEGIN CERTIFICATE"))
+          # Reconcile the trust store on every invocation. A missed event or a
+          # failure after the upload is repaired by the next scheduled tick.
+          reconciled_version = ensure_bundle(
+              s3, elbv2, bucket, bundle_key, bundle, trust_store_arn)
+          result["chainReconciled"] = reconciled_version is not None
+          if reconciled_version:
+              result["bundleVersionId"] = reconciled_version
 
           # ---- CRL: sign, upload, add, then remove the old one -------------------
           issuer_pem = read_parameter(ssm, issuer_param)
@@ -419,7 +489,17 @@ data "archive_file" "sync" {
               raise RuntimeError("KMS key exposes no supported ECDSA signing algorithm: %s"
                                  % algorithms)
 
-          revoked = load_revocations_ssm(ssm, revocations_param)
+          revocations_uri = os.environ.get("REVOCATIONS_S3_URI", "")
+          if revocations_param:
+              revoked = load_revocations_ssm(ssm, revocations_param)
+          else:
+              revoked = load_revocations_s3(s3, revocations_uri)
+          if revoked is None:
+              # An unset source opts out of CRL rotation entirely. Only an
+              # explicit {"revoked": []} clears the installed serials.
+              LOG.info("no revocation source configured: keeping the current CRL")
+              return {"ok": True, "skipped": "revocations-unset",
+                      "reason": event.get("reason", "scheduled")}
           crl_number = int(time.time())
           now, next_update, revoked_seq, extensions = build_crl(
               subject_der, akid, revoked, crl_number, validity_days)
@@ -522,9 +602,12 @@ data "aws_iam_policy_document" "sync" {
   }
 
   statement {
-    sid       = "WriteBundleAndCrl"
-    actions   = ["s3:PutObject", "s3:GetObject", "s3:GetObjectVersion"]
-    resources = ["${var.ca_contract.artifacts_bucket_arn}/${local.prefix}/*"]
+    sid     = "WriteBundleAndCrl"
+    actions = ["s3:PutObject", "s3:GetObject", "s3:GetObjectVersion"]
+    resources = [
+      "${var.ca_contract.artifacts_bucket_arn}/${local.prefix}/*",
+      "${var.ca_contract.artifacts_bucket_arn}/${var.revocations_s3_key}",
+    ]
   }
 
   # The Describe actions do not support resource-level permissions, so scoping
@@ -609,6 +692,7 @@ resource "aws_lambda_function" "sync" {
       CA_BUNDLE_PARAM       = var.ca_contract.ca_bundle_ssm_param
       ISSUER_CERT_PARAM     = var.ca_contract.intermediate_ca_ssm_param
       REVOKED_SERIALS_PARAM = var.revoked_serials_ssm_param
+      REVOCATIONS_S3_URI    = "s3://${var.ca_contract.artifacts_bucket}/${var.revocations_s3_key}"
       KMS_KEY_ARN           = var.ca_contract.intermediate_kms_key_arn
       CA_EVENT_SOURCE       = var.ca_contract.event_source
       CRL_VALIDITY_DAYS     = tostring(var.crl_validity_days)

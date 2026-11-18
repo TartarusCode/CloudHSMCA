@@ -50,6 +50,8 @@ terraform.rc
 planout
 crl.pem
 *.csr
+# Live-verification snapshot: restored by --restore-pending, never committed.
+.verify-live-snapshot.json
 __pycache__/
 *.pyc
 .venv/

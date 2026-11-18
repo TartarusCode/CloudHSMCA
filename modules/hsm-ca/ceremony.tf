@@ -3,8 +3,8 @@
 #
 # Terraform owns the durable half: the CloudHSM cluster shell, the artifact
 # bucket, the SSM hand-over parameters, IAM, and the state machine. Step
-# Functions owns the ephemeral half exclusively — cloudhsmv2:CreateHsm,
-# ec2:RunInstances, ssm:SendCommand, cloudhsmv2:DeleteHsm,
+# Functions owns the ephemeral half exclusively — cloudhsm:CreateHsm,
+# ec2:RunInstances, ssm:SendCommand, cloudhsm:DeleteHsm,
 # ec2:TerminateInstances — so no HSM or ceremony host ever exists in Terraform
 # state and nothing can drift.
 #
@@ -36,6 +36,7 @@ locals {
   ssm_intermediate_ca_pem = "${local.ssm_prefix}/intermediate_ca.pem"
   ssm_ca_bundle_pem       = "${local.ssm_prefix}/ca_bundle.pem"
   ssm_ceremony_state      = "${local.ssm_prefix}/ceremony/state"
+  ssm_verified_backup     = "${local.ssm_prefix}/ceremony/verified_backup_id"
   ssm_hsm_admin_password  = "${local.ssm_prefix}/ceremony/hsm-admin-password"
   ssm_hsm_cu_password     = "${local.ssm_prefix}/ceremony/hsm-cu-password"
 
@@ -44,51 +45,66 @@ locals {
   # The bootstrap script is the ceremony script itself, rendered
   # here so both paths execute one implementation.
   bootstrap_config = {
-    name                 = var.name
-    region               = local.region
-    cluster_id           = aws_cloudhsm_v2_cluster.this.cluster_id
-    hsm_ip               = ""
-    bucket               = aws_s3_bucket.artifacts.id
-    kms_key_arn          = aws_kms_key.intermediate_ca.arn
-    root_curve           = var.root_key_curve
-    root_digest          = local.root_digest
-    root_label           = local.hsm_root_key_label
-    public_key_der       = "/opt/pki/root_ca_pub.der"
-    root_validity_days   = var.root_ca_validity_days
-    inter_validity_days  = var.intermediate_ca_validity_days
-    ssm_root_ca_pem      = local.ssm_root_ca_pem
-    ssm_intermediate_pem = local.ssm_intermediate_ca_pem
-    ssm_ca_bundle_pem    = local.ssm_ca_bundle_pem
-    ssm_ceremony_state   = local.ssm_ceremony_state
-    ssm_admin_password   = local.ssm_hsm_admin_password
-    ssm_cu_password      = local.ssm_hsm_cu_password
-    s3_kms_ca_tool       = "scripts/kms_ca_tool.py"
-    s3_root_ca_cnf       = "scripts/root_ca.cnf"
-    s3_intermediate_cnf  = "scripts/intermediate_ca.cnf"
-    cu_username          = var.hsm_crypto_user
-    cloudhsm_cli_rpm     = var.cloudhsm_cli_rpm
+    name                        = var.name
+    region                      = local.region
+    cluster_id                  = aws_cloudhsm_v2_cluster.this.cluster_id
+    hsm_ip                      = ""
+    bucket                      = aws_s3_bucket.artifacts.id
+    kms_key_arn                 = aws_kms_key.intermediate_ca.arn
+    root_curve                  = var.root_key_curve
+    root_digest                 = local.root_digest
+    root_label                  = local.hsm_root_key_label
+    public_key_der              = "/opt/pki/root_ca_pub.der"
+    root_validity_days          = var.root_ca_validity_days
+    inter_validity_days         = var.intermediate_ca_validity_days
+    ssm_root_ca_pem             = local.ssm_root_ca_pem
+    ssm_intermediate_pem        = local.ssm_intermediate_ca_pem
+    ssm_ca_bundle_pem           = local.ssm_ca_bundle_pem
+    ssm_ceremony_state          = local.ssm_ceremony_state
+    ssm_admin_password          = local.ssm_hsm_admin_password
+    ssm_cu_password             = local.ssm_hsm_cu_password
+    s3_kms_ca_tool              = "scripts/kms_ca_tool.py"
+    s3_root_ca_cnf              = "scripts/root_ca.cnf"
+    s3_intermediate_cnf         = "scripts/intermediate_ca.cnf"
+    cu_username                 = var.hsm_crypto_user
+    cloudhsm_cli_rpm            = var.cloudhsm_cli_rpm
+    commissioning_ca_cert       = var.commissioning_ca.certificate
+    commissioning_key_ssm_param = var.commissioning_ca.key_ssm_param
+    commissioning_signed_cert   = var.commissioning_ca.signed_cluster_certificate
+    s3_tool_version             = aws_s3_object.kms_ca_tool.version_id
+    s3_root_cnf_version         = aws_s3_object.root_ca_cnf.version_id
+    s3_inter_cnf_version        = aws_s3_object.intermediate_ca_cnf.version_id
+    cloudhsm_cli_rpm_sha256     = var.cloudhsm_cli_rpm_sha256
+    uv_version                  = var.uv_version
+    uv_installer_sha256         = var.uv_installer_sha256
   }
 
   rotate_config = {
-    name                 = var.name
-    region               = local.region
-    cluster_id           = aws_cloudhsm_v2_cluster.this.cluster_id
-    bucket               = aws_s3_bucket.artifacts.id
-    kms_key_arn          = aws_kms_key.intermediate_ca.arn
-    root_curve           = var.root_key_curve
-    root_digest          = local.root_digest
-    root_label           = local.hsm_root_key_label
-    public_key_der       = "/opt/pki/root_ca_pub.der"
-    inter_validity_days  = var.intermediate_ca_validity_days
-    ssm_root_ca_pem      = local.ssm_root_ca_pem
-    ssm_intermediate_pem = local.ssm_intermediate_ca_pem
-    ssm_ca_bundle_pem    = local.ssm_ca_bundle_pem
-    ssm_ceremony_state   = local.ssm_ceremony_state
-    ssm_cu_password      = local.ssm_hsm_cu_password
-    s3_kms_ca_tool       = "scripts/kms_ca_tool.py"
-    s3_intermediate_cnf  = "scripts/intermediate_ca.cnf"
-    cu_username          = var.hsm_crypto_user
-    cloudhsm_cli_rpm     = var.cloudhsm_cli_rpm
+    name                    = var.name
+    region                  = local.region
+    cluster_id              = aws_cloudhsm_v2_cluster.this.cluster_id
+    bucket                  = aws_s3_bucket.artifacts.id
+    kms_key_arn             = aws_kms_key.intermediate_ca.arn
+    root_curve              = var.root_key_curve
+    root_digest             = local.root_digest
+    root_label              = local.hsm_root_key_label
+    public_key_der          = "/opt/pki/root_ca_pub.der"
+    inter_validity_days     = var.intermediate_ca_validity_days
+    ssm_root_ca_pem         = local.ssm_root_ca_pem
+    ssm_intermediate_pem    = local.ssm_intermediate_ca_pem
+    ssm_ca_bundle_pem       = local.ssm_ca_bundle_pem
+    ssm_ceremony_state      = local.ssm_ceremony_state
+    ssm_cu_password         = local.ssm_hsm_cu_password
+    s3_kms_ca_tool          = "scripts/kms_ca_tool.py"
+    s3_intermediate_cnf     = "scripts/intermediate_ca.cnf"
+    cu_username             = var.hsm_crypto_user
+    cloudhsm_cli_rpm        = var.cloudhsm_cli_rpm
+    commissioning_ca_cert   = var.commissioning_ca.certificate
+    s3_tool_version         = aws_s3_object.kms_ca_tool.version_id
+    s3_inter_cnf_version    = aws_s3_object.intermediate_ca_cnf.version_id
+    cloudhsm_cli_rpm_sha256 = var.cloudhsm_cli_rpm_sha256
+    uv_version              = var.uv_version
+    uv_installer_sha256     = var.uv_installer_sha256
   }
 
   root_digest = {
@@ -122,13 +138,9 @@ locals {
     ECC_NIST_P521 = "ECDSA_SHA_512"
   }[var.intermediate_key_spec]
 
-  # Who may sign with the Intermediate CA key: the ceremony host, plus whatever
-  # consumers the caller names. The default is every role whose name starts with
-  # "<name>-", which is how a consumer module in this repository is named, so the
-  # key policy never has to reference a resource the core module does not own.
-  consumer_signer_arns = var.allowed_kms_signer_role_arns != null ? var.allowed_kms_signer_role_arns : [
-    "arn:${local.partition}:iam::${local.account_id}:role/${var.name}-*"
-  ]
+  # Exact ARNs only. The default empty list keeps workload roles out of the CA
+  # key's authorization boundary.
+  consumer_signer_arns = var.allowed_kms_signer_role_arns
 
   ca_key_principal_arns = compact(concat(
     [aws_iam_role.ceremony_host.arn],
@@ -145,8 +157,11 @@ locals {
     ceremony_security_group_id = aws_security_group.ceremony.id
     instance_profile_arn       = aws_iam_instance_profile.ceremony_host.arn
     bucket                     = aws_s3_bucket.artifacts.id
-    bootstrap_key              = aws_s3_object.bootstrap_script[0].key
+    bootstrap_key              = try(aws_s3_object.bootstrap_script[0].key, "")
     rotate_key                 = aws_s3_object.rotate_script.key
+    bootstrap_enabled          = var.enable_bootstrap
+    verified_backup_param      = local.ssm_verified_backup
+    lease_table                = aws_dynamodb_table.ceremony_lease.name
 
     # The fan-out: the workflow announces the chain on EventBridge and knows
     # nothing about who consumes it.
@@ -159,6 +174,27 @@ locals {
     kms_key_arn_out      = aws_kms_key.intermediate_ca.arn
     bucket_out           = aws_s3_bucket.artifacts.id
   })
+}
+
+###############################################################################
+# One conditional lease per cluster
+#
+# A bootstrap and a rotation must never allocate two HSMs or write the same CA
+# artifacts at once. The lease is owned by an execution; a lease whose owner is
+# no longer running is reclaimed by the next run, so a timed-out or aborted
+# execution cannot block the cluster indefinitely.
+###############################################################################
+
+resource "aws_dynamodb_table" "ceremony_lease" {
+  name         = "${var.name}-ceremony-lease"
+  billing_mode = "PAY_PER_REQUEST"
+  hash_key     = "lease_id"
+  tags         = local.tags
+
+  attribute {
+    name = "lease_id"
+    type = "S"
+  }
 }
 
 ###############################################################################
@@ -384,6 +420,20 @@ resource "aws_ssm_parameter" "ceremony_state" {
   }
 }
 
+# The workflow writes this only after it has observed a NEW, READY escrow
+# backup. Consumers must not read a chain whose root has not been escrowed.
+resource "aws_ssm_parameter" "verified_backup" {
+  name        = local.ssm_verified_backup
+  description = "Backup id verified as escrow for the latest CA ceremony"
+  type        = "String"
+  value       = local.pending
+  tags        = local.tags
+
+  lifecycle {
+    ignore_changes = [value]
+  }
+}
+
 ###############################################################################
 # Ceremony host IAM — the role the workflow attaches to the instance it creates
 ###############################################################################
@@ -434,14 +484,14 @@ data "aws_iam_policy_document" "ceremony_host" {
       "ssm:GetParameters",
     ]
     resources = [
-      for path in [
+      for path in concat([
         local.ssm_root_ca_pem,
         local.ssm_intermediate_ca_pem,
         local.ssm_ca_bundle_pem,
         local.ssm_ceremony_state,
         local.ssm_hsm_admin_password,
         local.ssm_hsm_cu_password,
-      ] : "arn:${local.partition}:ssm:${local.region}:${local.account_id}:parameter${path}"
+      ], var.commissioning_ca.key_ssm_param != "" ? [var.commissioning_ca.key_ssm_param] : []) : "arn:${local.partition}:ssm:${local.region}:${local.account_id}:parameter${path}"
     ]
   }
 
@@ -498,6 +548,14 @@ data "aws_iam_policy_document" "ceremony_host" {
   statement {
     sid       = "DescribeHsmCluster"
     actions   = ["cloudhsm:DescribeClusters"]
+    resources = ["*"]
+  }
+
+  # Claiming a newly created cluster is part of the bootstrap: sign its CSR and
+  # call InitializeCluster before the CLI can activate it.
+  statement {
+    sid       = "InitializeHsmCluster"
+    actions   = ["cloudhsm:InitializeCluster"]
     resources = ["*"]
   }
 }
@@ -640,6 +698,14 @@ resource "aws_kms_key" "intermediate_ca" {
   enable_key_rotation      = false # asymmetric KMS keys cannot be rotated
   multi_region             = false
   tags                     = local.tags
+
+  # The key spec is immutable and this key signs the published chain and CRLs.
+  # Replacing it would move consumers to a new signer before a new Intermediate
+  # certificate exists, and destroying it would make old revocations
+  # unverifiable. Roll a new generation explicitly instead of editing the spec.
+  lifecycle {
+    prevent_destroy = true
+  }
 }
 
 resource "aws_kms_alias" "intermediate_ca" {
@@ -678,11 +744,14 @@ resource "aws_iam_role" "sfn" {
 data "aws_iam_policy_document" "sfn" {
   statement {
     sid = "HsmLifecycle"
+    # The API is CloudHSM V2, but its IAM actions use the `cloudhsm:` prefix.
+    # `cloudhsmv2:` grants nothing, so the first DescribeClusters call fails.
+    # Keep `cloudhsmv2:` only in the Step Functions integration identifiers.
     actions = [
-      "cloudhsmv2:CreateHsm",
-      "cloudhsmv2:DeleteHsm",
-      "cloudhsmv2:DescribeClusters",
-      "cloudhsmv2:DescribeBackups",
+      "cloudhsm:CreateHsm",
+      "cloudhsm:DeleteHsm",
+      "cloudhsm:DescribeClusters",
+      "cloudhsm:DescribeBackups",
     ]
     resources = ["*"]
   }
@@ -695,6 +764,24 @@ data "aws_iam_policy_document" "sfn" {
       "ec2:CreateTags",
     ]
     resources = ["*"]
+  }
+
+  statement {
+    sid = "DynamoDbLease"
+    actions = [
+      "dynamodb:PutItem",
+      "dynamodb:GetItem",
+      "dynamodb:DeleteItem",
+    ]
+    resources = [aws_dynamodb_table.ceremony_lease.arn]
+  }
+
+  # Read the owner of a conflicting lease to decide whether it is stale.
+  # DescribeExecution is authorized on the *execution* ARN, not the state machine.
+  statement {
+    sid       = "InspectLeaseOwner"
+    actions   = ["states:DescribeExecution"]
+    resources = ["arn:${local.partition}:states:${local.region}:${local.account_id}:execution:${var.name}-ceremony:*"]
   }
 
   statement {
@@ -718,6 +805,14 @@ data "aws_iam_policy_document" "sfn" {
       "ssm:ListCommandInvocations",
     ]
     resources = ["*"]
+  }
+
+  # The workflow commits the verified escrow backup id before it announces the
+  # chain; the host role cannot do that (it is terminated by then).
+  statement {
+    sid       = "RecordVerifiedBackup"
+    actions   = ["ssm:PutParameter"]
+    resources = ["arn:${local.partition}:ssm:${local.region}:${local.account_id}:parameter${local.ssm_verified_backup}"]
   }
 
   statement {
@@ -793,11 +888,12 @@ resource "terraform_data" "auto_bootstrap" {
   provisioner "local-exec" {
     interpreter = ["/bin/bash", "-c"]
     environment = {
-      STATE_MACHINE_ARN = aws_sfn_state_machine.ceremony.arn
-      SSM_CA_BUNDLE     = local.ssm_ca_bundle_pem
-      PKI_NAME          = var.name
-      AWS_REGION        = local.region
-      WAIT_TIMEOUT      = tostring(var.auto_bootstrap_timeout_seconds)
+      STATE_MACHINE_ARN   = aws_sfn_state_machine.ceremony.arn
+      SSM_CA_BUNDLE       = local.ssm_ca_bundle_pem
+      SSM_VERIFIED_BACKUP = local.ssm_verified_backup
+      PKI_NAME            = var.name
+      AWS_REGION          = local.region
+      WAIT_TIMEOUT        = tostring(var.auto_bootstrap_timeout_seconds)
     }
     command = "${path.module}/scripts/run_ceremony_and_wait.sh"
   }

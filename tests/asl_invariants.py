@@ -52,6 +52,9 @@ RENDER_VARS = {
     "bucket": "corp-pki-ceremony-artifacts",
     "bootstrap_key": "scripts/bootstrap.sh",
     "rotate_key": "scripts/rotate_intermediate.sh",
+    "verified_backup_param": "/corp-pki/pki/ceremony/verified_backup_id",
+    "lease_table": "corp-pki-ceremony-lease",
+    "bootstrap_enabled": True,
     "event_bus_name": "default",
     "ca_name": "corp-pki",
     "ca_bundle_ssm_pem": "/corp-pki/pki/ca_bundle.pem",
@@ -91,8 +94,8 @@ def render_template(template, vars_):
     return body
 
 
-def render():
-    body = render_template(TEMPLATE, RENDER_VARS)
+def render(vars_=None):
+    body = render_template(TEMPLATE, dict(vars_ if vars_ is not None else RENDER_VARS))
     try:
         return json.loads(body)
     except json.JSONDecodeError:
@@ -195,10 +198,13 @@ def check_aws_sdk_parameters(states, check):
         if not match:
             continue
         service, action = match.group(1), match.group(2)
+        # Step Functions' own integration identifier is "sfn"; botocore calls
+        # the service "stepfunctions".
+        service_model_name = {"sfn": "stepfunctions"}.get(service, service)
         params = state.get("Parameters") or {}
         keys = [key[:-2] if key.endswith(".$") else key for key in params]
         try:
-            model = session.get_service_model(service)
+            model = session.get_service_model(service_model_name)
             operation = model.operation_model(action[0].upper() + action[1:])
         except Exception as exc:  # noqa: BLE001 - the message is the finding
             problems.append("%s: %s:%s is not in the botocore model (%s)"
@@ -307,20 +313,45 @@ def main():
               "cleanup reaches terminateInstances")
 
     # A Catch that does not route into cleanup must at least reach a Fail.
-    catters = [(n, c["Next"]) for n, s in states.items() for c in s.get("Catch", [])]
+    # The success-path lease release is deliberately best-effort: its Catch
+    # rejoins the teardown path so a DynamoDB hiccup cannot discard a completed
+    # ceremony whose root is already escrowed.
+    catters = [(n, c["Next"]) for n, s in states.items() for c in s.get("Catch", [])
+               if n != "ReleaseClusterLease"]
     dead_ends = [n for n, target in catters
                  if not path_exists(defn, target, lambda x, s: s.get("Type") in FAIL_TYPES)]
     check(not dead_ends, "every Catch path ends in a Fail state", str(dead_ends))
 
-    # The original cause must survive cleanup: the primary failure routes catch
-    # into $.error, no cleanup task may write it, and the terminal Fail reads it.
+    print("\ncluster lease (one owner per cluster, reclaimed when the owner ends):")
+    acquire = states.get("AcquireClusterLease", {})
+    check(acquire.get("Resource", "").endswith(":dynamodb:putItem"),
+          "the lease is taken with a conditional DynamoDB write")
+    check("ConditionExpression" in acquire.get("Parameters", {}) and
+          "attribute_not_exists(lease_id)" in acquire.get("Parameters", {}).get("ConditionExpression", ""),
+          "the acquire is conditional, so a second run cannot overwrite the lease")
+    check("$$.Execution.Id" in json.dumps(acquire),
+          "the lease is owned by the execution, not by a shared name")
+    release = [n for n, s in states.items()
+               if n.startswith("Release") and s.get("Resource", "").endswith(":dynamodb:deleteItem")]
+    check(len(release) >= 2, "the lease is released on both success and failure", str(release))
+    check(path_exists(defn, "IsLeaseStale", lambda n, s: n == "StealClusterLease"),
+          "a stale lease is reclaimed instead of blocking the cluster")
+    check(path_exists(defn, "DescribeLeaseExecution", lambda n, s: n == "FailClusterBusy"),
+          "a live lease owner refuses a concurrent run")
+
+    # The original cause must survive cleanup. A Task records it in its Catch;
+    # a guard/recorder Pass states it in Result. Either way the terminal Fail
+    # reads the same $.error object.
+    cleanup_tasks = set(delete_hsm + terminate)
     into_cleanup = [n for n, s in states.items()
-                    if any(t == cleanup_entry for _, t in edges(s))]
+                    if n not in cleanup_tasks and not n.startswith("Cleanup")
+                    and any(t in (cleanup_entry, "CleanupHostOnFailure")
+                            for _, t in edges(s))]
     losers = [n for n in into_cleanup
-              if not any(c.get("ResultPath") == "$.error"
-                         for c in states[n].get("Catch", []))]
-    check(not losers, "every failure route into cleanup preserves $.error at the Catch",
-          str(losers))
+              if not (any(c.get("ResultPath") == "$.error"
+                          for c in states[n].get("Catch", []))
+                      or states[n].get("ResultPath") == "$.error")]
+    check(not losers, "every failure route into cleanup preserves $.error", str(losers))
     check(bool(into_cleanup), "the primary failure routes exist", str(len(into_cleanup)))
     cleanup_tasks = set(delete_hsm + terminate)
     clobber = [n for n in cleanup_tasks
@@ -368,15 +399,51 @@ def main():
     check(bool(mode_choice), "an explicit $.mode input is honoured", str(mode_choice))
     inferred = "UNINITIALIZED" in json.dumps(states.get("ChooseMode", {}))
     check(inferred, "the cluster state is used when no mode is supplied")
-    check("FailInvalidMode" in states, "an unknown mode is refused, not guessed")
+    check("RecordInvalidMode" in states, "an unknown mode is refused, not guessed")
 
     ready_gate = [n for n, s in states.items()
-                  if "Backups[0].State" in json.dumps(s) and "READY" in json.dumps(s)]
-    check(len(ready_gate) >= 2, "READY backups gate both restore and completion",
+                  if "Backups[0].BackupState" in json.dumps(s) and "READY" in json.dumps(s)]
+    check(len(ready_gate) >= 2, "BackupState READY gates both restore and completion",
           str(ready_gate))
+    stale = [n for n, s in states.items()
+             if "Backups[0].State" in json.dumps(s)]
+    check(not stale, "no gate reads the nonexistent Backups[0].State field", str(stale))
     check(path_exists(defn, "RequireReadyBackupRequested",
                       lambda n, s: n == "CreateHsmFromBackup"),
           "the READY backup gate precedes the rotation HSM")
+
+    # Poll counters are workflow variables: a workflow variable is referenced as
+    # `$name`, and an expression-valued Assign needs the `.$` suffix. Without
+    # both, the counter is a literal string and every bounded loop is unbounded.
+    increments = [n for n, s in states.items() if n.startswith("Increment")]
+    wrong = []
+    for name in increments:
+        assign = states[name].get("Assign", {})
+        if not any(k.endswith(".$") and v.startswith("States.MathAdd($")
+                   for k, v in assign.items()):
+            wrong.append(name)
+    check(len(increments) >= 5 and not wrong,
+          "every poll increment uses a workflow variable with a .$ expression", str(wrong))
+    guards = [n for n, s in states.items() if n.startswith("Guard") and s.get("Type") == "Choice"]
+    bad_guard = [n for n in guards
+                 if any(r.get("Variable", "").startswith("$.")
+                        for r in states[n].get("Choices", []))]
+    check(not bad_guard, "poll guards read workflow variables, not payload counters", str(bad_guard))
+    state_reads = [n for n, s in states.items()
+                   if "$.hsmPoll" in json.dumps(s) or "$.commandPoll" in json.dumps(s)]
+    check(not state_reads, "poll counters no longer share a path with API results", str(state_reads))
+
+    # The escrow check must see a backup created by this run, and commit its id
+    # before the chain can be announced.
+    escrow = states.get("IsBackupReady", {})
+    check("StringNotEqualsPath" in json.dumps(escrow),
+          "the escrow gate rejects a pre-existing backup")
+    check(path_exists(defn, "IsBackupReady",
+                      lambda n, s: s.get("Resource", "").endswith(":ssm:putParameter")),
+          "the verified backup id is committed before success")
+    check(path_exists(defn, "RecordVerifiedBackup",
+                      lambda n, s: n == "TerminateHostAfterSuccess"),
+          "the escrow id is recorded before the host is terminated")
 
     # --- 4. success path ordering -----------------------------------------
     print("\nsuccess path (delete, confirm gone, confirm backup, then exit):")
@@ -441,9 +508,12 @@ def main():
         detail = detail if isinstance(detail, dict) else {}
         missing = [k for k in ("ca_name", "cluster_id", "intermediate_kms_key_arn",
                                "ca_bundle_ssm_param", "root_ca_ssm_param",
-                               "intermediate_ca_ssm_param", "artifacts_bucket")
+                               "intermediate_ca_ssm_param", "verified_backup_ssm_param",
+                               "artifacts_bucket")
                    if k not in detail]
         check(not missing, "the detail carries the whole contract", str(missing))
+        check("verified_backup_id.$" in detail or "verified_backup_id" in detail,
+              "the detail carries the verified escrow backup id", str(sorted(detail)))
         check(detail.get("ca_name") == "corp-pki",
               "the detail names the CA (consumers match on it)", str(detail.get("ca_name")))
         check(detail.get("artifacts_bucket") == "corp-pki-pki-artifacts",
@@ -472,6 +542,31 @@ def main():
               "PublishCaReadyEvent precedes the Succeed state")
         check(bool(publish.get("Catch")),
               "a failed publish is caught instead of stalling")
+
+    # --- 6. rotation-only rendering ---------------------------------------
+    # enable_bootstrap = false must produce a valid, fully reachable definition
+    # with no bootstrap states and no unresolved ${bootstrap_key}.
+    print("\nrotation-only rendering (enable_bootstrap = false):")
+    rot_vars = dict(RENDER_VARS, bootstrap_enabled=False)
+    try:
+        rot = render(rot_vars)
+        rs = rot["States"]
+        orphan = [n for n in ("SetBootstrapMode", "CreateHsmNoBackup", "RunBootstrapCeremony")
+                  if n in rs]
+        check(not orphan, "bootstrap states are rendered out", str(orphan))
+        check("${bootstrap_key}" not in json.dumps(rot),
+              "no unresolved bootstrap key remains")
+        unreachable_rot = set(rs) - reachable(rot)
+        check(not unreachable_rot, "every remaining state is reachable",
+              str(sorted(unreachable_rot)))
+        empty_choices = [n for n, s in rs.items()
+                         if s.get("Type") == "Choice" and not s.get("Choices")]
+        check(not empty_choices, "no Choice state has an empty Choices array",
+              str(empty_choices))
+        check(path_exists(rot, "ChooseCeremonyScript", lambda n, s: n == "RunRotationCeremony"),
+              "rotation-only runs the rotation ceremony")
+    except SystemExit as exc:
+        check(False, "the rotation-only definition renders", str(exc))
 
     print()
     failures.extend(check_scripts())

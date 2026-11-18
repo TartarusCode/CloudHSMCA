@@ -81,7 +81,7 @@ PY
 echo "defaults (auto_bootstrap off, nothing required beyond the network):"
 snapshot defaults "$BASE" \
   '{module_tag = local.module_tag, tags = local.tags, auto_bootstrap = var.auto_bootstrap, ssm_ca_bundle_pem = local.ssm_ca_bundle_pem, ssm_intermediate_ca_pem = local.ssm_intermediate_ca_pem, signing_algorithm = local.ca_signing_algorithm, signer_override = var.allowed_kms_signer_role_arns, event_bus = var.event_bus_name}' \
-  "{\"module_tag\": \"cloudhsmca\", \"tags\": {\"Module\": \"cloudhsmca\", \"Tier\": \"root-of-trust\"}, \"auto_bootstrap\": false, \"ssm_ca_bundle_pem\": \"/corp-pki/pki/ca_bundle.pem\", \"ssm_intermediate_ca_pem\": \"/corp-pki/pki/intermediate_ca.pem\", \"signing_algorithm\": \"ECDSA_SHA_384\", \"signer_override\": null, \"event_bus\": \"default\"}"
+  "{\"module_tag\": \"cloudhsmca\", \"tags\": {\"Module\": \"cloudhsmca\", \"Tier\": \"root-of-trust\"}, \"auto_bootstrap\": false, \"ssm_ca_bundle_pem\": \"/corp-pki/pki/ca_bundle.pem\", \"ssm_intermediate_ca_pem\": \"/corp-pki/pki/intermediate_ca.pem\", \"signing_algorithm\": \"ECDSA_SHA_384\", \"signer_override\": [], \"event_bus\": \"default\"}"
 
 echo
 echo "auto_bootstrap = true (the turnkey path is a variable, not a second module):"
@@ -122,6 +122,20 @@ for want in 'must be 2-24 chars' 'root_key_curve must be' 'object_lock_mode must
     fail=1
   fi
 done
+
+# A wildcard signer ARN would admit workload roles into the CA key's signer
+# allowlist; the module must reject it rather than silently widen the boundary.
+rejected_signer=$(
+  printf 'jsonencode({a = var.allowed_kms_signer_role_arns})\n' \
+    | console -var 'allowed_kms_signer_role_arns=["arn:aws:iam::111122223333:role/corp-pki-*"]' 2>&1 || true
+)
+if grep -qF 'must contain exact IAM role ARNs' <<<"$rejected_signer"; then
+  printf '  rejected %-34s -> ok\n' "wildcard signer ARN"
+else
+  echo "FAIL: a wildcard signer ARN was accepted; console said:" >&2
+  printf '%s\n' "$rejected_signer" >&2
+  fail=1
+fi
 
 echo
 if [ "$fail" -ne 0 ]; then

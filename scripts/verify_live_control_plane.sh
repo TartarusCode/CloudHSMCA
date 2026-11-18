@@ -14,10 +14,13 @@
 # anchor turned on with the chain and a KMS-signed CRL.
 #
 #   ./scripts/verify_live_control_plane.sh examples/complete
-#   ./scripts/verify_live_control_plane.sh examples/complete --restore-pending
+#   ./scripts/verify_live_control_plane.sh examples/complete --restore-pending --confirm-sandbox
 #
-# --restore-pending puts PENDING-CEREMONY back and disables the trust anchor, so
-# the stack is clean for a real ceremony.
+# Before mutating anything the run writes a snapshot to
+# <stack-dir>/.verify-live-snapshot.json. --restore-pending refuses to run
+# without --confirm-sandbox, refuses a snapshot from another account or CA, and
+# restores only those recorded values. Every write is read back; a partial
+# restore exits nonzero instead of reporting success.
 #
 # This MUTATES the stack: three SSM parameters, one trust anchor, one CRL. Run it
 # against a sandbox, and restore afterwards.
@@ -30,13 +33,15 @@ TOOL="$REPO_ROOT/modules/hsm-ca/scripts/kms_ca_tool.py"
 REGION="${AWS_REGION:-${AWS_DEFAULT_REGION:-}}"
 TIMEOUT=60
 RESTORE=0
+CONFIRM_SANDBOX=0
 STACK_DIR=""
+SNAPSHOT=""
 # Where the Roles Anywhere consumer reads revoked serials from. The module's
 # default; override with --revocations-key if the stack changed it.
 REVOCATIONS_KEY="revocations/revoked.json"
 
 usage() {
-  sed -n '2,26p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'
   exit "${1:-0}"
 }
 
@@ -46,6 +51,7 @@ fail() { printf '[verify] FAIL: %s\n' "$*" >&2; exit 1; }
 while [ $# -gt 0 ]; do
   case "$1" in
     --restore-pending) RESTORE=1 ;;
+    --confirm-sandbox) CONFIRM_SANDBOX=1 ;;
     --timeout) TIMEOUT="${2:?--timeout needs a number}"; shift ;;
     --region) REGION="${2:?--region needs a value}"; shift ;;
     --revocations-key) REVOCATIONS_KEY="${2:?--revocations-key needs a value}"; shift ;;
@@ -58,6 +64,7 @@ done
 
 [ -n "$STACK_DIR" ] || usage 1
 [ -d "$STACK_DIR" ] || fail "no such directory: $STACK_DIR"
+SNAPSHOT="$STACK_DIR/.verify-live-snapshot.json"
 command -v terraform >/dev/null || fail "terraform is required"
 command -v aws >/dev/null || fail "the AWS CLI is required"
 command -v python3 >/dev/null || fail "python3 is required"
@@ -340,26 +347,126 @@ PY
   done
 }
 
-restore() {
-  log "restoring the stack: PENDING-CEREMONY and a disabled trust anchor"
-  for param in "$ROOT_PARAM" "$INTER_PARAM" "$CA_BUNDLE_PARAM"; do
-    aws ssm put-parameter --name "$param" --type String --overwrite \
-      --value PENDING-CEREMONY --region "$REGION" >/dev/null \
-      || log "WARNING: could not reset $param"
+###############################################################################
+# Snapshot before any mutation, restore only from that snapshot
+###############################################################################
+
+write_snapshot() {
+  local account
+  account="$(aws sts get-caller-identity --query Account --output text --region "$REGION")"
+  aws rolesanywhere get-trust-anchor --trust-anchor-id "$TRUST_ANCHOR_ID" \
+    --region "$REGION" --output json > "$WORK/anchor-before.json" \
+    || fail "could not snapshot the trust anchor"
+  for pair in "root:$ROOT_PARAM" "intermediate:$INTER_PARAM" "bundle:$CA_BUNDLE_PARAM"; do
+    local name="${pair%%:*}" param="${pair#*:}"
+    aws ssm get-parameter --name "$param" --with-decryption \
+      --query Parameter.Value --output text --region "$REGION" \
+      > "$WORK/$name-before.pem" || fail "could not snapshot $param"
   done
-  aws rolesanywhere disable-trust-anchor --trust-anchor-id "$TRUST_ANCHOR_ID" \
-    --region "$REGION" >/dev/null || log "WARNING: could not disable the trust anchor"
-  printf '{"revoked":[]}\n' >"$WORK/revoked-empty.json"
-  aws s3 cp --region "$REGION" "$WORK/revoked-empty.json" \
-    "s3://$ARTIFACT_BUCKET/$REVOCATIONS_KEY" >/dev/null \
-    || log "WARNING: could not reset the revocation list"
-  log "restored"
+  if aws s3api get-object --bucket "$ARTIFACT_BUCKET" --key "$REVOCATIONS_KEY" \
+       "$WORK/revocations-before.json" --region "$REGION" >/dev/null 2>&1; then
+    :
+  else
+    rm -f "$WORK/revocations-before.json"
+  fi
+  SNAP_ACCOUNT="$account" SNAP_CA_NAME="$CA_NAME" SNAP_WORK="$WORK" \
+    python3 - "$SNAPSHOT" <<'PY'
+import base64, json, os, sys
+work = os.environ["SNAP_WORK"]
+snap = {
+    "account": os.environ["SNAP_ACCOUNT"],
+    "ca_name": os.environ["SNAP_CA_NAME"],
+    "root": open(os.path.join(work, "root-before.pem")).read(),
+    "intermediate": open(os.path.join(work, "intermediate-before.pem")).read(),
+    "bundle": open(os.path.join(work, "bundle-before.pem")).read(),
+    "anchor": json.load(open(os.path.join(work, "anchor-before.json")))["trustAnchor"],
+}
+rev = os.path.join(work, "revocations-before.json")
+snap["revocations_b64"] = (
+    base64.b64encode(open(rev, "rb").read()).decode("ascii") if os.path.exists(rev) else None)
+json.dump(snap, open(sys.argv[1], "w"))
+PY
+  chmod 600 "$SNAPSHOT"
+  log "snapshot written to $SNAPSHOT (account $account, anchor enabled=$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["anchor"].get("enabled"))' "$SNAPSHOT"))"
+}
+
+restore() {
+  [ "$CONFIRM_SANDBOX" = "1" ] \
+    || fail "--restore-pending requires --confirm-sandbox: it mutates a live trust anchor"
+  [ -n "$SNAPSHOT" ] && [ -f "$SNAPSHOT" ] \
+    || fail "no snapshot at $SNAPSHOT: restore is only allowed from a snapshot this script took"
+
+  local account recorded
+  account="$(aws sts get-caller-identity --query Account --output text --region "$REGION")"
+  recorded="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["account"])' "$SNAPSHOT")"
+  [ "$account" = "$recorded" ] \
+    || fail "snapshot belongs to account $recorded, current account is $account: refusing to restore"
+  local snap_name
+  snap_name="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["ca_name"])' "$SNAPSHOT")"
+  [ "$snap_name" = "$CA_NAME" ] \
+    || fail "snapshot belongs to CA $snap_name, current stack is $CA_NAME: refusing to restore"
+
+  python3 - "$SNAPSHOT" "$WORK" <<'PY'
+import base64, json, os, sys
+snap = json.load(open(sys.argv[1])); work = sys.argv[2]
+for name in ("root", "intermediate", "bundle"):
+    open(os.path.join(work, "restore-%s.pem" % name), "w").write(snap[name])
+if snap.get("revocations_b64") is not None:
+    open(os.path.join(work, "restore-revoked.json"), "wb").write(
+        base64.b64decode(snap["revocations_b64"]))
+open(os.path.join(work, "restore-enabled"), "w").write(
+    "1" if snap["anchor"].get("enabled") else "0")
+PY
+
+  local rc=0 want value actual
+  for pair in "$ROOT_PARAM:root" "$INTER_PARAM:intermediate" "$CA_BUNDLE_PARAM:bundle"; do
+    local param="${pair%:*}" name="${pair#*:}"
+    if ! aws ssm put-parameter --name "$param" --type String --overwrite \
+         --value "file://$WORK/restore-$name.pem" --region "$REGION" >/dev/null; then
+      log "ERROR: could not restore $param"; rc=1; continue
+    fi
+    want="$(cat "$WORK/restore-$name.pem")"
+    actual="$(aws ssm get-parameter --name "$param" --with-decryption \
+      --query Parameter.Value --output text --region "$REGION" 2>/dev/null || true)"
+    [ "$want" = "$actual" ] || { log "ERROR: $param did not read back as restored"; rc=1; }
+  done
+
+  if [ "$(cat "$WORK/restore-enabled")" = "1" ]; then
+    aws rolesanywhere enable-trust-anchor --trust-anchor-id "$TRUST_ANCHOR_ID" \
+      --region "$REGION" >/dev/null \
+      || { log "ERROR: could not re-enable the trust anchor (it was enabled before)"; rc=1; }
+  else
+    aws rolesanywhere disable-trust-anchor --trust-anchor-id "$TRUST_ANCHOR_ID" \
+      --region "$REGION" >/dev/null \
+      || { log "ERROR: could not disable the trust anchor"; rc=1; }
+  fi
+  actual="$(aws rolesanywhere get-trust-anchor --trust-anchor-id "$TRUST_ANCHOR_ID" \
+    --region "$REGION" --query 'trustAnchor.enabled' --output text 2>/dev/null || true)"
+  [ "$actual" = "$(python3 -c 'import sys;print("True" if sys.argv[1]=="1" else "False")' "$(cat "$WORK/restore-enabled")")" ] \
+    || { log "ERROR: trust anchor enabled state did not read back as restored"; rc=1; }
+
+  if [ -f "$WORK/restore-revoked.json" ]; then
+    if aws s3 cp --region "$REGION" "$WORK/restore-revoked.json" \
+         "s3://$ARTIFACT_BUCKET/$REVOCATIONS_KEY" >/dev/null 2>&1 \
+       && aws s3api get-object --bucket "$ARTIFACT_BUCKET" --key "$REVOCATIONS_KEY" \
+            "$WORK/revocations-restored.json" --region "$REGION" >/dev/null 2>&1 \
+       && cmp -s "$WORK/restore-revoked.json" "$WORK/revocations-restored.json"; then
+      :
+    else
+      log "ERROR: the revocation list was not restored byte-for-byte"; rc=1
+    fi
+  fi
+
+  [ "$rc" -eq 0 ] || fail "restore was partial; see the ERROR lines above"
+  log "restore verified: snapshot values, anchor state and revocations match"
 }
 
 if [ "$RESTORE" = "1" ]; then
   restore
   exit 0
 fi
+
+write_snapshot
 
 step1
 step2

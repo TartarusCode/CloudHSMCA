@@ -52,8 +52,12 @@ calls `RemoveTrustStoreRevocations` on the previous `RevocationIds`. Doing it th
 other way round would leave a window in which the trust store has no revocation
 data at all.
 
-Revoked serials come from `var.revoked_serials_ssm_param` (JSON, same shape the
-Roles Anywhere consumer reads from S3); unset means an empty CRL.
+Revoked serials come from the shared S3 object
+`s3://<artifacts>/<revocations_s3_key>` — the same one the Roles Anywhere consumer
+reads, so the documented revoke operation reaches both. `revoked_serials_ssm_param`
+is an explicit override; unset means "use S3". A configured but missing, blank or
+invalid source fails closed instead of clearing the installed CRL, and an explicit
+`{"revoked": []}` is the only way to clear serials.
 
 ## Inputs that matter
 
@@ -62,7 +66,8 @@ Roles Anywhere consumer reads from S3); unset means an empty CRL.
 | `ca_contract` | every ARN, SSM path and the event contract; nothing is guessed |
 | `name` | S3 prefix only (`alb-mtls/<name>/`); empty = the CA's name |
 | `trust_store_name` | ELBv2 caps this at 32 characters; empty = `<ca_name>-alb-mtls`, and a `precondition` says so instead of an opaque API error |
-| `revoked_serials_ssm_param` | where the revoked serials live |
+| `revocations_s3_key` | key of the shared revocation JSON (default `revocations/revoked.json`) |
+| `revoked_serials_ssm_param` | optional SSM override for the revocation source |
 | `crl_validity_days` | must exceed the refresh cadence (default 7 vs 24 h) |
 
 ## Tests
@@ -140,7 +145,7 @@ No modules.
 | <a name="input_crl_validity_days"></a> [crl\_validity\_days](#input\_crl\_validity\_days) | thisUpdate -> nextUpdate window of every generated CRL. Must exceed the refresh cadence comfortably. | `number` | `7` | no |
 | <a name="input_log_retention_days"></a> [log\_retention\_days](#input\_log\_retention\_days) | Retention for the sync Lambda's log group. | `number` | `365` | no |
 | <a name="input_name"></a> [name](#input\_name) | Short name for this trust store's S3 prefix (alb-mtls/<name>/). Empty = the CA's name. | `string` | `""` | no |
-| <a name="input_revoked_serials_ssm_param"></a> [revoked\_serials\_ssm\_param](#input\_revoked\_serials\_ssm\_param) | SSM parameter holding the revoked serials as JSON ({"revoked":[{"serial":"0x0a1b","revoked\_at":...,"reason":...}]}). Empty = issue an empty CRL. | `string` | `""` | no |
+| <a name="input_revoked_serials_ssm_param"></a> [revoked\_serials\_ssm\_param](#input\_revoked\_serials\_ssm\_param) | Optional SSM override for revoked serials. Empty = read the shared S3 revocation object; an explicit {"revoked": []} clears serials; a configured but missing or invalid source fails closed. | `string` | `""` | no |
 | <a name="input_sync_schedule"></a> [sync\_schedule](#input\_sync\_schedule) | EventBridge schedule expression for the routine CRL rotation. | `string` | `"rate(24 hours)"` | no |
 | <a name="input_tags"></a> [tags](#input\_tags) | Tags applied to every taggable resource. `Module = "cloudhsmca"` is always added. | `map(string)` | `{}` | no |
 | <a name="input_trust_store_name"></a> [trust\_store\_name](#input\_trust\_store\_name) | Explicit ELBv2 trust store name (max 32 chars, alphanumeric and hyphens). Empty = <ca\_name>-alb-mtls. | `string` | `""` | no |
