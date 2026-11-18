@@ -240,7 +240,9 @@ variable "workload_profiles" {
   validation {
     condition = alltrue([
       for p in values(var.workload_profiles) :
-      p.role_max_session_duration == null || (p.role_max_session_duration >= 3600 && p.role_max_session_duration <= 43200)
+      p.role_max_session_duration == null ? true : (
+        p.role_max_session_duration >= 3600 && p.role_max_session_duration <= 43200
+      )
     ])
     error_message = "role_max_session_duration must be between 3600 and 43200 (IAM role limit)."
   }

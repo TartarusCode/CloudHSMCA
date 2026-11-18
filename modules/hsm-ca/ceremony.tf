@@ -885,6 +885,13 @@ resource "terraform_data" "auto_bootstrap" {
     var.name,
   ]
 
+  lifecycle {
+    precondition {
+      condition     = var.enable_bootstrap
+      error_message = "auto_bootstrap = true starts mode=BOOTSTRAP and requires enable_bootstrap = true."
+    }
+  }
+
   provisioner "local-exec" {
     interpreter = ["/bin/bash", "-c"]
     environment = {

@@ -23,7 +23,7 @@ locals {
 resource "aws_s3_object" "placeholder_bundle" {
   bucket        = var.ca_contract.artifacts_bucket
   key           = local.bundle_key
-  content       = file("${path.module}/placeholder_ca.pem")
+  content       = file("${path.module}/placeholder_ca.crt")
   content_type  = "application/x-pem-file"
   tags          = local.tags
   force_destroy = false

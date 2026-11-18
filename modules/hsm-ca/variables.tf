@@ -165,11 +165,6 @@ variable "auto_bootstrap" {
   EOT
   type        = bool
   default     = false
-
-  validation {
-    condition     = !var.auto_bootstrap || var.enable_bootstrap
-    error_message = "auto_bootstrap = true starts mode=BOOTSTRAP and requires enable_bootstrap = true."
-  }
 }
 
 variable "auto_bootstrap_timeout_seconds" {
