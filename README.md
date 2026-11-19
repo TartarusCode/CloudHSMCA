@@ -134,9 +134,11 @@ provisioning dominates) and needs the AWS CLI on the machine running apply; see
  │  Step Functions                                                          │
  │    1. CreateHsm  (hsm2m.medium, FIPS)                                    │
  │    2. Root key EXTRACTABLE=false → self-sign Root CA → sign KMS CSR      │
- │    3. verify the encrypted backup is READY   (the Root key is escrowed)  │
- │    4. DeleteHsm, terminate the ceremony host                             │
- │    5. PublishCaReadyEvent → cloudhsmca.pki / CAChainPublished            │
+ │    3. verify root/intermediate/bundle are published in SSM + S3          │
+ │    4. DeleteHsm  → triggers the cluster backup, billing drops to $0/hr   │
+ │    5. poll DescribeBackups every 60s until READY (Root key escrowed)     │
+ │    6. terminate the ceremony host, release the lease                     │
+ │    7. PublishCaReadyEvent → cloudhsmca.pki / CAChainPublished            │
  └──────────────────────────────────────────────────────────────────────────┘
                                    │  EventBridge
                                    ▼
@@ -313,7 +315,7 @@ the same event. Five-year default validity: `intermediate_ca_validity_days`.
 | <a name="input_enable_alb_mtls"></a> [enable\_alb\_mtls](#input\_enable\_alb\_mtls) | Create the ALB mutual-TLS consumer (ELBv2 trust store + activation/CRL Lambda). false = no trust store. | `bool` | `false` | no |
 | <a name="input_enable_bootstrap"></a> [enable\_bootstrap](#input\_enable\_bootstrap) | true for a first-time cluster (publishes the bootstrap entrypoint and admin password); false for rotation-only. | `bool` | `true` | no |
 | <a name="input_enable_roles_anywhere"></a> [enable\_roles\_anywhere](#input\_enable\_roles\_anywhere) | Create the IAM Roles Anywhere consumer (trust anchor, profiles, workload roles, CRL Lambda). false = PKI engine only. | `bool` | `true` | no |
-| <a name="input_escrow_wait_minutes"></a> [escrow\_wait\_minutes](#input\_escrow\_wait\_minutes) | Minutes the ceremony workflow waits for the escrow backup to reach READY after the HSM is deleted. CloudHSM creates it asynchronously; there is no API to force one. | `number` | `180` | no |
+| <a name="input_escrow_wait_minutes"></a> [escrow\_wait\_minutes](#input\_escrow\_wait\_minutes) | Minutes the workflow waits for the deletion-triggered escrow backup to reach READY; polled every 60 seconds, so this is the maximum number of polls. | `number` | `60` | no |
 | <a name="input_event_bus_name"></a> [event\_bus\_name](#input\_event\_bus\_name) | EventBridge bus for CAChainPublished. Consumers must subscribe to the same bus. | `string` | `"default"` | no |
 | <a name="input_hsm_crypto_user"></a> [hsm\_crypto\_user](#input\_hsm\_crypto\_user) | CloudHSM crypto user that owns the Root key. Letters, digits and underscore only, per CloudHSM. | `string` | `"pki_cu"` | no |
 | <a name="input_intermediate_ca_validity_days"></a> [intermediate\_ca\_validity\_days](#input\_intermediate\_ca\_validity\_days) | Intermediate CA lifetime (bootstrap and rotation). | `number` | `1825` | no |

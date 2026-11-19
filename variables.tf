@@ -295,9 +295,9 @@ variable "permissions_boundary_arn" {
   }
 }
 variable "escrow_wait_minutes" {
-  description = "Minutes the ceremony workflow waits for the escrow backup to reach READY after the HSM is deleted. CloudHSM creates it asynchronously; there is no API to force one."
+  description = "Minutes the workflow waits for the deletion-triggered escrow backup to reach READY; polled every 60 seconds, so this is the maximum number of polls."
   type        = number
-  default     = 180
+  default     = 60
 
   validation {
     condition     = var.escrow_wait_minutes >= 1 && var.escrow_wait_minutes <= 1440

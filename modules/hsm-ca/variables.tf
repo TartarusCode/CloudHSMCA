@@ -301,9 +301,9 @@ variable "permissions_boundary_arn" {
 }
 
 variable "escrow_wait_minutes" {
-  description = "How long the workflow waits for the service-scheduled escrow backup to reach READY after the HSM is deleted. AWS CloudHSM has no API to force a backup; it is created on cluster activation, HSM add and HSM removal, and can take a while."
+  description = "Minutes the workflow waits for the deletion-triggered escrow backup to reach READY. DeleteHsm triggers the backup; it is polled every 60 seconds, so this is also the maximum number of polls."
   type        = number
-  default     = 180
+  default     = 60
 
   validation {
     condition     = var.escrow_wait_minutes >= 1 && var.escrow_wait_minutes <= 1440

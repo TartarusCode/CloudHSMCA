@@ -5,7 +5,12 @@ It is a stand-in for an HSM: keys are generated locally (so the harness can sign
 and `crypto sign ecdsa` returns base64(r||s), exactly as the SDK 5 command
 reference documents. Nothing else about the flow is stubbed: the ceremony script
 parses this JSON, rebuilds the SPKI from the reported EC point, and signs with it.
+
+Arguments are parsed with argparse, one parser per interactive command, so a
+missing flag is a clean parse error instead of an IndexError and `--flag=value`
+works the same as `--flag value`.
 """
+import argparse
 import base64
 import json
 import os
@@ -18,6 +23,7 @@ from cryptography.hazmat.primitives.asymmetric import ec, utils
 STUB_DIR = os.environ["STUB_DIR"]
 KEY_PATH = os.path.join(STUB_DIR, "hsm_root_key.pem")
 LOG = os.path.join(STUB_DIR, "cloudhsm-cli.log")
+KEYS_FILE = os.path.join(STUB_DIR, "keys.json")
 
 CURVES = {"secp256r1": ec.SECP256R1, "secp384r1": ec.SECP384R1, "secp521r1": ec.SECP521R1}
 HASHES = {"sha256": hashes.SHA256, "sha384": hashes.SHA384, "sha512": hashes.SHA512}
@@ -49,6 +55,149 @@ def der_to_rs(der):
     return b"".join(i.rjust(width, b"\x00")[-width:] for i in ints)
 
 
+def build_parser():
+    """A parser mirroring the subset of the SDK 5 CLI the ceremony uses."""
+    parser = argparse.ArgumentParser(prog="cloudhsm-cli", add_help=False)
+    commands = parser.add_subparsers(dest="command", required=True)
+
+    login = commands.add_parser("login", add_help=False)
+    login.add_argument("--username", required=True)
+    login.add_argument("--role", required=True)
+    login.add_argument("--password", required=True)
+
+    commands.add_parser("logout", add_help=False)
+    commands.add_parser("quit", add_help=False)
+
+    user = commands.add_parser("user", add_help=False)
+    user_commands = user.add_subparsers(dest="user_command", required=True)
+    user_create = user_commands.add_parser("create", add_help=False)
+    user_create.add_argument("--username", required=True)
+    user_create.add_argument("--role")
+    user_create.add_argument("--password")
+    user_commands.add_parser("list", add_help=False)
+    user_delete = user_commands.add_parser("delete", add_help=False)
+    user_delete.add_argument("--username", required=True)
+
+    key = commands.add_parser("key", add_help=False)
+    key_commands = key.add_subparsers(dest="key_command", required=True)
+    key_generate = key_commands.add_parser("generate-asymmetric-pair", add_help=False)
+    key_generate.add_argument("algorithm", choices=["ec"])
+    key_generate.add_argument("--curve", required=True, choices=sorted(CURVES))
+    key_generate.add_argument("--public-label")
+    key_generate.add_argument("--private-label")
+    # clap accepts a space-separated attribute list after one flag.
+    key_generate.add_argument("--private-attributes", nargs="+", default=[])
+    key_generate.add_argument("--public-attributes", nargs="+", default=[])
+    key_commands.add_parser("list", add_help=False)
+    key_delete = key_commands.add_parser("delete", add_help=False)
+    key_delete.add_argument("--filter", required=True)
+
+    crypto = commands.add_parser("crypto", add_help=False)
+    crypto_commands = crypto.add_subparsers(dest="crypto_command", required=True)
+    sign = crypto_commands.add_parser("sign", add_help=False)
+    sign_commands = sign.add_subparsers(dest="sign_command", required=True)
+    sign_ecdsa = sign_commands.add_parser("ecdsa", add_help=False)
+    sign_ecdsa.add_argument("--key-filter", action="append", default=[])
+    sign_ecdsa.add_argument("--hash-function", required=True, choices=sorted(HASHES))
+    sign_ecdsa.add_argument("--data-path")
+    sign_ecdsa.add_argument("--data")
+    sign_ecdsa.add_argument("--data-type", default="raw", choices=["raw", "digest"])
+
+    cluster = commands.add_parser("cluster", add_help=False)
+    cluster_commands = cluster.add_subparsers(dest="cluster_command", required=True)
+    activate = cluster_commands.add_parser("activate", add_help=False)
+    activate.add_argument("--password")
+
+    return parser
+
+
+def attr_value(attributes, name):
+    """Turn ['extractable=false', 'sign=true'] into {'extractable': 'false', ...}."""
+    pairs = dict(item.split("=", 1) for item in attributes if "=" in item)
+    return pairs.get(name)
+
+
+def handle(args):
+    if args.command == "login":
+        emit({"error_code": 0, "data": {"username": args.username, "role": args.role}})
+
+    elif args.command in ("logout", "quit"):
+        return
+
+    elif args.command == "cluster" and args.cluster_command == "activate":
+        emit({"error_code": 0, "data": "Cluster activation successful"})
+
+    elif args.command == "user" and args.user_command == "create":
+        emit({"error_code": 0, "data": {"username": args.username, "role": "crypto-user"}})
+
+    elif args.command == "user" and args.user_command == "list":
+        users = ["admin", os.environ.get("CU_USERNAME", "pki_cu")]
+        stray = os.environ.get("HSM_STUB_STRAY_USER")
+        if stray:
+            users.append(stray)
+        emit({"error_code": 0, "data": {"users": [{"username": u} for u in users]}})
+
+    elif args.command == "user" and args.user_command == "delete":
+        with open(LOG, "a") as log:
+            log.write("user delete %s\n" % args.username)
+        emit({"error_code": 0, "data": "ok"})
+
+    elif args.command == "key" and args.key_command == "generate-asymmetric-pair":
+        key = ec.generate_private_key(CURVES[args.curve]())
+        with open(KEY_PATH, "wb") as fh:
+            fh.write(key.private_bytes(serialization.Encoding.PEM,
+                                       serialization.PrivateFormat.PKCS8,
+                                       serialization.NoEncryption()))
+        point = key.public_key().public_bytes(
+            serialization.Encoding.X962, serialization.PublicFormat.UncompressedPoint)
+        labels = {label for label in (args.public_label, args.private_label) if label}
+        if labels:
+            with open(KEYS_FILE, "w") as fh:
+                json.dump(sorted(labels), fh)
+        # SDK 5 reports these as JSON booleans. HSM_STUB_EXTRACTABLE forces a
+        # mode so the ceremony's extractability gate can be tested for
+        # false/true/missing/string values.
+        forced = os.environ.get("HSM_STUB_EXTRACTABLE")
+        if forced in ("true", "false"):
+            extractable = forced == "true"
+        else:
+            extractable = attr_value(args.private_attributes, "extractable") != "false"
+        emit({"error_code": 0, "data": {
+            "public_key": {"key-reference": "0x1", "key-info": {}, "attributes": {
+                "key-type": "ec", "class": "public-key",
+                "ec-point": "0x" + point.hex(), "curve": args.curve}},
+            "private_key": {"key-reference": "0x2", "key-info": {}, "attributes": {
+                "key-type": "ec", "class": "private-key",
+                "extractable": extractable,
+                "sign": attr_value(args.private_attributes, "sign") == "true"}},
+        }})
+
+    elif args.command == "key" and args.key_command == "list":
+        labels = json.load(open(KEYS_FILE)) if os.path.exists(KEYS_FILE) else []
+        stray = os.environ.get("HSM_STUB_TEMP_KEY")
+        if stray:
+            labels.append(stray)
+        emit({"error_code": 0, "data": {"keys": [{"label": label} for label in labels]}})
+
+    elif args.command == "key" and args.key_command == "delete":
+        with open(LOG, "a") as log:
+            log.write("key delete --filter %s\n" % args.filter)
+        emit({"error_code": 0, "data": "ok"})
+
+    elif args.command == "crypto" and args.sign_command == "ecdsa":
+        payload = open(args.data_path, "rb").read() if args.data_path \
+            else base64.b64decode(args.data)
+        hash_algorithm = HASHES[args.hash_function]()
+        key = load_key()
+        if args.data_type == "digest":
+            signature = key.sign(payload, ec.ECDSA(utils.Prehashed(hash_algorithm)))
+        else:
+            signature = key.sign(payload, ec.ECDSA(hash_algorithm))
+        emit({"error_code": 0, "data": {
+            "key-reference": "0x2",
+            "signature": base64.b64encode(der_to_rs(signature)).decode()}})
+
+
 def main():
     argv = sys.argv[1:]
     if argv and argv[0] != "interactive":
@@ -58,78 +207,20 @@ def main():
         script = sys.stdin.read()
     with open(LOG, "a") as log:
         log.write("---- session ----\n" + script + "\n")
+
+    parser = build_parser()
     for line in script.splitlines():
         line = line.strip()
         if not line or line == "quit":
             continue
-        args = shlex.split(line)
-        log_line = " ".join(args)
-
-        if args[0] == "login":
-            emit({"error_code": 0, "data": {"username": "stub", "role": "x"}})
-
-        elif args[:3] == ["key", "generate-asymmetric-pair", "ec"]:
-            curve = CURVES[args[args.index("--curve") + 1]]
-            key = ec.generate_private_key(curve())
-            with open(KEY_PATH, "wb") as fh:
-                fh.write(key.private_bytes(serialization.Encoding.PEM,
-                                           serialization.PrivateFormat.PKCS8,
-                                           serialization.NoEncryption()))
-            point = key.public_key().public_bytes(
-                serialization.Encoding.X962, serialization.PublicFormat.UncompressedPoint)
-            attrs = {}
-            for flag in ("--private-attributes", "--public-attributes"):
-                if flag in args:
-                    for pair in args[args.index(flag) + 1:]:
-                        if "=" not in pair:
-                            break
-                        k, v = pair.split("=", 1)
-                        attrs[(flag, k)] = v
-            emit({"error_code": 0, "data": {
-                "public_key": {"key-reference": "0x1", "key-info": {}, "attributes": {
-                    "key-type": "ec", "class": "public-key",
-                    "ec-point": "0x" + point.hex(),
-                    "curve": args[args.index("--curve") + 1]}},
-                "private_key": {"key-reference": "0x2", "key-info": {}, "attributes": {
-                    "key-type": "ec", "class": "private-key",
-                    # SDK 5 reports these as JSON booleans. Support explicit
-                    # stub modes so the ceremony's extractability gate can be
-                    # tested for false/true/missing/string values.
-                    "extractable": (
-                        os.environ.get("HSM_STUB_EXTRACTABLE") == "true"
-                        if os.environ.get("HSM_STUB_EXTRACTABLE") in ("true", "false")
-                        else attrs.get(("--private-attributes", "extractable"), "true") != "false"
-                    ),
-                    "sign": attrs.get(("--private-attributes", "sign"), "false") == "true"}},
-            }})
-
-        elif args[:3] == ["crypto", "sign", "ecdsa"]:
-            data_path = args[args.index("--data-path") + 1]
-            hash_name = args[args.index("--hash-function") + 1]
-            data_type = args[args.index("--data-type") + 1] if "--data-type" in args else "raw"
-            payload = open(data_path, "rb").read()
-            key = load_key()
-            if data_type == "digest":
-                signature = key.sign(payload, ec.ECDSA(utils.Prehashed(HASHES[hash_name]())))
-            else:
-                signature = key.sign(payload, ec.ECDSA(HASHES[hash_name]()))
-            emit({"error_code": 0, "data": {
-                "key-reference": "0x2",
-                "signature": base64.b64encode(der_to_rs(signature)).decode()}})
-
-        elif args[:2] == ["cluster", "activate"]:
-            emit({"error_code": 0, "data": "Cluster activation successful"})
-
-        elif args[:2] == ["user", "create"]:
-            emit({"error_code": 0, "data": {"username": args[args.index("--username") + 1],
-                                            "role": "crypto-user"}})
-
-        elif args[:2] == ["key", "list"]:
-            emit({"error_code": 0, "data": {"keys": []}})
-
-        else:
-            log.write("UNHANDLED: %s\n" % log_line)
-            emit({"error_code": 1, "error_message": "stub does not implement: %s" % log_line})
+        try:
+            args = parser.parse_args(shlex.split(line))
+        except SystemExit:
+            # argparse already explained the problem on stderr; the real CLI
+            # returns a JSON error document, so mirror that shape.
+            emit({"error_code": 2, "error_message": "invalid arguments: %s" % line})
+            continue
+        handle(args)
 
 
 if __name__ == "__main__":

@@ -25,6 +25,7 @@ export HARNESS STUB_DIR="$STUB"
 mkdir -p "$STUB" "$HARNESS/pki" "$HARNESS/work" "$HARNESS/scripts" "$HARNESS/fakebin" "$HARNESS/cloudhsm-etc"
 echo NOT_STARTED > "$STUB/state"
 trap 'rm -rf "$HARNESS"' EXIT
+if [ "${HARNESS_KEEP:-0}" = "1" ]; then trap - EXIT; fi
 
 # A separate commissioning CA claims the cluster. Its private key is served
 # through the SSM stub; the certificate is public and goes into the config.
@@ -210,7 +211,7 @@ openssl ecparam -name prime256v1 -genkey -noout -out "$FAKE_KMS_KEY"
 
 echo
 echo "=== running the ceremony script ==="
-bash "$STUB/ceremony.sh"
+HSM_STUB_STRAY_USER=stray_user HSM_STUB_TEMP_KEY=temp-wrap bash "$STUB/ceremony.sh"
 
 echo
 echo "=== independent verification (outside the script) ==="
@@ -236,7 +237,7 @@ echo
 echo "=== claim scenario: cluster starts UNINITIALIZED ==="
 echo NOT_STARTED > "$STUB/state"
 rm -f "$STUB/activated" "$STUB/claimed" "$STUB/initialize.log" \
-      "$STUB/cluster.csr" "$STUB/cluster-csr-key.pem"
+      "$STUB/cluster.csr" "$STUB/cluster-csr-key.pem" "$STUB/keys.json"
 cd "$HARNESS"
 rm -rf "$HARNESS/pki"; mkdir -p "$HARNESS/pki"
 if ! HSM_STUB_UNINITIALIZED=1 bash "$STUB/ceremony.sh" > "$HARNESS/claim.log" 2>&1; then
@@ -252,7 +253,9 @@ grep -q "cluster claimed: INITIALIZED" "$HARNESS/claim.log" \
   || { echo "FAIL: InitializeCluster was never called" >&2; exit 1; }
 [ "$(cat "$STUB/state")" = "COMPLETE" ] \
   || { echo "FAIL: claim-run ceremony state is not COMPLETE" >&2; exit 1; }
-openssl verify -CAfile "$STUB/commissioning-ca.pem" "$HARNESS/pki/cluster-cert.pem" >/dev/null \
+# -no_check_time: the certificate was signed a moment ago and openssl rounds
+# notBefore to the next second, so an immediate verify can race it.
+openssl verify -no_check_time -CAfile "$STUB/commissioning-ca.pem" "$HARNESS/pki/cluster-cert.pem" >/dev/null \
   || { echo "FAIL: signed cluster certificate does not chain to the commissioning CA" >&2; exit 1; }
 cmp -s "$STUB/commissioning-ca.pem" "$HARNESS/cloudhsm-etc/customerCA.crt" \
   || { echo "FAIL: the commissioning CA was not installed as the client trust anchor" >&2; exit 1; }
@@ -278,6 +281,23 @@ if grep -q "secretsmanager get-secret-value .*hsm-admin" "$STUB/aws.log"; then
   exit 1
 fi
 echo "verified: bad RPM hash aborted before any credential read"
+
+# --- token hygiene: the backup must carry only the Root pair and two users ---
+echo
+echo "=== token hygiene ==="
+grep -q "user delete stray_user" "$STUB/cloudhsm-cli.log" \
+  || { echo "FAIL: the stray HSM user was not deleted" >&2; exit 1; }
+grep -q "key delete --filter attr.label=temp-wrap" "$STUB/cloudhsm-cli.log" \
+  || { echo "FAIL: the temporary key was not deleted" >&2; exit 1; }
+if grep -q "key delete --filter attr.label=root-ca-corp-pki" "$STUB/cloudhsm-cli.log"; then
+  echo "FAIL: the ceremony deleted the Root key" >&2
+  exit 1
+fi
+if grep -q "user delete admin\|user delete pki_cu" "$STUB/cloudhsm-cli.log"; then
+  echo "FAIL: the ceremony deleted a required HSM user" >&2
+  exit 1
+fi
+echo "stray user and temporary key removed; root pair and required users kept"
 
 echo
 echo "CEREMONY HARNESS: PASS"

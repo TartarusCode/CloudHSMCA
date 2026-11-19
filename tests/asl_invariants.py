@@ -371,6 +371,34 @@ def main():
               for n in delete_hsm + terminate if n in states),
           "neither deleteHsm nor terminateInstances clobbers $.error")
 
+    # --- 1b. escrow ordering ------------------------------------------------
+    # DeleteHsm is the documented backup trigger: it must run only after the
+    # chain is verifiably published, and the backup poll must run after it.
+    print("\nescrow ordering (DeleteHsm triggers the backup, then poll):")
+    check(bool(delete_hsm), "a deleteHsm task exists", str(delete_hsm))
+    check("VerifyChainPublished" in states,
+          "the published chain is read back before deletion")
+    check(path_exists(defn, "VerifyChainPublished",
+                      lambda n, s: s.get("Resource", "").endswith(":cloudhsmv2:deleteHsm")),
+          "deleteHsm runs after publication verification")
+    check(not path_exists(defn, "RecordChainNotPublished",
+                          lambda n, s: s.get("Resource", "").endswith(":cloudhsmv2:deleteHsm")),
+          "a missing published chain never deletes the HSM")
+    for delete_state in delete_hsm:
+        check(path_exists(defn, delete_state,
+                          lambda n, s: s.get("Resource", "").endswith(":cloudhsmv2:describeBackups")),
+              "the backup poll runs after %s" % delete_state)
+    wait_state = states.get("WaitForBackup", {})
+    check(wait_state.get("Seconds") == 60,
+          "the escrow poll waits 60 seconds", str(wait_state.get("Seconds")))
+    check(path_exists(defn, "GuardBackupPolls",
+                      lambda n, s: s.get("Type") in FAIL_TYPES),
+          "escrow poll exhaustion fails closed")
+    check("preDeleteBaselineId" in json.dumps(states),
+          "the pre-delete backup baseline is recorded and compared")
+    check("StringNotEqualsPath" in json.dumps(states.get("IsBackupReady", {})),
+          "the escrow check rejects the pre-delete baseline id")
+
     # --- 2. SSM agent readiness -------------------------------------------
     print("\nssm readiness (no sendCommand before the agent reports Online):")
     describe = find_tasks(defn, ":ssm:describeInstanceInformation")

@@ -79,7 +79,6 @@ locals {
     cloudhsm_cli_rpm_sha256     = var.cloudhsm_cli_rpm_sha256
     uv_version                  = var.uv_version
     uv_installer_sha256         = var.uv_installer_sha256
-    escrow_polls                = var.escrow_wait_minutes * 2
   }
 
   rotate_config = {
@@ -158,7 +157,7 @@ locals {
 
   statemachine_definition = templatefile("${path.module}/statemachine.asl.json.tftpl", {
     name                       = var.name
-    escrow_polls               = var.escrow_wait_minutes * 2
+    escrow_polls               = ceil(var.escrow_wait_minutes)
     cluster_id                 = aws_cloudhsm_v2_cluster.this.cluster_id
     availability_zone          = var.availability_zone
     ami_id                     = data.aws_ami.al2023.id

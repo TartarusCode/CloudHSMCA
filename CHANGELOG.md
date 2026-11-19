@@ -27,6 +27,19 @@ the harnesses; the cloud-side acceptance points are called out below.
 
 ### Fixed
 
+- **Escrow follows the CloudHSM backup lifecycle**: the workflow verifies the
+  published chain, reads the pre-delete backup baseline, then calls `DeleteHsm` —
+  the documented backup trigger — and polls `DescribeBackups` every 60 seconds.
+  `escrow_wait_minutes` now defaults to 60 (60 polls) and the gate rejects the
+  pre-delete baseline id, so only the backup created by this deletion satisfies
+  it. Failures before publication still keep the HSM.
+- **HSM token hygiene**: the ceremony removes temporary wrapping/session keys and
+  any user other than `admin` and the crypto user before it reports COMPLETE, so
+  the restored backup carries exactly the Root pair and the two required users.
+- **Ceremony harness**: the signed cluster certificate is verified with
+  `-no_check_time`, because openssl rounds `notBefore` to the next second and an
+  immediate verify raced it; the CLI stub now parses arguments with argparse.
+
 - **IAM prefix**: the ceremony execution role granted `cloudhsmv2:*`, which is not
   an IAM action namespace; it now grants `cloudhsm:CreateHsm/DeleteHsm/
   DescribeClusters/DescribeBackups/InitializeCluster`. The `aws-sdk:cloudhsmv2:`

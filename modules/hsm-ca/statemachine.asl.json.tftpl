@@ -12,7 +12,8 @@
         "ssmPoll": 0,
         "commandPoll": 0,
         "teardownPoll": 0,
-        "backupPoll": 0
+        "backupPoll": 0,
+        "preDeleteBaselineId": "none"
       },
       "Next": "AcquireClusterLease"
     },
@@ -698,11 +699,115 @@
       "Assign": {
         "ceremonyOutput": "$.invocation.StandardOutputContent"
       },
-      "Next": "DeleteHsmAfterSuccess"
+      "Next": "VerifyChainPublished"
     },
-    "DeleteHsmAfterSuccess": {
+    "VerifyChainPublished": {
       "Type": "Task",
-      "Comment": "Deleting the HSM stops the hourly billing and is what makes CloudHSM write the encrypted escrow backup. The backup appears several minutes later, so the workflow waits for it before reporting success.",
+      "Comment": "Read the published bundle back before the HSM is deleted: an escrow backup is worthless if the chain it protects never reached SSM.",
+      "Resource": "arn:aws:states:::aws-sdk:ssm:getParameter",
+      "Parameters": {
+        "Name": "${ca_bundle_ssm_pem}"
+      },
+      "ResultPath": "$.publishedBundle",
+      "Retry": [
+        {
+          "ErrorEquals": ["States.TaskFailed", "Ssm.ThrottlingException"],
+          "IntervalSeconds": 5,
+          "MaxAttempts": 3,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "CleanupHsmOnFailure"
+        }
+      ],
+      "Next": "IsChainPublished"
+    },
+    "IsChainPublished": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "And": [
+            {
+              "Variable": "$.publishedBundle.Parameter.Value",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.publishedBundle.Parameter.Value",
+              "StringMatches": "*BEGIN CERTIFICATE*"
+            },
+            {
+              "Variable": "$.publishedBundle.Parameter.Value",
+              "StringMatches": "*-END CERTIFICATE-*"
+            }
+          ],
+          "Next": "RecordPreDeleteBackups"
+        }
+      ],
+      "Default": "RecordChainNotPublished"
+    },
+    "RecordChainNotPublished": {
+      "Type": "Pass",
+      "Comment": "The chain is missing or still the PENDING placeholder. Keep the HSM: it holds the only copy of the Root key.",
+      "Result": {
+        "Error": "ChainNotPublished",
+        "Cause": "SSM ca_bundle.pem is missing or still the PENDING placeholder. The HSM was kept because it holds the only copy of the Root key."
+      },
+      "ResultPath": "$.error",
+      "Next": "CleanupHostOnFailure"
+    },
+    "RecordPreDeleteBackups": {
+      "Type": "Task",
+      "Comment": "Snapshot the newest backup id immediately before deletion so the escrow gate accepts only the backup this deletion creates.",
+      "Resource": "arn:aws:states:::aws-sdk:cloudhsmv2:describeBackups",
+      "Parameters": {
+        "Filters": {
+          "clusterIds": ["${cluster_id}"]
+        },
+        "SortAscending": false
+      },
+      "ResultPath": "$.preDeleteBackups",
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "CleanupHsmOnFailure"
+        }
+      ],
+      "Next": "ChoosePreDeleteBaseline"
+    },
+    "ChoosePreDeleteBaseline": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.preDeleteBackups.Backups[0].BackupId",
+          "IsPresent": true,
+          "Next": "SetPreDeleteBaseline"
+        }
+      ],
+      "Default": "SetNoPreDeleteBaseline"
+    },
+    "SetPreDeleteBaseline": {
+      "Type": "Pass",
+      "Assign": {
+        "preDeleteBaselineId.$": "$.preDeleteBackups.Backups[0].BackupId"
+      },
+      "Next": "DeleteHsmForEscrow"
+    },
+    "SetNoPreDeleteBaseline": {
+      "Type": "Pass",
+      "Comment": "No backup existed before this run, so any READY backup afterwards is the one the deletion created.",
+      "Assign": {
+        "preDeleteBaselineId": "none"
+      },
+      "Next": "DeleteHsmForEscrow"
+    },
+    "DeleteHsmForEscrow": {
+      "Type": "Task",
+      "Comment": "DeleteHsm triggers the cluster backup in the CloudHSM backup lifecycle and drops billing to zero; the backup itself appears asynchronously and is polled below.",
       "Resource": "arn:aws:states:::aws-sdk:cloudhsmv2:deleteHsm",
       "Parameters": {
         "ClusterId": "${cluster_id}",
@@ -827,6 +932,10 @@
             {
               "Variable": "$.finalBackups.Backups[0].CreateTimestamp",
               "TimestampGreaterThanPath": "$.baseline.createdAt"
+            },
+            {
+              "Variable": "$.finalBackups.Backups[0].BackupId",
+              "StringNotEqualsPath": "$.preDeleteBaselineId"
             }
           ],
           "Next": "RecordVerifiedBackup"
@@ -889,7 +998,7 @@
     },
     "WaitForBackup": {
       "Type": "Wait",
-      "Seconds": 30,
+      "Seconds": 60,
       "Next": "IncrementBackupPoll"
     },
     "IncrementBackupPoll": {

@@ -64,7 +64,9 @@ case "$svc" in
     signed=${signed#file://}; trust=${trust#file://}
     [ -s "$signed" ] || { echo "stub: missing signed cluster certificate" >&2; exit 1; }
     [ -s "$trust" ]  || { echo "stub: missing trust anchor" >&2; exit 1; }
-    openssl verify -CAfile "$trust" "$signed" >/dev/null 2>&1 || {
+    # -no_check_time: the certificate was signed in this run; notBefore can be a
+    # second ahead of the clock, which a strict verify would reject.
+    openssl verify -no_check_time -CAfile "$trust" "$signed" >/dev/null 2>&1 || {
       echo "stub: signed cluster certificate does not chain to the trust anchor" >&2
       exit 1
     }

@@ -345,7 +345,8 @@ key list --filter attr.label=$ROOT_LABEL
 quit
 EOF
 )
-if printf '%s' "$EXISTING" | grep -q 'attr.label\|"label"'; then
+if printf '%s' "$EXISTING" \
+     | grep -Eq "\"label\"[[:space:]]*:[[:space:]]*\"$ROOT_LABEL\""; then
   die "a key labelled $ROOT_LABEL already exists in this cluster (restored backup); run mode=ROTATE_INTERMEDIATE instead of BOOTSTRAP"
 fi
 
@@ -436,6 +437,35 @@ install -m 700 /var/lib/cloud/instance/user-data.txt "$PKI_DIR/hsm_ceremony.sh"
 # backup must be requested while the HSM still holds the Root key. If this
 # fails the script dies without COMPLETE, which keeps the HSM alive.
 log "requesting the encrypted escrow backup"
+# --- 9. HSM token hygiene ---------------------------------------------------
+# The backup is restored into every future HSM, so it must contain exactly the
+# Root key pair and exactly two users. Temporary wrapping/session keys and stray
+# users are removed here; the Root pair is never touched.
+log "HSM hygiene: pruning temporary keys and stray users"
+KEY_LABELS=$(printf '%s\n' "$(hsm_cu "key list" 2>/dev/null || true)" \
+  | grep -o '"label"[[:space:]]*:[[:space:]]*"[^"]*"' \
+  | sed 's/.*"\([^"]*\)"$/\1/' | sort -u || true)
+for label in $KEY_LABELS; do
+  case "$label" in
+    temp-*|tmp-*|wrap-*|session-*)
+      log "  removing temporary key label=$label"
+      hsm_cu "key delete --filter attr.label=$label" >/dev/null 2>&1 \
+        || log "  could not delete $label (continuing)" ;;
+  esac
+done
+USERS=$(printf '%s\n' "$(hsm_admin "user list" 2>/dev/null || true)" \
+  | grep -o '"username"[[:space:]]*:[[:space:]]*"[^"]*"' \
+  | sed 's/.*"\([^"]*\)"$/\1/' | sort -u || true)
+for user in $USERS; do
+  case "$user" in
+    admin|"$CU_USER") ;;
+    *)
+      log "  removing stray HSM user $user"
+      hsm_admin "user delete --username $user" >/dev/null 2>&1 \
+        || log "  could not delete $user (continuing)" ;;
+  esac
+done
+
 # The escrow backup is created by CloudHSM itself when the HSM is deleted; the
 # workflow deletes the HSM and then waits for that backup to reach READY.
 

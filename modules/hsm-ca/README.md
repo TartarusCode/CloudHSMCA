@@ -84,11 +84,13 @@ Root key lives in a single HSM for the duration of the ceremony, and afterwards
 only in the encrypted cluster backup. That is cheaper by roughly two orders of
 magnitude (a ceremony hour instead of a 24×7 cluster), but it means: (a) a
 hardware failure during the ceremony loses that run's key, (b) the module cannot
-report success until a backup is `READY`, and AWS creates backups on cluster
-activation and HSM add/remove rather than on demand — there is no `CreateBackup`
-API — so the wait is bounded by `escrow_wait_minutes` (default 180) and fails
-closed on timeout. A cluster that must tolerate an HSM loss should run two or three
-HSMs and leave the quorum check enabled.
+report success until a backup is `READY`. `DeleteHsm` is the backup trigger in the
+CloudHSM lifecycle — deleting the HSM both drops billing to zero and makes the
+service write the encrypted cluster backup — so the workflow deletes immediately
+after the chain is verified published, then polls `DescribeBackups` every 60
+seconds up to `escrow_wait_minutes` (default 60) and fails closed on timeout. A
+cluster that must tolerate an HSM loss should run two or three HSMs and leave the
+quorum check enabled.
 
 **Unattended Step Functions automation instead of M-of-N quorum authentication.**
 The ceremony runs as one state machine with one execution role and generated
@@ -223,7 +225,7 @@ No modules.
 | <a name="input_cloudhsm_cli_rpm_sha256"></a> [cloudhsm\_cli\_rpm\_sha256](#input\_cloudhsm\_cli\_rpm\_sha256) | SHA-256 of the CloudHSM CLI RPM. Required: the ceremony verifies the download before installing a package that can reach the root key. | `string` | `""` | no |
 | <a name="input_commissioning_ca"></a> [commissioning\_ca](#input\_commissioning\_ca) | The separate, approved CA that claims a NEW CloudHSM cluster. Terraform<br/>creates clusters UNINITIALIZED; the ceremony must sign the cluster CSR and<br/>call InitializeCluster before it can activate the cluster. The private key<br/>never enters Terraform state: supply either an SSM SecureString parameter<br/>name holding it, or a pre-signed cluster certificate (fully offline mode).<br/>The certificate is public and is installed as the client's trust anchor. | <pre>object({<br/>    certificate                = string<br/>    key_ssm_param              = optional(string, "")<br/>    signed_cluster_certificate = optional(string, "")<br/>  })</pre> | <pre>{<br/>  "certificate": "",<br/>  "key_ssm_param": "",<br/>  "signed_cluster_certificate": ""<br/>}</pre> | no |
 | <a name="input_enable_bootstrap"></a> [enable\_bootstrap](#input\_enable\_bootstrap) | true  — this cluster has never been initialized, so publish the bootstrap<br/>        entrypoint, the admin password and the Root CA inputs.<br/>false — rotation only: the Root key is restored from the cluster backup, and<br/>        the admin password is not needed.<br/>Both entrypoints are always safe to publish; this flag only hides the ones a<br/>rotation must never use. | `bool` | `true` | no |
-| <a name="input_escrow_wait_minutes"></a> [escrow\_wait\_minutes](#input\_escrow\_wait\_minutes) | How long the workflow waits for the service-scheduled escrow backup to reach READY after the HSM is deleted. AWS CloudHSM has no API to force a backup; it is created on cluster activation, HSM add and HSM removal, and can take a while. | `number` | `180` | no |
+| <a name="input_escrow_wait_minutes"></a> [escrow\_wait\_minutes](#input\_escrow\_wait\_minutes) | Minutes the workflow waits for the deletion-triggered escrow backup to reach READY. DeleteHsm triggers the backup; it is polled every 60 seconds, so this is also the maximum number of polls. | `number` | `60` | no |
 | <a name="input_event_bus_name"></a> [event\_bus\_name](#input\_event\_bus\_name) | EventBridge bus the CAChainPublished event is emitted on. Consumers must subscribe to the same bus. | `string` | `"default"` | no |
 | <a name="input_hsm_crypto_user"></a> [hsm\_crypto\_user](#input\_hsm\_crypto\_user) | CloudHSM crypto user that owns the Root key. It survives in the backup, so rotation re-uses it. CloudHSM allows only letters, digits and underscore. | `string` | `"pki_cu"` | no |
 | <a name="input_intermediate_ca_validity_days"></a> [intermediate\_ca\_validity\_days](#input\_intermediate\_ca\_validity\_days) | Intermediate CA lifetime. Used by both bootstrap and rotation. | `number` | `1825` | no |
