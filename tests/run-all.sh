@@ -41,6 +41,7 @@ run() {
 }
 
 run "module (hsm-ca locals evaluated like plan)" bash "$HERE/module/smoke.sh" "$HsmCa"
+run "every IAM role honours permissions_boundary_arn" bash "$HERE/module/iam_boundary.sh"
 run "asl invariants (hsm-ca, no consumer coupling)" python3 "$HERE/asl_invariants.py" "$HsmCa"
 run "crypto (kms_ca_tool.py)" bash "$HERE/crypto/test_kms_ca_tool.sh" "$HsmCa"
 run "ceremony (hsm_ceremony.sh)" bash "$HERE/ceremony/run.sh" "$HsmCa"

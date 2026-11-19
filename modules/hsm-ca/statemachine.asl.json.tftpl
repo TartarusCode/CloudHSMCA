@@ -74,7 +74,7 @@
       "Comment": "A lease whose owner is no longer running is stale; a running owner means a genuine concurrent ceremony.",
       "Resource": "arn:aws:states:::aws-sdk:sfn:describeExecution",
       "Parameters": {
-        "executionArn.$": "$.lease.Item.owner_arn.S"
+        "ExecutionArn.$": "$.lease.Item.owner_arn.S"
       },
       "ResultPath": "$.leaseExecution",
       "Catch": [
@@ -187,7 +187,7 @@
     "SetBackupBaseline": {
       "Type": "Pass",
       "Parameters": {
-        "backupId.$": "$.backups.Backups[0].BackupId"
+        "createdAt.$": "$.backups.Backups[0].CreateTimestamp"
       },
       "ResultPath": "$.baseline",
       "Next": "ChooseMode"
@@ -195,7 +195,7 @@
     "SetNoBaseline": {
       "Type": "Pass",
       "Result": {
-        "backupId": ""
+        "createdAt": "1970-01-01T00:00:00Z"
       },
       "ResultPath": "$.baseline",
       "Next": "ChooseMode"
@@ -391,6 +391,14 @@
             {
               "Variable": "$.hsmState.Clusters[0].Hsms[0].State",
               "StringEquals": "ACTIVE"
+            },
+            {
+              "Variable": "$.hsmState.Clusters[0].Hsms[0].EniIp",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.hsmState.Clusters[0].Hsms[0].EniIp",
+              "StringMatches": "*.*.*.*"
             }
           ],
           "Next": "LaunchCeremonyHost"
@@ -569,7 +577,7 @@
         "TimeoutSeconds": 3600,
         "Parameters": {
           "executionTimeout": ["3600"],
-          "commands.$": "States.Array('set -euo pipefail', 'mkdir -p /opt/ceremony', States.Format('export CEREMONY_HSM_IP={}', $.hsm.Hsm.EniIp), 'export CEREMONY_MODE=BOOTSTRAP', States.Format('aws s3api get-object --bucket ${bucket} --key ${bootstrap_key} /opt/ceremony/bootstrap.sh'), 'bash /opt/ceremony/bootstrap.sh 2>&1 | tee -a /var/log/ceremony.log')"
+          "commands.$": "States.Array('set -euo pipefail', 'mkdir -p /opt/ceremony', States.Format('export CEREMONY_HSM_IP={}', $.hsmState.Clusters[0].Hsms[0].EniIp), 'export CEREMONY_MODE=BOOTSTRAP', States.Format('aws s3api get-object --bucket ${bucket} --key ${bootstrap_key} /opt/ceremony/bootstrap.sh'), 'bash /opt/ceremony/bootstrap.sh 2>&1 | tee -a /var/log/ceremony.log')"
         }
       },
       "ResultPath": "$.command",
@@ -594,7 +602,7 @@
         "TimeoutSeconds": 3600,
         "Parameters": {
           "executionTimeout": ["3600"],
-          "commands.$": "States.Array('set -euo pipefail', 'mkdir -p /opt/ceremony', States.Format('export CEREMONY_HSM_IP={}', $.hsm.Hsm.EniIp), 'export CEREMONY_MODE=ROTATE_INTERMEDIATE', States.Format('aws s3api get-object --bucket ${bucket} --key ${rotate_key} /opt/ceremony/rotate.sh'), 'bash /opt/ceremony/rotate.sh 2>&1 | tee -a /var/log/ceremony.log')"
+          "commands.$": "States.Array('set -euo pipefail', 'mkdir -p /opt/ceremony', States.Format('export CEREMONY_HSM_IP={}', $.hsmState.Clusters[0].Hsms[0].EniIp), 'export CEREMONY_MODE=ROTATE_INTERMEDIATE', States.Format('aws s3api get-object --bucket ${bucket} --key ${rotate_key} /opt/ceremony/rotate.sh'), 'bash /opt/ceremony/rotate.sh 2>&1 | tee -a /var/log/ceremony.log')"
         }
       },
       "ResultPath": "$.command",
@@ -618,9 +626,9 @@
       "ResultPath": "$.invocation",
       "Retry": [
         {
-          "ErrorEquals": ["SSM.InvocationNotFound"],
+          "ErrorEquals": ["Ssm.InvocationDoesNotExistException", "SSM.InvocationNotFound"],
           "IntervalSeconds": 5,
-          "MaxAttempts": 6,
+          "MaxAttempts": 12,
           "BackoffRate": 1.5
         }
       ],
@@ -694,7 +702,7 @@
     },
     "DeleteHsmAfterSuccess": {
       "Type": "Task",
-      "Comment": "Deleting the HSM is what stops the hourly billing, and it is the moment AWS takes the encrypted backup.",
+      "Comment": "Deleting the HSM stops the hourly billing and is what makes CloudHSM write the encrypted escrow backup. The backup appears several minutes later, so the workflow waits for it before reporting success.",
       "Resource": "arn:aws:states:::aws-sdk:cloudhsmv2:deleteHsm",
       "Parameters": {
         "ClusterId": "${cluster_id}",
@@ -709,6 +717,16 @@
         }
       ],
       "Next": "PollHsmGone"
+    },
+    "RecordHsmDeleteFailure": {
+      "Type": "Pass",
+      "Comment": "The escrow backup is already READY, so the key is safe; report the deletion failure without deleting anything else.",
+      "Parameters": {
+        "Error.$": "$.deleteHsmError.Error",
+        "Cause.$": "$.deleteHsmError.Cause"
+      },
+      "ResultPath": "$.error",
+      "Next": "CleanupHsmOnFailure"
     },
     "PollHsmGone": {
       "Type": "Task",
@@ -792,6 +810,10 @@
           "And": [
             {
               "Variable": "$.finalBackups.Backups[0].BackupState",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.finalBackups.Backups[0].BackupState",
               "StringEquals": "READY"
             },
             {
@@ -799,8 +821,12 @@
               "IsPresent": true
             },
             {
-              "Variable": "$.finalBackups.Backups[0].BackupId",
-              "StringNotEqualsPath": "$.baseline.backupId"
+              "Variable": "$.finalBackups.Backups[0].CreateTimestamp",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.finalBackups.Backups[0].CreateTimestamp",
+              "TimestampGreaterThanPath": "$.baseline.createdAt"
             }
           ],
           "Next": "RecordVerifiedBackup"
@@ -823,7 +849,7 @@
         {
           "ErrorEquals": ["States.ALL"],
           "ResultPath": "$.error",
-          "Next": "CleanupHsmOnFailure"
+          "Next": "CleanupHostOnFailure"
         }
       ],
       "Next": "TerminateHostAfterSuccess"
@@ -855,7 +881,7 @@
       "Choices": [
         {
           "Variable": "$backupPoll",
-          "NumericLessThan": 120,
+          "NumericLessThan": ${escrow_polls},
           "Next": "WaitForBackup"
         }
       ],
@@ -941,40 +967,8 @@
       "Type": "Succeed"
     },
     "CleanupHsmOnFailure": {
-      "Type": "Choice",
-      "Comment": "Single cleanup entry for every Catch. Neither cleanup step may overwrite $.error.",
-      "Choices": [
-        {
-          "Variable": "$.hsm.Hsm.HsmId",
-          "IsPresent": true,
-          "Next": "DeleteHsmOnFailure"
-        }
-      ],
-      "Default": "CleanupHostOnFailure"
-    },
-    "DeleteHsmOnFailure": {
-      "Type": "Task",
-      "Resource": "arn:aws:states:::aws-sdk:cloudhsmv2:deleteHsm",
-      "Parameters": {
-        "ClusterId": "${cluster_id}",
-        "HsmId.$": "$.hsm.Hsm.HsmId"
-      },
-      "ResultPath": "$.cleanupHsm",
-      "Retry": [
-        {
-          "ErrorEquals": ["States.ALL"],
-          "IntervalSeconds": 10,
-          "MaxAttempts": 3,
-          "BackoffRate": 2.0
-        }
-      ],
-      "Catch": [
-        {
-          "ErrorEquals": ["States.ALL"],
-          "ResultPath": "$.cleanupHsmError",
-          "Next": "CleanupHostOnFailure"
-        }
-      ],
+      "Type": "Pass",
+      "Comment": "Never delete the HSM on failure. It may hold the only copy of the Root key, and the backup is not proven until it is READY. Terminate the host, report, and delete the HSM only after a backup exists.",
       "Next": "CleanupHostOnFailure"
     },
     "CleanupHostOnFailure": {
@@ -1094,15 +1088,6 @@
       "ResultPath": "$.error",
       "Next": "CleanupHsmOnFailure"
     },
-    "RecordHsmDeleteFailure": {
-      "Type": "Pass",
-      "Parameters": {
-        "Error": "HsmDeleteFailed",
-        "Cause.$": "States.Format('could not delete HSM after a successful ceremony: {}', $.deleteHsmError.Cause)"
-      },
-      "ResultPath": "$.error",
-      "Next": "CleanupHsmOnFailure"
-    },
     "RecordTeardownFailure": {
       "Type": "Pass",
       "Parameters": {
@@ -1123,10 +1108,10 @@
     },
     "RecordBackupNotReady": {
       "Type": "Pass",
-      "Comment": "The HSM is already gone; only the privileged host still needs cleanup.",
+      "Comment": "The HSM is already deleted; without a backup the Root key is gone, so this must fail loudly rather than report success.",
       "Result": {
         "Error": "BackupNotReady",
-        "Cause": "The HSM is gone but no READY backup appeared within 60 minutes. The Root key is not escrowed: investigate before re-running."
+        "Cause": "The HSM was deleted but no READY escrow backup appeared within 60 minutes. The Root key may not be escrowed: check describe-backups before re-running."
       },
       "ResultPath": "$.error",
       "Next": "CleanupHostOnFailure"

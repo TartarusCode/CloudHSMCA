@@ -13,6 +13,10 @@
 # =============================================================================
 set -euo pipefail
 
+# SSM RunShellScript starts a bare shell with no HOME; `set -u` would abort.
+export HOME="$${HOME:-/root}"
+export PATH="$${PATH:-/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin}"
+
 readonly CONFIG_JSON=$(cat <<'ROTATE_JSON'
 ${rotate_config}
 ROTATE_JSON
@@ -43,7 +47,7 @@ SSM_ROOT=$(cfg ssm_root_ca_pem)
 SSM_INTER=$(cfg ssm_intermediate_pem)
 SSM_BUNDLE=$(cfg ssm_ca_bundle_pem)
 SSM_STATE=$(cfg ssm_ceremony_state)
-SSM_CU_PW=$(cfg ssm_cu_password)
+SECRET_CU=$(cfg secret_cu_password)
 S3_TOOL=$(cfg s3_kms_ca_tool)
 S3_INTER_CNF=$(cfg s3_intermediate_cnf)
 CU_USER=$(cfg cu_username)
@@ -66,7 +70,10 @@ mark_state() { aws ssm put-parameter --name "$SSM_STATE" --value "$1" --type Str
 mark_state IN_PROGRESS
 
 # --- tooling ---------------------------------------------------------------
-dnf install -y -q jq openssl ca-certificates curl tar gzip >/dev/null
+# AL2023 ships curl-minimal, which conflicts with the `curl` package; it
+# already provides the binary. python3.11 keeps uv from downloading a managed
+# interpreter over the network.
+dnf install -y -q jq openssl ca-certificates tar gzip python3.11 >/dev/null
 [ -n "$CLI_RPM_SHA256" ] && [ "$CLI_RPM_SHA256" != "null" ] \
   || { echo "cloudhsm_cli_rpm_sha256 is required: refusing to install an unverified CLI package"; exit 1; }
 curl -fsSL -o /tmp/cloudhsm-cli.rpm "$CLI_RPM"
@@ -79,6 +86,12 @@ dnf install -y -q /tmp/cloudhsm-cli.rpm >/dev/null
 # was rendered before the HSM existed.
 [ -n "$${CEREMONY_HSM_IP:-}" ] || { echo "CEREMONY_HSM_IP is required"; exit 1; }
 /opt/cloudhsm/bin/configure-cli -a "$CEREMONY_HSM_IP"
+HSM_COUNT=$(aws cloudhsmv2 describe-clusters --filters clusterIds="$CLUSTER_ID" \
+              --query 'length(Clusters[0].Hsms)' --output text 2>/dev/null || echo 1)
+if [ "$${HSM_COUNT:-1}" -lt 2 ]; then
+  log "cluster has $HSM_COUNT HSM(s): disabling the client key-availability quorum"
+  /opt/cloudhsm/bin/configure-cli --disable-key-availability-check
+fi
 # The client must trust the cluster's commissioning CA before any HSM TLS.
 [ -n "$COMMISSIONING_CA_CERT" ] && [ "$COMMISSIONING_CA_CERT" != "null" ] \
   || { echo "commissioning_ca.certificate is required to trust the HSM cluster"; exit 1; }
@@ -89,12 +102,16 @@ if systemctl cat cloudhsm-cli >/dev/null 2>&1; then
 fi
 
 if ! command -v uv >/dev/null 2>&1; then
-  curl -LsSf -o /tmp/uv-install.sh https://astral.sh/uv/install.sh
+  # The versioned installer URL pins the release; the floating URL installs latest.
+  curl -LsSf -o /tmp/uv-install.sh "https://astral.sh/uv/$UV_VERSION/install.sh"
   if [ -n "$UV_INSTALLER_SHA256" ] && [ "$UV_INSTALLER_SHA256" != "null" ]; then
     printf '%s  %s\n' "$UV_INSTALLER_SHA256" /tmp/uv-install.sh | sha256sum -c - \
       || { echo "uv installer checksum mismatch"; exit 1; }
   fi
-  UV_VERSION="$UV_VERSION" sh /tmp/uv-install.sh >/dev/null
+  sh /tmp/uv-install.sh >/dev/null
+  HAVE_UV=$(uv --version | awk '{print $2}')
+  [ "$HAVE_UV" = "$UV_VERSION" ] \
+    || die "uv $HAVE_UV is installed but uv_version pins $UV_VERSION"
 fi
 uv venv --python 3.11 "$VENV" >/dev/null
 uv pip install --python "$VENV/bin/python" "cryptography>=42" "boto3>=1.34" >/dev/null
@@ -111,7 +128,7 @@ s3get "$S3_INTER_CNF" "$PKI_DIR/intermediate_ca.cnf" "$S3_INTER_CNF_VERSION"
 chmod 700 "$PKI_DIR/kms_ca_tool.py"
 
 # --- inputs ----------------------------------------------------------------
-CU_PW=$(aws ssm get-parameter --name "$SSM_CU_PW" --with-decryption --query Parameter.Value --output text)
+CU_PW=$(aws secretsmanager get-secret-value --secret-id "$SECRET_CU" --query SecretString --output text)
 ROOT_PEM=$(aws ssm get-parameter --name "$SSM_ROOT" --query Parameter.Value --output text)
 case "$ROOT_PEM" in
   *"BEGIN CERTIFICATE"*) ;;

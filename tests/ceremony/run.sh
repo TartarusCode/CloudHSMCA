@@ -94,12 +94,12 @@ cfg = {
     "ssm_intermediate_pem": "/corp-pki/pki/intermediate_ca.pem",
     "ssm_ca_bundle_pem": "/corp-pki/pki/ca_bundle.pem",
     "ssm_ceremony_state": "/corp-pki/pki/ceremony/state",
-    "ssm_admin_password": "/corp-pki/pki/ceremony/hsm-admin-password",
-    "ssm_cu_password": "/corp-pki/pki/ceremony/hsm-cu-password",
+    "secret_admin_password": "arn:aws:secretsmanager:us-east-1:111122223333:secret:corp-pki-ceremony-hsm-admin",
+    "secret_cu_password": "arn:aws:secretsmanager:us-east-1:111122223333:secret:corp-pki-ceremony-hsm-cu",
     "s3_kms_ca_tool": "scripts/kms_ca_tool.py",
     "s3_root_ca_cnf": "scripts/root_ca.cnf",
     "s3_intermediate_cnf": "scripts/intermediate_ca.cnf",
-    "cu_username": "pki-cu", "cloudhsm_cli_rpm": "https://example/rpm",
+    "cu_username": "pki_cu", "cloudhsm_cli_rpm": "https://example/rpm",
     "commissioning_ca_cert": open(os.path.join(os.environ["STUB_DIR"], "commissioning-ca.pem")).read(),
     "commissioning_key_ssm_param": "/corp-pki/pki/ceremony/commissioning-key",
     "commissioning_signed_cert": "",
@@ -273,7 +273,7 @@ if HSM_STUB_UNINITIALIZED=1 bash "$STUB/ceremony-badhash.sh" > "$HARNESS/badhash
 fi
 grep -q "CloudHSM CLI RPM checksum mismatch" "$HARNESS/badhash.log" \
   || { echo "FAIL: the checksum mismatch was not reported" >&2; tail -10 "$HARNESS/badhash.log" >&2; exit 1; }
-if grep -q "get-parameter .*hsm-admin-password" "$STUB/aws.log"; then
+if grep -q "secretsmanager get-secret-value .*hsm-admin" "$STUB/aws.log"; then
   echo "FAIL: the ceremony read the admin password before verifying the CLI package" >&2
   exit 1
 fi

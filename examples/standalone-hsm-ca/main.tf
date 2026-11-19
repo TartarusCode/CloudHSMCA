@@ -18,7 +18,7 @@
 # The leaf issuance tool is in the module: scripts/kms_ca_tool.py sign-leaf-csr.
 
 terraform {
-  required_version = ">= 1.6.0"
+  required_version = ">= 1.9.0"
 
   required_providers {
     aws = {

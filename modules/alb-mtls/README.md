@@ -97,8 +97,8 @@ Anywhere equivalents for $0.
 ## Requirements
 
 | Name | Version |
-|------|---------|
-| <a name="requirement_terraform"></a> [terraform](#requirement\_terraform) | >= 1.6.0 |
+| ---- | ------- |
+| <a name="requirement_terraform"></a> [terraform](#requirement\_terraform) | >= 1.9.0 |
 | <a name="requirement_archive"></a> [archive](#requirement\_archive) | >= 2.4.0 |
 | <a name="requirement_aws"></a> [aws](#requirement\_aws) | >= 5.67.0, < 7.0.0 |
 | <a name="requirement_tls"></a> [tls](#requirement\_tls) | >= 4.0.0 |
@@ -106,10 +106,9 @@ Anywhere equivalents for $0.
 ## Providers
 
 | Name | Version |
-|------|---------|
+| ---- | ------- |
 | <a name="provider_archive"></a> [archive](#provider\_archive) | 2.8.1 |
 | <a name="provider_aws"></a> [aws](#provider\_aws) | 6.73.0 |
-| <a name="provider_tls"></a> [tls](#provider\_tls) | 4.4.2 |
 
 ## Modules
 
@@ -118,7 +117,7 @@ No modules.
 ## Resources
 
 | Name | Type |
-|------|------|
+| ---- | ---- |
 | [aws_cloudwatch_event_rule.ca_chain_published](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/cloudwatch_event_rule) | resource |
 | [aws_cloudwatch_event_rule.crl_refresh](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/cloudwatch_event_rule) | resource |
 | [aws_cloudwatch_event_target.ca_chain_published](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/cloudwatch_event_target) | resource |
@@ -131,8 +130,6 @@ No modules.
 | [aws_lambda_permission.crl_refresh](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/lambda_permission) | resource |
 | [aws_lb_trust_store.this](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/lb_trust_store) | resource |
 | [aws_s3_object.placeholder_bundle](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/s3_object) | resource |
-| [tls_private_key.placeholder](https://registry.terraform.io/providers/hashicorp/tls/latest/docs/resources/private_key) | resource |
-| [tls_self_signed_cert.placeholder](https://registry.terraform.io/providers/hashicorp/tls/latest/docs/resources/self_signed_cert) | resource |
 | [archive_file.sync](https://registry.terraform.io/providers/hashicorp/archive/latest/docs/data-sources/file) | data source |
 | [aws_iam_policy_document.sync](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/data-sources/iam_policy_document) | data source |
 | [aws_iam_policy_document.sync_assume](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/data-sources/iam_policy_document) | data source |
@@ -140,12 +137,14 @@ No modules.
 ## Inputs
 
 | Name | Description | Type | Default | Required |
-|------|-------------|------|---------|:--------:|
-| <a name="input_ca_contract"></a> [ca\_contract](#input\_ca\_contract) | The ca\_contract output of modules/hsm-ca: ARNs, SSM parameter names, artifact bucket, signing algorithm and event contract. | <pre>object({<br>    name       = string<br>    region     = string<br>    account_id = string<br>    partition  = string<br><br>    cluster_id                 = string<br>    artifacts_bucket           = string<br>    artifacts_bucket_arn       = string<br>    intermediate_kms_key_arn   = string<br>    intermediate_kms_key_alias = string<br>    intermediate_key_spec      = string<br>    signing_algorithm          = string<br><br>    root_ca_ssm_param         = string<br>    intermediate_ca_ssm_param = string<br>    ca_bundle_ssm_param       = string<br>    ceremony_state_ssm_param  = string<br><br>    event_bus_name    = string<br>    event_source      = string<br>    event_detail_type = string<br><br>    state_machine_arn = string<br>    log_group_name    = string<br>  })</pre> | n/a | yes |
+| ---- | ----------- | ---- | ------- | :------: |
+| <a name="input_ca_contract"></a> [ca\_contract](#input\_ca\_contract) | The ca\_contract output of modules/hsm-ca: ARNs, SSM parameter names, artifact bucket, signing algorithm and event contract. | <pre>object({<br/>    name       = string<br/>    region     = string<br/>    account_id = string<br/>    partition  = string<br/><br/>    cluster_id                 = string<br/>    artifacts_bucket           = string<br/>    artifacts_bucket_arn       = string<br/>    intermediate_kms_key_arn   = string<br/>    intermediate_kms_key_alias = string<br/>    intermediate_key_spec      = string<br/>    signing_algorithm          = string<br/><br/>    root_ca_ssm_param         = string<br/>    intermediate_ca_ssm_param = string<br/>    ca_bundle_ssm_param       = string<br/>    ceremony_state_ssm_param  = string<br/><br/>    event_bus_name    = string<br/>    event_source      = string<br/>    event_detail_type = string<br/><br/>    state_machine_arn = string<br/>    log_group_name    = string<br/>  })</pre> | n/a | yes |
 | <a name="input_crl_validity_days"></a> [crl\_validity\_days](#input\_crl\_validity\_days) | thisUpdate -> nextUpdate window of every generated CRL. Must exceed the refresh cadence comfortably. | `number` | `7` | no |
 | <a name="input_log_retention_days"></a> [log\_retention\_days](#input\_log\_retention\_days) | Retention for the sync Lambda's log group. | `number` | `365` | no |
 | <a name="input_name"></a> [name](#input\_name) | Short name for this trust store's S3 prefix (alb-mtls/<name>/). Empty = the CA's name. | `string` | `""` | no |
-| <a name="input_revoked_serials_ssm_param"></a> [revoked\_serials\_ssm\_param](#input\_revoked\_serials\_ssm\_param) | Optional SSM override for revoked serials. Empty = read the shared S3 revocation object; an explicit {"revoked": []} clears serials; a configured but missing or invalid source fails closed. | `string` | `""` | no |
+| <a name="input_permissions_boundary_arn"></a> [permissions\_boundary\_arn](#input\_permissions\_boundary\_arn) | Optional IAM permissions boundary ARN attached to every role this module creates. Null leaves roles unbounded. | `string` | `null` | no |
+| <a name="input_revocations_s3_key"></a> [revocations\_s3\_key](#input\_revocations\_s3\_key) | S3 key inside the CA artifact bucket holding the revocation JSON shared with the Roles Anywhere consumer. | `string` | `"revocations/revoked.json"` | no |
+| <a name="input_revoked_serials_ssm_param"></a> [revoked\_serials\_ssm\_param](#input\_revoked\_serials\_ssm\_param) | Optional SSM parameter holding revoked serials as JSON. Empty = read the shared S3 revocation object instead. An explicit {"revoked": []} clears serials; a configured but missing or invalid parameter fails closed. | `string` | `""` | no |
 | <a name="input_sync_schedule"></a> [sync\_schedule](#input\_sync\_schedule) | EventBridge schedule expression for the routine CRL rotation. | `string` | `"rate(24 hours)"` | no |
 | <a name="input_tags"></a> [tags](#input\_tags) | Tags applied to every taggable resource. `Module = "cloudhsmca"` is always added. | `map(string)` | `{}` | no |
 | <a name="input_trust_store_name"></a> [trust\_store\_name](#input\_trust\_store\_name) | Explicit ELBv2 trust store name (max 32 chars, alphanumeric and hyphens). Empty = <ca\_name>-alb-mtls. | `string` | `""` | no |
@@ -153,7 +152,7 @@ No modules.
 ## Outputs
 
 | Name | Description |
-|------|-------------|
+| ---- | ----------- |
 | <a name="output_activation_rule_name"></a> [activation\_rule\_name](#output\_activation\_rule\_name) | EventBridge rule that fans CAChainPublished into this consumer. |
 | <a name="output_bundle_s3_uri"></a> [bundle\_s3\_uri](#output\_bundle\_s3\_uri) | Where the active CA bundle lives (the Lambda keeps it current). |
 | <a name="output_crl_refresh_rule_name"></a> [crl\_refresh\_rule\_name](#output\_crl\_refresh\_rule\_name) | EventBridge rule for the routine CRL rotation. |

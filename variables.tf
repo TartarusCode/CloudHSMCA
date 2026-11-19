@@ -123,9 +123,9 @@ variable "ceremony_instance_type" {
 }
 
 variable "hsm_crypto_user" {
-  description = "CloudHSM crypto user that owns the Root key."
+  description = "CloudHSM crypto user that owns the Root key. Letters, digits and underscore only, per CloudHSM."
   type        = string
-  default     = "pki-cu"
+  default     = "pki_cu"
 }
 
 variable "cloudhsm_cli_rpm" {
@@ -282,4 +282,48 @@ variable "alb_revoked_serials_ssm_param" {
   description = "SSM parameter holding revoked serials as JSON for the ALB CRL. Empty = do not rotate the CRL; set to a parameter containing {\"revoked\": []} to explicitly clear serials. A configured but missing or invalid parameter fails closed."
   type        = string
   default     = ""
+}
+
+variable "permissions_boundary_arn" {
+  description = "Optional IAM permissions boundary ARN attached to every role this module creates. Null leaves roles unbounded."
+  type        = string
+  default     = null
+
+  validation {
+    condition     = var.permissions_boundary_arn == null || can(regex("^arn:aws[a-zA-Z-]*:iam::[0-9]{12}:policy/.+$", var.permissions_boundary_arn))
+    error_message = "permissions_boundary_arn must be an IAM policy ARN."
+  }
+}
+variable "escrow_wait_minutes" {
+  description = "Minutes the ceremony workflow waits for the escrow backup to reach READY after the HSM is deleted. CloudHSM creates it asynchronously; there is no API to force one."
+  type        = number
+  default     = 180
+
+  validation {
+    condition     = var.escrow_wait_minutes >= 1 && var.escrow_wait_minutes <= 1440
+    error_message = "escrow_wait_minutes must be between 1 and 1440 (24 hours)."
+  }
+}
+
+variable "backup_retention_days" {
+  description = "Days CloudHSM keeps cluster backups. The escrow backup is the only copy of the Root key once the ephemeral HSM is deleted."
+  type        = number
+  default     = 90
+
+  validation {
+    condition     = var.backup_retention_days >= 7 && var.backup_retention_days <= 379
+    error_message = "backup_retention_days must be between 7 and 379."
+  }
+}
+
+variable "audit_log_retention_days" {
+  description = "Retention for the CloudHSM audit log group /aws/cloudhsm/<cluster-id>."
+  type        = number
+  default     = 90
+
+  validation {
+    condition = contains([1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545,
+    731, 1096, 1827, 2192, 2557, 2922, 3288, 3653], var.audit_log_retention_days)
+    error_message = "audit_log_retention_days must be a retention value CloudWatch Logs accepts."
+  }
 }

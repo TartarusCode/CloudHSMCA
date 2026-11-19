@@ -87,8 +87,8 @@ script and the tested script ever diverge.
 ## Requirements
 
 | Name | Version |
-|------|---------|
-| <a name="requirement_terraform"></a> [terraform](#requirement\_terraform) | >= 1.6.0 |
+| ---- | ------- |
+| <a name="requirement_terraform"></a> [terraform](#requirement\_terraform) | >= 1.9.0 |
 | <a name="requirement_archive"></a> [archive](#requirement\_archive) | >= 2.4.0 |
 | <a name="requirement_aws"></a> [aws](#requirement\_aws) | >= 5.67.0, < 7.0.0 |
 | <a name="requirement_tls"></a> [tls](#requirement\_tls) | >= 4.0.0 |
@@ -96,7 +96,7 @@ script and the tested script ever diverge.
 ## Providers
 
 | Name | Version |
-|------|---------|
+| ---- | ------- |
 | <a name="provider_archive"></a> [archive](#provider\_archive) | 2.8.1 |
 | <a name="provider_aws"></a> [aws](#provider\_aws) | 6.73.0 |
 | <a name="provider_tls"></a> [tls](#provider\_tls) | 4.4.2 |
@@ -108,7 +108,7 @@ No modules.
 ## Resources
 
 | Name | Type |
-|------|------|
+| ---- | ---- |
 | [aws_cloudwatch_event_rule.ca_chain_published](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/cloudwatch_event_rule) | resource |
 | [aws_cloudwatch_event_rule.crl_refresh](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/cloudwatch_event_rule) | resource |
 | [aws_cloudwatch_event_target.ca_chain_published](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/cloudwatch_event_target) | resource |
@@ -123,6 +123,7 @@ No modules.
 | [aws_lambda_permission.crl_refresh](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/lambda_permission) | resource |
 | [aws_rolesanywhere_profile.this](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/rolesanywhere_profile) | resource |
 | [aws_rolesanywhere_trust_anchor.this](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/rolesanywhere_trust_anchor) | resource |
+| [aws_s3_object.revocations](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/s3_object) | resource |
 | [tls_private_key.placeholder](https://registry.terraform.io/providers/hashicorp/tls/latest/docs/resources/private_key) | resource |
 | [tls_self_signed_cert.placeholder](https://registry.terraform.io/providers/hashicorp/tls/latest/docs/resources/self_signed_cert) | resource |
 | [archive_file.crl_issuer](https://registry.terraform.io/providers/hashicorp/archive/latest/docs/data-sources/file) | data source |
@@ -133,19 +134,20 @@ No modules.
 ## Inputs
 
 | Name | Description | Type | Default | Required |
-|------|-------------|------|---------|:--------:|
-| <a name="input_ca_contract"></a> [ca\_contract](#input\_ca\_contract) | The ca\_contract output of modules/hsm-ca: ARNs, SSM parameter names, artifact bucket, signing algorithm and event contract. | <pre>object({<br>    name       = string<br>    region     = string<br>    account_id = string<br>    partition  = string<br><br>    cluster_id                 = string<br>    artifacts_bucket           = string<br>    artifacts_bucket_arn       = string<br>    intermediate_kms_key_arn   = string<br>    intermediate_kms_key_alias = string<br>    intermediate_key_spec      = string<br>    signing_algorithm          = string<br><br>    root_ca_ssm_param         = string<br>    intermediate_ca_ssm_param = string<br>    ca_bundle_ssm_param       = string<br>    ceremony_state_ssm_param  = string<br><br>    event_bus_name    = string<br>    event_source      = string<br>    event_detail_type = string<br><br>    state_machine_arn = string<br>    log_group_name    = string<br>  })</pre> | n/a | yes |
+| ---- | ----------- | ---- | ------- | :------: |
+| <a name="input_ca_contract"></a> [ca\_contract](#input\_ca\_contract) | The ca\_contract output of modules/hsm-ca: ARNs, SSM parameter names, artifact bucket, signing algorithm and event contract. | <pre>object({<br/>    name       = string<br/>    region     = string<br/>    account_id = string<br/>    partition  = string<br/><br/>    cluster_id                 = string<br/>    artifacts_bucket           = string<br/>    artifacts_bucket_arn       = string<br/>    intermediate_kms_key_arn   = string<br/>    intermediate_kms_key_alias = string<br/>    intermediate_key_spec      = string<br/>    signing_algorithm          = string<br/><br/>    root_ca_ssm_param         = string<br/>    intermediate_ca_ssm_param = string<br/>    ca_bundle_ssm_param       = string<br/>    ceremony_state_ssm_param  = string<br/><br/>    event_bus_name    = string<br/>    event_source      = string<br/>    event_detail_type = string<br/><br/>    state_machine_arn = string<br/>    log_group_name    = string<br/>  })</pre> | n/a | yes |
 | <a name="input_crl_refresh_schedule"></a> [crl\_refresh\_schedule](#input\_crl\_refresh\_schedule) | EventBridge schedule expression for the routine CRL refresh. | `string` | `"rate(24 hours)"` | no |
 | <a name="input_crl_validity_days"></a> [crl\_validity\_days](#input\_crl\_validity\_days) | thisUpdate -> nextUpdate window of every generated CRL. Must exceed the 24h refresh cadence. | `number` | `7` | no |
 | <a name="input_log_retention_days"></a> [log\_retention\_days](#input\_log\_retention\_days) | Retention for the Lambda's log group. | `number` | `365` | no |
+| <a name="input_permissions_boundary_arn"></a> [permissions\_boundary\_arn](#input\_permissions\_boundary\_arn) | Optional IAM permissions boundary ARN attached to every role this module creates. Null leaves roles unbounded. | `string` | `null` | no |
 | <a name="input_revocations_s3_key"></a> [revocations\_s3\_key](#input\_revocations\_s3\_key) | S3 key inside the CA artifact bucket holding the revoked-serial JSON the Lambda reads. | `string` | `"revocations/revoked.json"` | no |
 | <a name="input_tags"></a> [tags](#input\_tags) | Tags applied to every taggable resource. `Module = "cloudhsmca"` is always added. | `map(string)` | `{}` | no |
-| <a name="input_workload_profiles"></a> [workload\_profiles](#input\_workload\_profiles) | One Roles Anywhere profile + IAM role per workload class, keyed by a short<br>stable name. allowed\_subject\_ou / allowed\_subject\_cn become conditions on<br>aws:PrincipalTag/x509Subject/OU and /CN. | <pre>map(object({<br>    description                = optional(string, "Managed by cloudhsmca")<br>    session_duration_seconds   = optional(number, 3600)<br>    role_max_session_duration  = optional(number)<br>    managed_policy_arns        = optional(list(string), [])<br>    session_policy_json        = optional(string)<br>    accept_role_session_name   = optional(bool, true)<br>    subject_condition_operator = optional(string, "StringEquals")<br>    allowed_subject_ou         = optional(string)<br>    allowed_subject_cn         = optional(string)<br>    tags                       = optional(map(string), {})<br>  }))</pre> | `{}` | no |
+| <a name="input_workload_profiles"></a> [workload\_profiles](#input\_workload\_profiles) | One Roles Anywhere profile + IAM role per workload class, keyed by a short<br/>stable name. allowed\_subject\_ou / allowed\_subject\_cn become conditions on<br/>aws:PrincipalTag/x509Subject/OU and /CN. | <pre>map(object({<br/>    description              = optional(string, "Managed by cloudhsmca")<br/>    session_duration_seconds = optional(number, 3600)<br/>    # IAM roles have a 3600 s floor; Roles Anywhere profiles accept 900 s.<br/>    # Leave null to floor the role automatically, or set an explicit ceiling.<br/>    role_max_session_duration  = optional(number)<br/>    managed_policy_arns        = optional(list(string), [])<br/>    session_policy_json        = optional(string)<br/>    accept_role_session_name   = optional(bool, true)<br/>    subject_condition_operator = optional(string, "StringEquals")<br/>    allowed_subject_ou         = optional(string)<br/>    allowed_subject_cn         = optional(string)<br/>    tags                       = optional(map(string), {})<br/>  }))</pre> | `{}` | no |
 
 ## Outputs
 
 | Name | Description |
-|------|-------------|
+| ---- | ----------- |
 | <a name="output_activation_rule_name"></a> [activation\_rule\_name](#output\_activation\_rule\_name) | EventBridge rule that fans CAChainPublished into this consumer. |
 | <a name="output_crl_issuer_function_name"></a> [crl\_issuer\_function\_name](#output\_crl\_issuer\_function\_name) | Activation + CRL refresh Lambda (invoke manually with `aws lambda invoke --payload '{"reason":"manual"}'`). |
 | <a name="output_crl_issuer_role_arn"></a> [crl\_issuer\_role\_arn](#output\_crl\_issuer\_role\_arn) | Role that installs the chain and signs CRLs. The core key policy must list this exact ARN in allowed\_kms\_signer\_role\_arns. |

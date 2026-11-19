@@ -578,10 +578,11 @@ data "aws_iam_policy_document" "sync_assume" {
 }
 
 resource "aws_iam_role" "sync" {
-  name               = local.sync_lambda_name
-  description        = "Keeps the ${local.trust_store_name} trust store and its CRL in step with the CA"
-  assume_role_policy = data.aws_iam_policy_document.sync_assume.json
-  tags               = local.tags
+  name                 = local.sync_lambda_name
+  description          = "Keeps the ${local.trust_store_name} trust store and its CRL in step with the CA"
+  assume_role_policy   = data.aws_iam_policy_document.sync_assume.json
+  permissions_boundary = var.permissions_boundary_arn
+  tags                 = local.tags
 }
 
 data "aws_iam_policy_document" "sync" {

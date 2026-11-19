@@ -145,6 +145,7 @@ resource "aws_iam_role" "workload" {
   description          = each.value.description
   assume_role_policy   = data.aws_iam_policy_document.workload_assume[each.key].json
   max_session_duration = coalesce(each.value.role_max_session_duration, max(3600, each.value.session_duration_seconds))
+  permissions_boundary = var.permissions_boundary_arn
   tags                 = merge(local.tags, each.value.tags, { Workload = each.key })
 }
 

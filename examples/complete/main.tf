@@ -12,7 +12,7 @@
 # it, and proves a READY backup escrows the Root key before it reports success.
 
 terraform {
-  required_version = ">= 1.6.0"
+  required_version = ">= 1.9.0"
 
   required_providers {
     aws = {

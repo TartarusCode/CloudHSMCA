@@ -24,6 +24,10 @@
 #
 # This MUTATES the stack: three SSM parameters, one trust anchor, one CRL. Run it
 # against a sandbox, and restore afterwards.
+#
+# --teardown --confirm-sandbox destroys the sandbox cleanly: the Intermediate CA
+# key carries prevent_destroy, so it is removed from state and scheduled for
+# deletion (7-day window) before `terraform destroy` runs on the rest.
 # =============================================================================
 set -euo pipefail
 
@@ -34,6 +38,7 @@ REGION="${AWS_REGION:-${AWS_DEFAULT_REGION:-}}"
 TIMEOUT=60
 RESTORE=0
 CONFIRM_SANDBOX=0
+TEARDOWN=0
 STACK_DIR=""
 SNAPSHOT=""
 # Where the Roles Anywhere consumer reads revoked serials from. The module's
@@ -51,6 +56,7 @@ fail() { printf '[verify] FAIL: %s\n' "$*" >&2; exit 1; }
 while [ $# -gt 0 ]; do
   case "$1" in
     --restore-pending) RESTORE=1 ;;
+    --teardown) TEARDOWN=1 ;;
     --confirm-sandbox) CONFIRM_SANDBOX=1 ;;
     --timeout) TIMEOUT="${2:?--timeout needs a number}"; shift ;;
     --region) REGION="${2:?--region needs a value}"; shift ;;
@@ -68,6 +74,77 @@ SNAPSHOT="$STACK_DIR/.verify-live-snapshot.json"
 command -v terraform >/dev/null || fail "terraform is required"
 command -v aws >/dev/null || fail "the AWS CLI is required"
 command -v python3 >/dev/null || fail "python3 is required"
+
+# --- sandbox teardown --------------------------------------------------------
+# The Intermediate CA key is immutable and carries prevent_destroy, so a plain
+# `terraform destroy` stops on it and leaves the stack half-torn-down. The clean
+# two-step sandbox path is: drop the key from state, schedule its deletion with a
+# 7-day window, then destroy everything else.
+if [ "$TEARDOWN" = 1 ]; then
+  [ -n "$REGION" ] || fail "--teardown needs --region or AWS_REGION"
+  [ "$CONFIRM_SANDBOX" = 1 ] || fail "--teardown destroys the stack: pass --confirm-sandbox"
+  KEY_ADDR=$(terraform -chdir="$STACK_DIR" state list 2>/dev/null \
+             | grep -E '\.aws_kms_key\.intermediate_ca$' | head -1 || true)
+  [ -n "$KEY_ADDR" ] || fail "no aws_kms_key.intermediate_ca in $STACK_DIR state"
+  KMS_ARN=$(terraform -chdir="$STACK_DIR" state pull | python3 -c '
+import json, sys
+state = json.load(sys.stdin)
+for res in state.get("resources", []):
+    if res.get("type") == "aws_kms_key" and res.get("name") == "intermediate_ca":
+        print(res["instances"][0]["attributes"]["arn"])
+        break
+')
+  [ -n "$KMS_ARN" ] || fail "could not read the KMS key ARN from state"
+  log "1/3 removing $KEY_ADDR from state (prevent_destroy blocks destroy)"
+  terraform -chdir="$STACK_DIR" state rm "$KEY_ADDR"
+  log "2/3 scheduling deletion of $KMS_ARN (7-day window)"
+  aws kms schedule-key-deletion --region "$REGION" --key-id "$KMS_ARN" \
+    --pending-window-in-days 7 >/dev/null
+  key_state=$(aws kms describe-key --region "$REGION" --key-id "$KMS_ARN" \
+              --query KeyMetadata.KeyState --output text)
+  [ "$key_state" = "PendingDeletion" ] \
+    || fail "the KMS key is $key_state, expected PendingDeletion"
+  log "3/4 purging object versions (governance object lock blocks a plain delete)"
+  BUCKET=$(terraform -chdir="$STACK_DIR" state pull | python3 -c '
+import json, sys
+state = json.load(sys.stdin)
+for res in state.get("resources", []):
+    if res.get("type") == "aws_s3_bucket" and res.get("name") == "artifacts":
+        print(res["instances"][0]["attributes"]["bucket"])
+        break
+')
+  if [ -n "$BUCKET" ]; then
+    python3 - "$BUCKET" "$REGION" <<'PY'
+import json, subprocess, sys
+bucket, region = sys.argv[1], sys.argv[2]
+def aws(*args):
+    return subprocess.run(["aws", "s3api", *args, "--region", region],
+                          capture_output=True, text=True)
+while True:
+    listed = aws("list-object-versions", "--bucket", bucket,
+                 "--max-items", "500", "--output", "json")
+    if listed.returncode != 0:
+        sys.exit("cannot list %s: %s" % (bucket, listed.stderr.strip()))
+    doc = json.loads(listed.stdout or "{}")
+    objs = [{"Key": o["Key"], "VersionId": o["VersionId"]}
+            for o in doc.get("Versions", []) + doc.get("DeleteMarkers", [])]
+    if not objs:
+        break
+    deleted = aws("delete-objects", "--bucket", bucket,
+                  "--delete", json.dumps({"Objects": objs, "Quiet": True}),
+                  "--bypass-governance-retention")
+    if deleted.returncode != 0:
+        sys.exit("cannot purge %s: %s" % (bucket, deleted.stderr.strip()))
+print("purged %s" % bucket)
+PY
+  else
+    log "no artifacts bucket in state; skipping the purge"
+  fi
+  log "4/4 destroying the rest of the stack"
+  terraform -chdir="$STACK_DIR" destroy -auto-approve -input=false
+  log "teardown complete: the KMS key is PendingDeletion, everything else is gone"
+  exit 0
+fi
 command -v openssl >/dev/null || fail "openssl is required"
 [ -f "$TOOL" ] || fail "missing $TOOL"
 

@@ -28,6 +28,11 @@
 # =============================================================================
 set -euo pipefail
 
+# SSM RunShellScript starts a bare shell: HOME is unset, so `set -u` aborts on
+# the first $HOME use. Default it and a sane PATH before anything else.
+export HOME="$${HOME:-/root}"
+export PATH="$${PATH:-/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin}"
+
 # --- facts injected by Terraform --------------------------------------------
 readonly CONFIG_JSON=$(cat <<'CEREMONY_JSON'
 ${ceremony_config}
@@ -66,8 +71,8 @@ SSM_ROOT=$(cfg ssm_root_ca_pem)
 SSM_INTER=$(cfg ssm_intermediate_pem)
 SSM_BUNDLE=$(cfg ssm_ca_bundle_pem)
 SSM_STATE=$(cfg ssm_ceremony_state)
-SSM_ADMIN_PW=$(cfg ssm_admin_password)
-SSM_CU_PW=$(cfg ssm_cu_password)
+SECRET_ADMIN=$(cfg secret_admin_password)
+SECRET_CU=$(cfg secret_cu_password)
 S3_TOOL=$(cfg s3_kms_ca_tool)
 S3_ROOT_CNF=$(cfg s3_root_ca_cnf)
 S3_INTER_CNF=$(cfg s3_intermediate_cnf)
@@ -93,7 +98,14 @@ export PYTHONUNBUFFERED=1
 mark_state() { aws ssm put-parameter --name "$SSM_STATE" --value "$1" \
                  --type String --overwrite >/dev/null 2>&1 || true; }
 
+# HSM user passwords: Secrets Manager, scoped to the two secret ARNs.
 get_secret() {
+  aws secretsmanager get-secret-value --secret-id "$1" \
+    --query SecretString --output text
+}
+
+# Non-password material (the commissioning signing key) stays a SecureString.
+get_ssm_secret() {
   aws ssm get-parameter --name "$1" --with-decryption \
     --query Parameter.Value --output text
 }
@@ -106,8 +118,28 @@ pick_json() {
 
 # Run one command in cloudhsm-cli interactive mode as the given role.
 hsm_as() { # hsm_as <role> <user> <password> <command>
-  printf 'login --username %s --role %s --password %s\n%s\nquit\n' \
-    "$2" "$1" "$3" "$4" | "$CLI" interactive 2>&1
+  local out="" attempt
+  for attempt in 1 2 3; do
+    # --password= form: a generated password may start with '-' and would
+    # otherwise be parsed as a flag by the CLI's argument parser.
+    # Every session also logs out explicitly: the admin (CO) session that
+    # creates the crypto user must not stay open while keys are generated.
+    out=$(printf 'login --username %s --role %s --password=%s\n%s\nlogout\nquit\n' \
+            "$2" "$1" "$3" "$4" | "$CLI" interactive 2>&1)
+    # Retry only transport failures. Retrying a key generation would create a
+    # second key, so anything else is returned as-is.
+    case "$out" in
+      *"Unable to connect"*|*"Connection refused"*|*"connection timed out"*|*"transport error"*)
+        if [ "$attempt" -lt 3 ]; then
+          log "cloudhsm-cli transient failure (attempt $attempt/3): retrying in 2s"
+          sleep 2
+          continue
+        fi
+        ;;
+    esac
+    break
+  done
+  printf '%s\n' "$out"
 }
 
 hsm_admin() { hsm_as admin admin "$ADMIN_PW" "$1"; }
@@ -135,8 +167,11 @@ fi
 mark_state IN_PROGRESS
 
 # --- 1. packages ------------------------------------------------------------
-log "installing jq, openssl, curl and the CloudHSM Client SDK 5 CLI"
-dnf install -y -q jq openssl ca-certificates curl tar gzip >/dev/null
+log "installing jq, openssl, python3.11 and the CloudHSM Client SDK 5 CLI"
+# AL2023 ships curl-minimal, which conflicts with the `curl` package; it
+# already provides the binary. python3.11 keeps uv from downloading a managed
+# interpreter over the network.
+dnf install -y -q jq openssl ca-certificates tar gzip python3.11 >/dev/null
 [ -n "$CLI_RPM_SHA256" ] && [ "$CLI_RPM_SHA256" != "null" ] \
   || die "cloudhsm_cli_rpm_sha256 is required: refusing to install an unverified CLI package"
 curl -fsSL -o /tmp/cloudhsm-cli.rpm "$CLI_RPM"
@@ -147,6 +182,15 @@ dnf install -y -q /tmp/cloudhsm-cli.rpm >/dev/null
 
 log "configuring cloudhsm-cli for HSM ENI $HSM_IP"
 /opt/cloudhsm/bin/configure-cli -a "$HSM_IP"
+# Key availability quorum requires two HSMs; with one, key generation and every
+# use of the Root key fail with "key must be available on at least 2 HSMs". Opt
+# the client out only when the cluster really has fewer than two.
+HSM_COUNT=$(aws cloudhsmv2 describe-clusters --filters clusterIds="$CLUSTER_ID" \
+              --query 'length(Clusters[0].Hsms)' --output text 2>/dev/null || echo 1)
+if [ "$${HSM_COUNT:-1}" -lt 2 ]; then
+  log "cluster has $HSM_COUNT HSM(s): disabling the client key-availability quorum"
+  /opt/cloudhsm/bin/configure-cli --disable-key-availability-check
+fi
 # The client must trust the commissioning CA before any TLS to the HSM,
 # including `cluster activate`. This is public certificate material only.
 [ -n "$COMMISSIONING_CA_CERT" ] && [ "$COMMISSIONING_CA_CERT" != "null" ] \
@@ -164,14 +208,18 @@ fi
 # --- 2. python tooling (uv, isolated) ---------------------------------------
 if ! command -v uv >/dev/null 2>&1; then
   log "installing uv $UV_VERSION"
-  curl -LsSf -o /tmp/uv-install.sh https://astral.sh/uv/install.sh
+  # The versioned installer URL pins the release; the floating URL installs latest.
+  curl -LsSf -o /tmp/uv-install.sh "https://astral.sh/uv/$UV_VERSION/install.sh"
   if [ -n "$UV_INSTALLER_SHA256" ] && [ "$UV_INSTALLER_SHA256" != "null" ]; then
     printf '%s  %s\n' "$UV_INSTALLER_SHA256" /tmp/uv-install.sh | sha256sum -c - \
       || die "uv installer checksum mismatch"
   else
     log "WARNING: uv_installer_sha256 is unset; the installer is version-pinned only"
   fi
-  UV_VERSION="$UV_VERSION" sh /tmp/uv-install.sh >/dev/null
+  sh /tmp/uv-install.sh >/dev/null
+  HAVE_UV=$(uv --version | awk '{print $2}')
+  [ "$HAVE_UV" = "$UV_VERSION" ] \
+    || die "uv $HAVE_UV is installed but uv_version pins $UV_VERSION"
 fi
 command -v uv >/dev/null 2>&1 || die "uv is unavailable; refusing to fall back to system pip"
 log "creating $VENV and installing cryptography + boto3"
@@ -230,7 +278,7 @@ if [ "$STATE" = "UNINITIALIZED" ]; then
     printf '%s\n' "$COMMISSIONING_SIGNED_CERT" > "$CERT_FILE"
   elif [ -n "$COMMISSIONING_KEY_PARAM" ] && [ "$COMMISSIONING_KEY_PARAM" != "null" ]; then
     log "signing the cluster CSR with the commissioning key from SSM"
-    COMMISSIONING_KEY=$(get_secret "$COMMISSIONING_KEY_PARAM")
+    COMMISSIONING_KEY=$(get_ssm_secret "$COMMISSIONING_KEY_PARAM")
     [ -n "$COMMISSIONING_KEY" ] || die "commissioning signing key is empty in SSM"
     KEY_FILE="$PKI_DIR/commissioning-key.pem"
     printf '%s\n' "$COMMISSIONING_KEY" > "$KEY_FILE"
@@ -260,20 +308,20 @@ if [ "$STATE" = "UNINITIALIZED" ]; then
   esac
 fi
 
-ADMIN_PW=$(get_secret "$SSM_ADMIN_PW")
-CU_PW=$(get_secret "$SSM_CU_PW")
+ADMIN_PW=$(get_secret "$SECRET_ADMIN")
+CU_PW=$(get_secret "$SECRET_CU")
 [ -n "$ADMIN_PW" ] && [ -n "$CU_PW" ] || die "ceremony passwords are missing from SSM"
 
 if [ "$STATE" = "INITIALIZED" ]; then
   log "activating the cluster (sets the initial admin password)"
   OUT=$PKI_DIR/logs/activate.json
-  "$CLI" cluster activate --password "$ADMIN_PW" > "$OUT" 2>&1 || true
+  "$CLI" cluster activate --password="$ADMIN_PW" > "$OUT" 2>&1 || true
   require_ok "cluster activate" "$OUT"
 fi
 
 log "creating crypto user $CU_USER"
 OUT=$PKI_DIR/logs/user-create.json
-hsm_admin "user create --username $CU_USER --role crypto-user --password $CU_PW" > "$OUT" 2>&1 || true
+hsm_admin "user create --username $CU_USER --role crypto-user --password=$CU_PW" > "$OUT" 2>&1 || true
 if ! pick_json < "$OUT" | jq -e 'select(.error_code == 0)' >/dev/null 2>&1; then
   if grep -qi 'already exists' "$OUT"; then
     log "crypto user already exists — continuing"
@@ -287,10 +335,26 @@ fi
 # that can never leave the HSM. (Some SDK builds also expose
 # never-extractable=true; it is stronger but not present on every 5.x build,
 # so the module asks for the portable subset.)
+# A cluster whose latest backup is restored onto the new HSM already holds the
+# Root key. Generating another with the same label would leave two signing keys
+# and make `--key-filter attr.label=` ambiguous, so refuse and send the operator
+# to the rotation path instead.
+EXISTING=$("$CLI" interactive <<EOF 2>&1
+login --username $CU_USER --role crypto-user --password=$CU_PW
+key list --filter attr.label=$ROOT_LABEL
+quit
+EOF
+)
+if printf '%s' "$EXISTING" | grep -q 'attr.label\|"label"'; then
+  die "a key labelled $ROOT_LABEL already exists in this cluster (restored backup); run mode=ROTATE_INTERMEDIATE instead of BOOTSTRAP"
+fi
+
 log "generating the non-exportable Root CA key (label=$ROOT_LABEL curve=$ROOT_CURVE)"
 OUT=$PKI_DIR/logs/root-key.json
+# The public half gets a distinct label: a shared label makes
+# `crypto sign ecdsa --key-filter attr.label=<label>` match two keys.
 hsm_cu "key generate-asymmetric-pair ec --curve $ROOT_CURVE \
-  --public-label $ROOT_LABEL --private-label $ROOT_LABEL \
+  --public-label $${ROOT_LABEL}-pub --private-label $ROOT_LABEL \
   --private-attributes extractable=false sign=true" > "$OUT" 2>&1 || true
 require_ok "key generate-asymmetric-pair" "$OUT"
 
@@ -367,6 +431,13 @@ for f in root_ca.pem intermediate_ca.pem ca_bundle.pem intermediate_ca.csr; do
 done
 
 install -m 700 /var/lib/cloud/instance/user-data.txt "$PKI_DIR/hsm_ceremony.sh"
+
+# Escrow before success: deleting an HSM does NOT create a backup, so the
+# backup must be requested while the HSM still holds the Root key. If this
+# fails the script dies without COMPLETE, which keeps the HSM alive.
+log "requesting the encrypted escrow backup"
+# The escrow backup is created by CloudHSM itself when the HSM is deleted; the
+# workflow deletes the HSM and then waits for that backup to reach READY.
 
 mark_state COMPLETE
 

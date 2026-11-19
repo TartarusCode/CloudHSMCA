@@ -36,7 +36,16 @@ class _Kms:
             Message, ec.ECDSA(utils.Prehashed(hashes.SHA256())))}
 
 
+class _CloudHsmV2:
+    def create_backup(self, ClusterId=None):
+        return {"Backup": {"BackupId": "backup-stub-0001",
+                           "BackupState": "CREATING",
+                           "ClusterId": ClusterId}}
+
+
 def client(name, **kwargs):
     if name == "kms":
         return _Kms()
-    raise RuntimeError("harness boto3 only implements kms, asked for %r" % name)
+    if name == "cloudhsmv2":
+        return _CloudHsmV2()
+    raise RuntimeError("harness boto3 only implements kms and cloudhsmv2, asked for %r" % name)

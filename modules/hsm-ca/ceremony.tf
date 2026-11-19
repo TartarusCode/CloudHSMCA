@@ -37,8 +37,10 @@ locals {
   ssm_ca_bundle_pem       = "${local.ssm_prefix}/ca_bundle.pem"
   ssm_ceremony_state      = "${local.ssm_prefix}/ceremony/state"
   ssm_verified_backup     = "${local.ssm_prefix}/ceremony/verified_backup_id"
-  ssm_hsm_admin_password  = "${local.ssm_prefix}/ceremony/hsm-admin-password"
-  ssm_hsm_cu_password     = "${local.ssm_prefix}/ceremony/hsm-cu-password"
+  # HSM user passwords live in Secrets Manager, not SSM: the host gets a
+  # scoped GetSecretValue instead of read access to a SecureString parameter.
+  secret_hsm_admin_name = "${var.name}-ceremony-hsm-admin"
+  secret_hsm_cu_name    = "${var.name}-ceremony-hsm-cu"
 
   pending = "PENDING-CEREMONY"
 
@@ -61,8 +63,8 @@ locals {
     ssm_intermediate_pem        = local.ssm_intermediate_ca_pem
     ssm_ca_bundle_pem           = local.ssm_ca_bundle_pem
     ssm_ceremony_state          = local.ssm_ceremony_state
-    ssm_admin_password          = local.ssm_hsm_admin_password
-    ssm_cu_password             = local.ssm_hsm_cu_password
+    secret_admin_password       = aws_secretsmanager_secret.hsm_admin[0].arn
+    secret_cu_password          = aws_secretsmanager_secret.hsm_cu.arn
     s3_kms_ca_tool              = "scripts/kms_ca_tool.py"
     s3_root_ca_cnf              = "scripts/root_ca.cnf"
     s3_intermediate_cnf         = "scripts/intermediate_ca.cnf"
@@ -77,6 +79,7 @@ locals {
     cloudhsm_cli_rpm_sha256     = var.cloudhsm_cli_rpm_sha256
     uv_version                  = var.uv_version
     uv_installer_sha256         = var.uv_installer_sha256
+    escrow_polls                = var.escrow_wait_minutes * 2
   }
 
   rotate_config = {
@@ -94,7 +97,7 @@ locals {
     ssm_intermediate_pem    = local.ssm_intermediate_ca_pem
     ssm_ca_bundle_pem       = local.ssm_ca_bundle_pem
     ssm_ceremony_state      = local.ssm_ceremony_state
-    ssm_cu_password         = local.ssm_hsm_cu_password
+    secret_cu_password      = aws_secretsmanager_secret.hsm_cu.arn
     s3_kms_ca_tool          = "scripts/kms_ca_tool.py"
     s3_intermediate_cnf     = "scripts/intermediate_ca.cnf"
     cu_username             = var.hsm_crypto_user
@@ -147,8 +150,15 @@ locals {
     local.consumer_signer_arns,
   ))
 
+  cluster_arn         = "arn:${local.partition}:cloudhsm:${local.region}:${local.account_id}:cluster/${aws_cloudhsm_v2_cluster.this.cluster_id}"
+  ceremony_sg_arn     = "arn:${local.partition}:ec2:${local.region}:${local.account_id}:security-group/${aws_security_group.ceremony.id}"
+  ceremony_ami_arn    = "arn:${local.partition}:ec2:${local.region}::image/${data.aws_ami.al2023.id}"
+  ceremony_subnet_arn = "arn:${local.partition}:ec2:${local.region}:${local.account_id}:subnet/${var.private_subnet_ids[0]}"
+  run_shell_doc_arn   = "arn:${local.partition}:ssm:${local.region}::document/AWS-RunShellScript"
+
   statemachine_definition = templatefile("${path.module}/statemachine.asl.json.tftpl", {
     name                       = var.name
+    escrow_polls               = var.escrow_wait_minutes * 2
     cluster_id                 = aws_cloudhsm_v2_cluster.this.cluster_id
     availability_zone          = var.availability_zone
     ami_id                     = data.aws_ami.al2023.id
@@ -211,6 +221,30 @@ resource "aws_cloudhsm_v2_cluster" "this" {
   tags       = merge(local.tags, { Name = "${var.name}-hsm-cluster" })
 }
 
+# The provider's aws_cloudhsm_v2_cluster has no backup_retention_policy, but the
+# API does and it needs no HSM, so the cluster-level window is applied here
+# instead of silently keeping the 90-day service default. The escrow backup is
+# the only copy of the Root key once the ephemeral HSM is deleted.
+resource "terraform_data" "backup_retention" {
+  triggers_replace = [
+    aws_cloudhsm_v2_cluster.this.cluster_id,
+    var.backup_retention_days,
+  ]
+
+  provisioner "local-exec" {
+    command = "aws cloudhsmv2 modify-cluster --region ${local.region} --cluster-id ${aws_cloudhsm_v2_cluster.this.cluster_id} --backup-retention-policy Type=DAYS,Value=${var.backup_retention_days}"
+  }
+}
+
+# CloudHSM writes its audit log to this exact group name. Managing it here makes
+# the retention policy explicit and reviewable; a group that already exists (an
+# older cluster) must be imported rather than recreated.
+resource "aws_cloudwatch_log_group" "cluster_audit" {
+  name              = "/aws/cloudhsm/${aws_cloudhsm_v2_cluster.this.cluster_id}"
+  retention_in_days = var.audit_log_retention_days
+  tags              = local.tags
+}
+
 ###############################################################################
 # Ephemeral host prerequisites (network only — no instance is declared here)
 ###############################################################################
@@ -262,6 +296,19 @@ resource "aws_security_group" "ceremony" {
   lifecycle {
     create_before_destroy = true
   }
+}
+
+# The cluster security group is created by CloudHSM with a self-referencing
+# ingress rule only. The ephemeral host is a different group, so without this
+# rule the cloudhsm-cli TLS connection to ports 2223-2225 is refused.
+resource "aws_security_group_rule" "cluster_from_ceremony" {
+  type                     = "ingress"
+  description              = "CloudHSM customer HSM ports from the ceremony host"
+  security_group_id        = aws_cloudhsm_v2_cluster.this.security_group_id
+  source_security_group_id = aws_security_group.ceremony.id
+  from_port                = 2223
+  to_port                  = 2225
+  protocol                 = "tcp"
 }
 
 ###############################################################################
@@ -334,42 +381,46 @@ resource "aws_s3_object" "bootstrap_entrypoint" {
 # SSM hand-over parameters (the chain the trust anchor and the Lambda read)
 ###############################################################################
 
+# The alphabet excludes ':' (the HSM rejects it) and '$', '\', '`', quotes and
+# spaces (shell and CLI argument expansion). The ceremony passes every password
+# as --password=<value>, so a leading '-' cannot be parsed as a flag either.
 resource "random_password" "hsm_admin" {
   count            = var.enable_bootstrap ? 1 : 0
   length           = 32
   special          = true
-  override_special = "_-+=:."
+  override_special = "_-+=."
 }
 
 resource "random_password" "hsm_cu" {
   length           = 32
   special          = true
-  override_special = "_-+=:."
+  override_special = "_-+=."
 }
 
-resource "aws_ssm_parameter" "hsm_admin_password" {
-  count       = var.enable_bootstrap ? 1 : 0
-  name        = local.ssm_hsm_admin_password
-  description = "Bootstrap password of the unactivated CloudHSM admin user"
-  type        = "SecureString"
-  value       = random_password.hsm_admin[0].result
-  tags        = local.tags
-
-  lifecycle {
-    ignore_changes = [value]
-  }
+resource "aws_secretsmanager_secret" "hsm_admin" {
+  count                   = var.enable_bootstrap ? 1 : 0
+  name                    = local.secret_hsm_admin_name
+  description             = "Bootstrap password of the unactivated CloudHSM admin user"
+  recovery_window_in_days = 0 # bootstrap-only credential: delete with the stack
+  tags                    = local.tags
 }
 
-resource "aws_ssm_parameter" "hsm_cu_password" {
-  name        = local.ssm_hsm_cu_password
-  description = "Password of the CloudHSM crypto user that owns the Root key"
-  type        = "SecureString"
-  value       = random_password.hsm_cu.result
-  tags        = local.tags
+resource "aws_secretsmanager_secret_version" "hsm_admin" {
+  count         = var.enable_bootstrap ? 1 : 0
+  secret_id     = aws_secretsmanager_secret.hsm_admin[0].id
+  secret_string = random_password.hsm_admin[0].result
+}
 
-  lifecycle {
-    ignore_changes = [value]
-  }
+resource "aws_secretsmanager_secret" "hsm_cu" {
+  name                    = local.secret_hsm_cu_name
+  description             = "Password of the CloudHSM crypto user that owns the Root key"
+  recovery_window_in_days = 0
+  tags                    = local.tags
+}
+
+resource "aws_secretsmanager_secret_version" "hsm_cu" {
+  secret_id     = aws_secretsmanager_secret.hsm_cu.id
+  secret_string = random_password.hsm_cu.result
 }
 
 resource "aws_ssm_parameter" "root_ca_pem" {
@@ -454,6 +505,7 @@ resource "aws_iam_role" "ceremony_host" {
   description          = "Ephemeral host that runs the CloudHSM Root CA ceremony"
   assume_role_policy   = data.aws_iam_policy_document.ec2_assume.json
   max_session_duration = 3600
+  permissions_boundary = var.permissions_boundary_arn
   tags                 = local.tags
 }
 
@@ -462,11 +514,17 @@ resource "aws_iam_role_policy_attachment" "ceremony_ssm_core" {
   policy_arn = "arn:${local.partition}:iam::aws:policy/AmazonSSMManagedInstanceCore"
 }
 
+data "aws_kms_alias" "ssm" {
+  name = "alias/aws/ssm"
+}
+
+
 data "aws_iam_policy_document" "ceremony_host" {
   statement {
     sid = "ReadCeremonyArtifacts"
     actions = [
       "s3:GetObject",
+      "s3:GetObjectVersion",
     ]
     resources = ["${aws_s3_bucket.artifacts.arn}/scripts/*"]
   }
@@ -489,8 +547,6 @@ data "aws_iam_policy_document" "ceremony_host" {
         local.ssm_intermediate_ca_pem,
         local.ssm_ca_bundle_pem,
         local.ssm_ceremony_state,
-        local.ssm_hsm_admin_password,
-        local.ssm_hsm_cu_password,
       ], var.commissioning_ca.key_ssm_param != "" ? [var.commissioning_ca.key_ssm_param] : []) : "arn:${local.partition}:ssm:${local.region}:${local.account_id}:parameter${path}"
     ]
   }
@@ -501,10 +557,23 @@ data "aws_iam_policy_document" "ceremony_host" {
     resources = ["arn:${local.partition}:ssm:${local.region}:${local.account_id}:parameter${local.ssm_prefix}/*"]
   }
 
+  # HSM user passwords come from Secrets Manager; the host may read exactly
+  # these two secrets and nothing else. They use the service-managed key, which
+  # Secrets Manager decrypts on the caller's behalf, so no kms:Decrypt is
+  # needed here (and none is granted).
+  statement {
+    sid     = "ReadHsmSecrets"
+    actions = ["secretsmanager:GetSecretValue"]
+    resources = concat(
+      [aws_secretsmanager_secret.hsm_cu.arn],
+      var.enable_bootstrap ? [aws_secretsmanager_secret.hsm_admin[0].arn] : [],
+    )
+  }
+
   statement {
     sid       = "DecryptSecureParameters"
     actions   = ["kms:Decrypt"]
-    resources = ["*"]
+    resources = [data.aws_kms_alias.ssm.target_key_arn]
 
     condition {
       test     = "StringEquals"
@@ -556,7 +625,7 @@ data "aws_iam_policy_document" "ceremony_host" {
   statement {
     sid       = "InitializeHsmCluster"
     actions   = ["cloudhsm:InitializeCluster"]
-    resources = ["*"]
+    resources = [local.cluster_arn]
   }
 }
 
@@ -735,35 +804,101 @@ data "aws_iam_policy_document" "sfn_assume" {
 }
 
 resource "aws_iam_role" "sfn" {
-  name               = "${var.name}-ceremony-sfn"
-  description        = "Drives the CloudHSM Root CA ceremony"
-  assume_role_policy = data.aws_iam_policy_document.sfn_assume.json
-  tags               = local.tags
+  name                 = "${var.name}-ceremony-sfn"
+  description          = "Drives the CloudHSM Root CA ceremony"
+  assume_role_policy   = data.aws_iam_policy_document.sfn_assume.json
+  permissions_boundary = var.permissions_boundary_arn
+  tags                 = local.tags
 }
 
 data "aws_iam_policy_document" "sfn" {
   statement {
-    sid = "HsmLifecycle"
+    sid = "HsmClusterLifecycle"
     # The API is CloudHSM V2, but its IAM actions use the `cloudhsm:` prefix.
     # `cloudhsmv2:` grants nothing, so the first DescribeClusters call fails.
-    # Keep `cloudhsmv2:` only in the Step Functions integration identifiers.
+    # CreateHsm and InitializeCluster support the cluster resource.
+    actions   = ["cloudhsm:CreateHsm", "cloudhsm:InitializeCluster"]
+    resources = [local.cluster_arn]
+  }
+
+  statement {
+    sid = "HsmDescribeAndDelete"
+    # CreateBackup, DeleteHsm and the Describe actions support no resource-level
+    # permission, so `*` is the only possible resource. CreateBackup is checked
+    # before the backup ARN exists, which is why a cluster-scoped grant fails.
+    actions   = ["cloudhsm:CreateBackup", "cloudhsm:DeleteHsm", "cloudhsm:DescribeClusters", "cloudhsm:DescribeBackups"]
+    resources = ["*"]
+  }
+
+  # CloudHSM's CreateHsm/DeleteHsm call these EC2 actions as dependencies and
+  # evaluate them with resource "*", so a statement scoped to the cluster
+  # security group or an ENI ARN does not match (verified live: AccessDenied at
+  # the CloudHsmV2 API for each narrower grant). AWSServiceRoleForCloudHSM does
+  # not help: it is only for CloudTrail logging, and these calls use the caller's
+  # identity. AWS's documented CloudHSM policy also grants them on "*".
+  statement {
+    sid = "HsmDependentEc2"
     actions = [
-      "cloudhsm:CreateHsm",
-      "cloudhsm:DeleteHsm",
-      "cloudhsm:DescribeClusters",
-      "cloudhsm:DescribeBackups",
+      "ec2:AuthorizeSecurityGroupIngress",
+      "ec2:AuthorizeSecurityGroupEgress",
+      "ec2:RevokeSecurityGroupEgress",
+      "ec2:CreateNetworkInterface",
+      "ec2:DeleteNetworkInterface",
+      "ec2:CreateSecurityGroup",
+      "ec2:DeleteSecurityGroup",
+      "ec2:ModifyNetworkInterfaceAttribute",
+      "ec2:CreateNetworkInterfacePermission",
+      "ec2:DescribeNetworkInterfaces",
+      "ec2:DescribeSecurityGroups",
+      "ec2:DescribeSubnets",
+      "ec2:DescribeVpcs",
+      "ec2:DescribeAvailabilityZones",
+      "ec2:DescribeTags",
+      "ec2:CreateTags",
     ]
     resources = ["*"]
   }
 
+  # CloudHSM creates its service-linked role (for logging) on first use.
   statement {
-    sid = "CeremonyHostLifecycle"
-    actions = [
-      "ec2:RunInstances",
-      "ec2:TerminateInstances",
-      "ec2:CreateTags",
+    sid       = "CreateCloudHsmServiceLinkedRole"
+    actions   = ["iam:CreateServiceLinkedRole"]
+    resources = ["arn:${local.partition}:iam::${local.account_id}:role/aws-service-role/cloudhsm.amazonaws.com/AWSServiceRoleForCloudHSM"]
+
+    condition {
+      test     = "StringEquals"
+      variable = "iam:AWSServiceName"
+      values   = ["cloudhsm.amazonaws.com"]
+    }
+  }
+
+  statement {
+    sid     = "RunCeremonyInstance"
+    actions = ["ec2:RunInstances"]
+    resources = [
+      local.ceremony_ami_arn,
+      local.ceremony_subnet_arn,
+      local.ceremony_sg_arn,
+      "arn:${local.partition}:ec2:${local.region}:${local.account_id}:instance/*",
+      "arn:${local.partition}:ec2:${local.region}:${local.account_id}:volume/*",
+      "arn:${local.partition}:ec2:${local.region}:${local.account_id}:network-interface/*",
     ]
-    resources = ["*"]
+  }
+
+  statement {
+    sid       = "TerminateCeremonyInstance"
+    actions   = ["ec2:TerminateInstances"]
+    resources = ["arn:${local.partition}:ec2:${local.region}:${local.account_id}:instance/*"]
+  }
+
+  statement {
+    sid     = "TagCeremonyResources"
+    actions = ["ec2:CreateTags"]
+    resources = [
+      "arn:${local.partition}:ec2:${local.region}:${local.account_id}:instance/*",
+      "arn:${local.partition}:ec2:${local.region}:${local.account_id}:volume/*",
+      "arn:${local.partition}:ec2:${local.region}:${local.account_id}:network-interface/*",
+    ]
   }
 
   statement {
@@ -797,13 +932,25 @@ data "aws_iam_policy_document" "sfn" {
   }
 
   statement {
-    sid = "DriveTheHost"
-    actions = [
-      "ssm:SendCommand",
-      "ssm:GetCommandInvocation",
-      "ssm:DescribeInstanceInformation",
-      "ssm:ListCommandInvocations",
+    sid     = "SendHostCommand"
+    actions = ["ssm:SendCommand"]
+    resources = [
+      local.run_shell_doc_arn,
+      "arn:${local.partition}:ec2:${local.region}:${local.account_id}:instance/*",
     ]
+  }
+
+  statement {
+    sid       = "ReadHostCommand"
+    actions   = ["ssm:GetCommandInvocation"]
+    resources = ["*"] # GetCommandInvocation supports no resource-level permissions
+  }
+
+  statement {
+    sid = "ReadHostInventory"
+    # DescribeInstanceInformation and ListCommandInvocations support no
+    # resource-level permissions.
+    actions   = ["ssm:DescribeInstanceInformation", "ssm:ListCommandInvocations"]
     resources = ["*"]
   }
 
@@ -817,6 +964,8 @@ data "aws_iam_policy_document" "sfn" {
 
   statement {
     sid = "Logs"
+    # Log-delivery actions and DescribeLogGroups support no resource-level
+    # permissions; the log group ARN cannot scope them.
     actions = ["logs:CreateLogDelivery", "logs:GetLogDelivery", "logs:UpdateLogDelivery",
       "logs:DeleteLogDelivery", "logs:ListLogDeliveries", "logs:PutResourcePolicy",
       "logs:DescribeResourcePolicies", "logs:DescribeLogGroups",
@@ -826,8 +975,8 @@ data "aws_iam_policy_document" "sfn" {
 
   statement {
     sid       = "XRay"
-    actions   = ["xray:PutTraceSegments", "xray:PutTelemetryRecords"]
-    resources = ["*"]
+    actions   = ["xray:PutTraceSegments", "xray:PutTelemetryRecords", "xray:GetSamplingRules", "xray:GetSamplingTargets"]
+    resources = ["*"] # X-Ray actions support no resource-level permissions
   }
 
   # The fan-out: the workflow announces the published chain and knows nothing

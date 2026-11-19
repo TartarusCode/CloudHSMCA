@@ -174,15 +174,25 @@ variable "auto_bootstrap_timeout_seconds" {
 }
 
 variable "ceremony_instance_type" {
-  description = "Instance type for the ephemeral ceremony host."
+  description = "Instance type for the ephemeral ceremony host. Nano and micro sizes are rejected: the ceremony builds a venv, installs the CloudHSM CLI and runs OpenSSL, which those shapes cannot do reliably."
   type        = string
   default     = "t3.small"
+
+  validation {
+    condition     = !contains(["t2.nano", "t2.micro", "t3.nano", "t3.micro"], var.ceremony_instance_type)
+    error_message = "ceremony_instance_type must be at least t3.small (t2.nano, t2.micro, t3.nano and t3.micro are rejected)."
+  }
 }
 
 variable "hsm_crypto_user" {
-  description = "CloudHSM crypto user that owns the Root key. It survives in the backup, so rotation re-uses it."
+  description = "CloudHSM crypto user that owns the Root key. It survives in the backup, so rotation re-uses it. CloudHSM allows only letters, digits and underscore."
   type        = string
-  default     = "pki-cu"
+  default     = "pki_cu"
+
+  validation {
+    condition     = can(regex("^[A-Za-z0-9_]{1,64}$", var.hsm_crypto_user))
+    error_message = "hsm_crypto_user may contain only letters, digits and underscore: CloudHSM rejects any other character."
+  }
 }
 
 variable "cloudhsm_cli_rpm" {
@@ -277,4 +287,49 @@ variable "tags" {
   description = "Tags applied to every taggable resource. `Module = \"cloudhsmca\"` is always added."
   type        = map(string)
   default     = {}
+}
+
+variable "permissions_boundary_arn" {
+  description = "Optional IAM permissions boundary ARN attached to every role this module creates. Null leaves roles unbounded."
+  type        = string
+  default     = null
+
+  validation {
+    condition     = var.permissions_boundary_arn == null || can(regex("^arn:aws[a-zA-Z-]*:iam::[0-9]{12}:policy/.+$", var.permissions_boundary_arn))
+    error_message = "permissions_boundary_arn must be an IAM policy ARN."
+  }
+}
+
+variable "escrow_wait_minutes" {
+  description = "How long the workflow waits for the service-scheduled escrow backup to reach READY after the HSM is deleted. AWS CloudHSM has no API to force a backup; it is created on cluster activation, HSM add and HSM removal, and can take a while."
+  type        = number
+  default     = 180
+
+  validation {
+    condition     = var.escrow_wait_minutes >= 1 && var.escrow_wait_minutes <= 1440
+    error_message = "escrow_wait_minutes must be between 1 and 1440 (24 hours)."
+  }
+}
+
+variable "backup_retention_days" {
+  description = "Days CloudHSM keeps cluster backups. The escrow backup holds the only copy of the Root key after the ephemeral HSM is deleted."
+  type        = number
+  default     = 90
+
+  validation {
+    condition     = var.backup_retention_days >= 7 && var.backup_retention_days <= 379
+    error_message = "backup_retention_days must be between 7 and 379."
+  }
+}
+
+variable "audit_log_retention_days" {
+  description = "Retention for the CloudHSM audit log group /aws/cloudhsm/<cluster-id>."
+  type        = number
+  default     = 90
+
+  validation {
+    condition = contains([1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545,
+    731, 1096, 1827, 2192, 2557, 2922, 3288, 3653], var.audit_log_retention_days)
+    error_message = "audit_log_retention_days must be a retention value CloudWatch Logs accepts."
+  }
 }

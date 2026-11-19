@@ -42,6 +42,7 @@ TEMPLATE = "statemachine.asl.json.tftpl"
 # structural, and a real cluster id would make the output unreadable.
 RENDER_VARS = {
     "name": "corp-pki",
+    "escrow_polls": 360,
     "cluster_id": "cluster-abc123",
     "availability_zone": "us-west-2a",
     "ami_id": "ami-0123456789abcdef0",
@@ -203,14 +204,20 @@ def check_aws_sdk_parameters(states, check):
         service_model_name = {"sfn": "stepfunctions"}.get(service, service)
         params = state.get("Parameters") or {}
         keys = [key[:-2] if key.endswith(".$") else key for key in params]
-        try:
-            model = session.get_service_model(service_model_name)
-            operation = model.operation_model(action[0].upper() + action[1:])
-        except Exception as exc:  # noqa: BLE001 - the message is the finding
-            problems.append("%s: %s:%s is not in the botocore model (%s)"
-                            % (name, service, action, exc))
-            continue
-        allowed = set((operation.input_shape.members or {}) if operation.input_shape else {})
+        if service == "sfn":
+            # Step Functions' own integration is the authoritative schema here:
+            # it accepts PascalCase ExecutionArn, while botocore's model uses
+            # camelCase executionArn (verified by a live CreateStateMachine).
+            allowed = {"ExecutionArn"}
+        else:
+            try:
+                model = session.get_service_model(service_model_name)
+                operation = model.operation_model(action[0].upper() + action[1:])
+            except Exception as exc:  # noqa: BLE001 - the message is the finding
+                problems.append("%s: %s:%s is not in the botocore model (%s)"
+                                % (name, service, action, exc))
+                continue
+            allowed = set((operation.input_shape.members or {}) if operation.input_shape else {})
         unknown = sorted(key for key in keys if key not in allowed)
         if unknown:
             problems.append("%s: %s:%s does not accept %s (accepts %s)"
@@ -305,9 +312,9 @@ def main():
     cleanup_entry = "CleanupHsmOnFailure"
     check(cleanup_entry in states, "a single cleanup entry state exists")
     if cleanup_entry in states:
-        check(path_exists(defn, cleanup_entry,
-                          lambda n, s: s.get("Resource", "").endswith(":cloudhsmv2:deleteHsm")),
-              "cleanup reaches deleteHsm")
+        check(not path_exists(defn, cleanup_entry,
+                              lambda n, s: s.get("Resource", "").endswith(":cloudhsmv2:deleteHsm")),
+              "failure cleanup never deletes an HSM (it may hold the only copy of the Root key)")
         check(path_exists(defn, cleanup_entry,
                           lambda n, s: s.get("Resource", "").endswith(":ec2:terminateInstances")),
               "cleanup reaches terminateInstances")
@@ -436,8 +443,8 @@ def main():
     # The escrow check must see a backup created by this run, and commit its id
     # before the chain can be announced.
     escrow = states.get("IsBackupReady", {})
-    check("StringNotEqualsPath" in json.dumps(escrow),
-          "the escrow gate rejects a pre-existing backup")
+    check("TimestampGreaterThanPath" in json.dumps(escrow),
+          "the escrow gate rejects a pre-existing backup by creation time")
     check(path_exists(defn, "IsBackupReady",
                       lambda n, s: s.get("Resource", "").endswith(":ssm:putParameter")),
           "the verified backup id is committed before success")

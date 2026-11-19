@@ -25,10 +25,14 @@ locals {
 module "hsm_ca" {
   source = "./modules/hsm-ca"
 
-  name               = var.name
-  vpc_id             = var.vpc_id
-  private_subnet_ids = var.private_subnet_ids
-  availability_zone  = var.availability_zone
+  name                     = var.name
+  permissions_boundary_arn = var.permissions_boundary_arn
+  escrow_wait_minutes      = var.escrow_wait_minutes
+  backup_retention_days    = var.backup_retention_days
+  audit_log_retention_days = var.audit_log_retention_days
+  vpc_id                   = var.vpc_id
+  private_subnet_ids       = var.private_subnet_ids
+  availability_zone        = var.availability_zone
 
   intermediate_key_spec         = var.intermediate_key_spec
   kms_deletion_window_in_days   = var.kms_deletion_window_in_days
@@ -62,8 +66,9 @@ module "roles_anywhere" {
   source = "./modules/roles-anywhere"
   count  = var.enable_roles_anywhere ? 1 : 0
 
-  ca_contract       = module.hsm_ca.ca_contract
-  workload_profiles = var.workload_profiles
+  ca_contract              = module.hsm_ca.ca_contract
+  permissions_boundary_arn = var.permissions_boundary_arn
+  workload_profiles        = var.workload_profiles
 
   revocations_s3_key = var.revocations_s3_key
   crl_validity_days  = var.crl_validity_days
@@ -75,7 +80,8 @@ module "alb_mtls" {
   source = "./modules/alb-mtls"
   count  = var.enable_alb_mtls ? 1 : 0
 
-  ca_contract = module.hsm_ca.ca_contract
+  ca_contract              = module.hsm_ca.ca_contract
+  permissions_boundary_arn = var.permissions_boundary_arn
 
   name                      = var.alb_mtls_name
   trust_store_name          = var.alb_trust_store_name

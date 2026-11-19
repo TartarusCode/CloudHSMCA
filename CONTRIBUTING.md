@@ -25,8 +25,8 @@ every example, `tflint`, `workflow-lint`, and `tests/run-all.sh`). `make -j4 che
 gates in parallel: `init` is a single target, so the slots cannot race each other
 in the provider cache.
 
-CI also checks the floor that `required_version = ">= 1.6.0"` promises: the
-`fmt, validate, examples` job downloads Terraform 1.6.6 and runs
+CI also checks the floor that `required_version = ">= 1.9.0"` promises: the
+`fmt, validate, examples` job downloads Terraform 1.9.8 and runs
 `make validate examples TF=/tmp/tf-floor/terraform` against the same provider
 cache. To reproduce it locally, put any older CLI on `$PATH` and use the same
 override — every target takes `TF=<binary>`.

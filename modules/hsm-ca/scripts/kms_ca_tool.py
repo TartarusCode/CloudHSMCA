@@ -335,13 +335,15 @@ class HsmSigner(Signer):
         with tempfile.NamedTemporaryFile(prefix="hsm-digest-") as fh:
             fh.write(digest)
             fh.flush()
-            cmd = "crypto sign ecdsa --key-filter label=%s --hash-function %s " \
+            cmd = "crypto sign ecdsa --key-filter attr.label=%s --hash-function %s " \
                   "--data-path %s --data-type digest" % (
                       self.key_label, self.alg.openssl_name, fh.name)
             if self.cluster_id:
                 cmd += " --cluster-id %s" % self.cluster_id
             script = "\n".join([
-                "login --username %s --role crypto-user --password %s"
+                # --password= keeps a password that starts with '-' from being
+                # parsed as a CLI flag.
+                "login --username %s --role crypto-user --password=%s"
                 % (self._user, self._password),
                 cmd,
                 "quit",
@@ -591,7 +593,17 @@ def cmd_spki_from_point(args) -> None:
         raise SystemExit("unsupported curve %r" % args.curve)
     size, curve_oid = curves[args.curve]
     point = bytes.fromhex(args.point.lower().removeprefix("0x"))
-    if point[0] != 0x04 or len(point) != 1 + 2 * ((size + 7) // 8):
+    expected = 1 + 2 * ((size + 7) // 8)
+    # The CloudHSM CLI reports ec-point as a DER OCTET STRING wrapping the
+    # uncompressed point (99 bytes for secp384r1): 04 <len> 04 <x> <y>. Accept
+    # that as well as the bare point, and keep the strict on-curve check below.
+    if not (len(point) == expected and point[:1] == b"\x04"):
+        if len(point) >= 2 and point[0] == 0x04 and point[1] < 0x80 \
+                and point[1] == len(point) - 2:
+            inner = point[2:]
+            if len(inner) == expected and inner[:1] == b"\x04":
+                point = inner
+    if point[0] != 0x04 or len(point) != expected:
         raise SystemExit("EC point is not an uncompressed %s point (%d bytes)"
                          % (args.curve, len(point)))
     spki = der_tlv(TAG_SEQUENCE, der_tlv(

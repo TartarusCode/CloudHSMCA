@@ -263,8 +263,8 @@ the same event. Five-year default validity: `intermediate_ca_validity_days`.
 ## Requirements
 
 | Name | Version |
-|------|---------|
-| <a name="requirement_terraform"></a> [terraform](#requirement\_terraform) | >= 1.6.0 |
+| ---- | ------- |
+| <a name="requirement_terraform"></a> [terraform](#requirement\_terraform) | >= 1.9.0 |
 | <a name="requirement_archive"></a> [archive](#requirement\_archive) | >= 2.4.0 |
 | <a name="requirement_aws"></a> [aws](#requirement\_aws) | >= 5.67.0, < 7.0.0 |
 | <a name="requirement_random"></a> [random](#requirement\_random) | >= 3.5.0 |
@@ -272,65 +272,74 @@ the same event. Five-year default validity: `intermediate_ca_validity_days`.
 
 ## Providers
 
-No providers.
+| Name | Version |
+| ---- | ------- |
+| <a name="provider_aws"></a> [aws](#provider\_aws) | 6.73.0 |
 
 ## Modules
 
 | Name | Source | Version |
-|------|--------|---------|
+| ---- | ------ | ------- |
 | <a name="module_alb_mtls"></a> [alb\_mtls](#module\_alb\_mtls) | ./modules/alb-mtls | n/a |
 | <a name="module_hsm_ca"></a> [hsm\_ca](#module\_hsm\_ca) | ./modules/hsm-ca | n/a |
 | <a name="module_roles_anywhere"></a> [roles\_anywhere](#module\_roles\_anywhere) | ./modules/roles-anywhere | n/a |
 
 ## Resources
 
-No resources.
+| Name | Type |
+| ---- | ---- |
+| [aws_caller_identity.current](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/data-sources/caller_identity) | data source |
+| [aws_partition.current](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/data-sources/partition) | data source |
 
 ## Inputs
 
 | Name | Description | Type | Default | Required |
-|------|-------------|------|---------|:--------:|
+| ---- | ----------- | ---- | ------- | :------: |
 | <a name="input_alb_mtls_name"></a> [alb\_mtls\_name](#input\_alb\_mtls\_name) | S3 prefix name for the ALB trust store artifacts (alb-mtls/<name>/). Empty = the CA's name. | `string` | `""` | no |
-| <a name="input_alb_revoked_serials_ssm_param"></a> [alb\_revoked\_serials\_ssm\_param](#input\_alb\_revoked\_serials\_ssm\_param) | Optional SSM override for ALB revoked serials. Empty = read the shared S3 revocation object; an explicit {"revoked": []} clears serials; a configured but missing or invalid source fails closed. | `string` | `""` | no |
+| <a name="input_alb_revoked_serials_ssm_param"></a> [alb\_revoked\_serials\_ssm\_param](#input\_alb\_revoked\_serials\_ssm\_param) | SSM parameter holding revoked serials as JSON for the ALB CRL. Empty = do not rotate the CRL; set to a parameter containing {"revoked": []} to explicitly clear serials. A configured but missing or invalid parameter fails closed. | `string` | `""` | no |
 | <a name="input_alb_trust_store_name"></a> [alb\_trust\_store\_name](#input\_alb\_trust\_store\_name) | Explicit ELBv2 trust store name (max 32 chars). Empty = <ca\_name>-alb-mtls. | `string` | `""` | no |
-| <a name="input_allowed_kms_signer_role_arns"></a> [allowed\_kms\_signer\_role\_arns](#input\_allowed\_kms\_signer\_role\_arns) | Exact IAM role ARNs besides the ceremony host allowed to sign with the Intermediate key. null = the composite stack's designated CRL issuer only; workload roles are never implied by a pattern. | `list(string)` | `null` | no |
+| <a name="input_allowed_kms_signer_role_arns"></a> [allowed\_kms\_signer\_role\_arns](#input\_allowed\_kms\_signer\_role\_arns) | Exact IAM role ARNs besides the ceremony host allowed to sign with the Intermediate key. null = the composite stack's designated CRL issuer role only; workload roles are never implied by a pattern. | `list(string)` | `null` | no |
 | <a name="input_artifact_bucket_name"></a> [artifact\_bucket\_name](#input\_artifact\_bucket\_name) | Explicit artifact bucket name. Empty = generated unique name. | `string` | `""` | no |
+| <a name="input_audit_log_retention_days"></a> [audit\_log\_retention\_days](#input\_audit\_log\_retention\_days) | Retention for the CloudHSM audit log group /aws/cloudhsm/<cluster-id>. | `number` | `90` | no |
 | <a name="input_auto_bootstrap"></a> [auto\_bootstrap](#input\_auto\_bootstrap) | true runs the ceremony inside terraform apply and waits for it; false (default) leaves it to the operator. | `bool` | `false` | no |
 | <a name="input_auto_bootstrap_timeout_seconds"></a> [auto\_bootstrap\_timeout\_seconds](#input\_auto\_bootstrap\_timeout\_seconds) | How long the auto\_bootstrap waiter polls before failing the apply. | `number` | `3600` | no |
 | <a name="input_availability_zone"></a> [availability\_zone](#input\_availability\_zone) | AZ for the ceremony HSM. Must be an AZ of one of var.private\_subnet\_ids. | `string` | n/a | yes |
+| <a name="input_backup_retention_days"></a> [backup\_retention\_days](#input\_backup\_retention\_days) | Days CloudHSM keeps cluster backups. The escrow backup is the only copy of the Root key once the ephemeral HSM is deleted. | `number` | `90` | no |
 | <a name="input_ceremony_instance_type"></a> [ceremony\_instance\_type](#input\_ceremony\_instance\_type) | Instance type for the ephemeral ceremony host. | `string` | `"t3.small"` | no |
 | <a name="input_cloudhsm_cli_rpm"></a> [cloudhsm\_cli\_rpm](#input\_cloudhsm\_cli\_rpm) | AWS CloudHSM Client SDK 5 CLI package for Amazon Linux 2023. | `string` | `"https://s3.amazonaws.com/cloudhsmv2-software/CloudHsmClient/Amzn2023/cloudhsm-cli-latest.amzn2023.x86_64.rpm"` | no |
 | <a name="input_cloudhsm_cli_rpm_sha256"></a> [cloudhsm\_cli\_rpm\_sha256](#input\_cloudhsm\_cli\_rpm\_sha256) | SHA-256 of the CloudHSM CLI RPM, verified before the ceremony installs it. Required for a bootstrap. | `string` | `""` | no |
-| <a name="input_commissioning_ca"></a> [commissioning\_ca](#input\_commissioning\_ca) | The approved CA that claims a new CloudHSM cluster (public certificate plus an SSM SecureString parameter holding the key, or a pre-signed cluster certificate). Required for the first bootstrap of an UNINITIALIZED cluster. | <pre>object({<br>    certificate                = string<br>    key_ssm_param              = optional(string, "")<br>    signed_cluster_certificate = optional(string, "")<br>  })</pre> | <pre>{<br>  "certificate": "",<br>  "key_ssm_param": "",<br>  "signed_cluster_certificate": ""<br>}</pre> | no |
+| <a name="input_commissioning_ca"></a> [commissioning\_ca](#input\_commissioning\_ca) | The approved CA that claims a new CloudHSM cluster (public certificate plus an SSM SecureString parameter holding the key, or a pre-signed cluster certificate). Required for the first bootstrap of an UNINITIALIZED cluster. | <pre>object({<br/>    certificate                = string<br/>    key_ssm_param              = optional(string, "")<br/>    signed_cluster_certificate = optional(string, "")<br/>  })</pre> | <pre>{<br/>  "certificate": "",<br/>  "key_ssm_param": "",<br/>  "signed_cluster_certificate": ""<br/>}</pre> | no |
 | <a name="input_crl_validity_days"></a> [crl\_validity\_days](#input\_crl\_validity\_days) | thisUpdate -> nextUpdate window of every generated CRL. Must exceed the 24h refresh cadence. | `number` | `7` | no |
 | <a name="input_enable_alb_mtls"></a> [enable\_alb\_mtls](#input\_enable\_alb\_mtls) | Create the ALB mutual-TLS consumer (ELBv2 trust store + activation/CRL Lambda). false = no trust store. | `bool` | `false` | no |
 | <a name="input_enable_bootstrap"></a> [enable\_bootstrap](#input\_enable\_bootstrap) | true for a first-time cluster (publishes the bootstrap entrypoint and admin password); false for rotation-only. | `bool` | `true` | no |
 | <a name="input_enable_roles_anywhere"></a> [enable\_roles\_anywhere](#input\_enable\_roles\_anywhere) | Create the IAM Roles Anywhere consumer (trust anchor, profiles, workload roles, CRL Lambda). false = PKI engine only. | `bool` | `true` | no |
+| <a name="input_escrow_wait_minutes"></a> [escrow\_wait\_minutes](#input\_escrow\_wait\_minutes) | Minutes the ceremony workflow waits for the escrow backup to reach READY after the HSM is deleted. CloudHSM creates it asynchronously; there is no API to force one. | `number` | `180` | no |
 | <a name="input_event_bus_name"></a> [event\_bus\_name](#input\_event\_bus\_name) | EventBridge bus for CAChainPublished. Consumers must subscribe to the same bus. | `string` | `"default"` | no |
-| <a name="input_hsm_crypto_user"></a> [hsm\_crypto\_user](#input\_hsm\_crypto\_user) | CloudHSM crypto user that owns the Root key. | `string` | `"pki-cu"` | no |
+| <a name="input_hsm_crypto_user"></a> [hsm\_crypto\_user](#input\_hsm\_crypto\_user) | CloudHSM crypto user that owns the Root key. Letters, digits and underscore only, per CloudHSM. | `string` | `"pki_cu"` | no |
 | <a name="input_intermediate_ca_validity_days"></a> [intermediate\_ca\_validity\_days](#input\_intermediate\_ca\_validity\_days) | Intermediate CA lifetime (bootstrap and rotation). | `number` | `1825` | no |
 | <a name="input_intermediate_key_spec"></a> [intermediate\_key\_spec](#input\_intermediate\_key\_spec) | Key spec of the KMS Intermediate CA key. | `string` | `"ECC_NIST_P384"` | no |
-| <a name="input_intermediate_subject"></a> [intermediate\_subject](#input\_intermediate\_subject) | Distinguished name of the KMS-backed Intermediate CA. | <pre>object({<br>    country             = optional(string, "US")<br>    state               = optional(string, "Washington")<br>    locality            = optional(string, "Seattle")<br>    organization        = optional(string, "Example Corp")<br>    organizational_unit = optional(string, "Platform Security")<br>    common_name         = optional(string, "Example Corp Issuing CA")<br>  })</pre> | `{}` | no |
+| <a name="input_intermediate_subject"></a> [intermediate\_subject](#input\_intermediate\_subject) | Distinguished name of the KMS-backed Intermediate CA. | <pre>object({<br/>    country             = optional(string, "US")<br/>    state               = optional(string, "Washington")<br/>    locality            = optional(string, "Seattle")<br/>    organization        = optional(string, "Example Corp")<br/>    organizational_unit = optional(string, "Platform Security")<br/>    common_name         = optional(string, "Example Corp Issuing CA")<br/>  })</pre> | `{}` | no |
 | <a name="input_kms_deletion_window_in_days"></a> [kms\_deletion\_window\_in\_days](#input\_kms\_deletion\_window\_in\_days) | Waiting period before the Intermediate CA key can be destroyed. | `number` | `30` | no |
 | <a name="input_log_retention_days"></a> [log\_retention\_days](#input\_log\_retention\_days) | Retention for every log group this stack creates. | `number` | `365` | no |
 | <a name="input_name"></a> [name](#input\_name) | Prefix for every resource, SSM path and IAM role name. Consumers match the CAChainPublished event on this value. | `string` | `"corp-pki"` | no |
 | <a name="input_object_lock_days"></a> [object\_lock\_days](#input\_object\_lock\_days) | S3 Object Lock default retention period in days. | `number` | `30` | no |
 | <a name="input_object_lock_mode"></a> [object\_lock\_mode](#input\_object\_lock\_mode) | S3 Object Lock default retention mode. | `string` | `"GOVERNANCE"` | no |
+| <a name="input_permissions_boundary_arn"></a> [permissions\_boundary\_arn](#input\_permissions\_boundary\_arn) | Optional IAM permissions boundary ARN attached to every role this module creates. Null leaves roles unbounded. | `string` | `null` | no |
 | <a name="input_private_subnet_ids"></a> [private\_subnet\_ids](#input\_private\_subnet\_ids) | Private subnets for the CloudHSM cluster. The ceremony host is launched in the first one. | `list(string)` | n/a | yes |
 | <a name="input_revocations_s3_key"></a> [revocations\_s3\_key](#input\_revocations\_s3\_key) | S3 key inside the CA artifact bucket holding the revoked-serial JSON read by the CRL Lambda. | `string` | `"revocations/revoked.json"` | no |
 | <a name="input_root_ca_validity_days"></a> [root\_ca\_validity\_days](#input\_root\_ca\_validity\_days) | Root CA lifetime (bootstrap only). | `number` | `3650` | no |
 | <a name="input_root_key_curve"></a> [root\_key\_curve](#input\_root\_key\_curve) | CloudHSM curve for the non-exportable Root CA key. | `string` | `"secp384r1"` | no |
-| <a name="input_root_subject"></a> [root\_subject](#input\_root\_subject) | Distinguished name of the offline Root CA. | <pre>object({<br>    country             = optional(string, "US")<br>    state               = optional(string, "Washington")<br>    locality            = optional(string, "Seattle")<br>    organization        = optional(string, "Example Corp")<br>    organizational_unit = optional(string, "Platform Security")<br>    common_name         = optional(string, "Example Corp Root CA")<br>  })</pre> | `{}` | no |
+| <a name="input_root_subject"></a> [root\_subject](#input\_root\_subject) | Distinguished name of the offline Root CA. | <pre>object({<br/>    country             = optional(string, "US")<br/>    state               = optional(string, "Washington")<br/>    locality            = optional(string, "Seattle")<br/>    organization        = optional(string, "Example Corp")<br/>    organizational_unit = optional(string, "Platform Security")<br/>    common_name         = optional(string, "Example Corp Root CA")<br/>  })</pre> | `{}` | no |
 | <a name="input_tags"></a> [tags](#input\_tags) | Tags applied to every taggable resource. Module = "cloudhsmca" is always added. | `map(string)` | `{}` | no |
 | <a name="input_uv_installer_sha256"></a> [uv\_installer\_sha256](#input\_uv\_installer\_sha256) | Optional SHA-256 of the uv install script. | `string` | `""` | no |
 | <a name="input_uv_version"></a> [uv\_version](#input\_uv\_version) | Exact uv release the ceremony installs. | `string` | `"0.5.11"` | no |
 | <a name="input_vpc_id"></a> [vpc\_id](#input\_vpc\_id) | VPC containing the private subnets for the CloudHSM cluster and the ceremony host. | `string` | n/a | yes |
-| <a name="input_workload_profiles"></a> [workload\_profiles](#input\_workload\_profiles) | One Roles Anywhere profile + IAM role per workload class, keyed by a short stable name. | <pre>map(object({<br>    description                = optional(string, "Managed by cloudhsmca")<br>    session_duration_seconds   = optional(number, 3600)<br>    role_max_session_duration  = optional(number)<br>    managed_policy_arns        = optional(list(string), [])<br>    session_policy_json        = optional(string)<br>    accept_role_session_name   = optional(bool, true)<br>    subject_condition_operator = optional(string, "StringEquals")<br>    allowed_subject_ou         = optional(string)<br>    allowed_subject_cn         = optional(string)<br>    tags                       = optional(map(string), {})<br>  }))</pre> | `{}` | no |
+| <a name="input_workload_profiles"></a> [workload\_profiles](#input\_workload\_profiles) | One Roles Anywhere profile + IAM role per workload class, keyed by a short stable name. | <pre>map(object({<br/>    description              = optional(string, "Managed by cloudhsmca")<br/>    session_duration_seconds = optional(number, 3600)<br/>    # IAM role ceiling: leave null to floor at 3600 automatically.<br/>    role_max_session_duration  = optional(number)<br/>    managed_policy_arns        = optional(list(string), [])<br/>    session_policy_json        = optional(string)<br/>    accept_role_session_name   = optional(bool, true)<br/>    subject_condition_operator = optional(string, "StringEquals")<br/>    allowed_subject_ou         = optional(string)<br/>    allowed_subject_cn         = optional(string)<br/>    tags                       = optional(map(string), {})<br/>  }))</pre> | `{}` | no |
 
 ## Outputs
 
 | Name | Description |
-|------|-------------|
+| ---- | ----------- |
 | <a name="output_alb_sync_function_name"></a> [alb\_sync\_function\_name](#output\_alb\_sync\_function\_name) | ALB trust-store activation + CRL rotation Lambda (null when disabled). |
 | <a name="output_alb_trust_store_arn"></a> [alb\_trust\_store\_arn](#output\_alb\_trust\_store\_arn) | ELBv2 trust store ARN for aws\_lb\_listener.mutual\_authentication (null when enable\_alb\_mtls = false). |
 | <a name="output_alb_trust_store_name"></a> [alb\_trust\_store\_name](#output\_alb\_trust\_store\_name) | ELBv2 trust store name (null when disabled). |

@@ -9,6 +9,22 @@ semantic versioning once it is tagged.
 Security and correctness pass over a full audit. Most items are offline-verified by
 the harnesses; the cloud-side acceptance points are called out below.
 
+### Changed
+
+- **Minimum engine floor is `>= 1.9.0`** (Terraform and OpenTofu). CI validates
+  every configuration with `1.9.8` as well as the current release, and the
+  cross-variable `auto_bootstrap`/`enable_bootstrap` validation relies on the
+  `1.9` validation semantics.
+- **IAM permissions boundary**: `permissions_boundary_arn` is accepted by the root
+  module, `modules/hsm-ca`, `modules/roles-anywhere` and `modules/alb-mtls`, and
+  attached to every `aws_iam_role` they create. `tests/module/iam_boundary.sh`
+  fails if a new role is added without it.
+- **HSM user passwords moved to Secrets Manager**: the admin and crypto-user
+  passwords are `aws_secretsmanager_secret` resources, read by the ceremony host
+  with `secretsmanager:GetSecretValue` scoped to those two ARNs. SSM SecureString
+  password parameters and the KMS decrypt grant for them are gone; the only
+  SecureString left is the commissioning signing key, which is not an HSM password.
+
 ### Fixed
 
 - **IAM prefix**: the ceremony execution role granted `cloudhsmv2:*`, which is not

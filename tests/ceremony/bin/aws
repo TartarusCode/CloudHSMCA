@@ -25,6 +25,14 @@ case "$svc" in
       *)                   echo "PENDING-CEREMONY" ;;
     esac
     ;;
+  "secretsmanager get-secret-value")
+    id=$(val --secret-id "$@")
+    case "$id" in
+      *hsm-admin*) echo "AdminPass-123" ;;
+      *hsm-cu*)    echo "CuPass-456" ;;
+      *) echo "stub: unknown secret $id" >&2; exit 1 ;;
+    esac
+    ;;
   "ssm put-parameter")
     name=$(val --name "$@"); value=$(val --value "$@")
     case "$value" in file://*) value=$(cat "${value#file://}");; esac
@@ -47,6 +55,9 @@ case "$svc" in
     else
       echo ACTIVE
     fi
+    ;;
+  "cloudhsmv2 create-backup")
+    echo "backup-stub-0001"
     ;;
   "cloudhsmv2 initialize-cluster")
     signed=$(val --signed-cert "$@"); trust=$(val --trust-anchor "$@")

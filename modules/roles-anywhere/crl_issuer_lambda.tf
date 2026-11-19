@@ -587,10 +587,11 @@ data "aws_iam_policy_document" "crl_issuer_assume" {
 }
 
 resource "aws_iam_role" "crl_issuer" {
-  name               = local.crl_lambda_name
-  description        = "Activates the Roles Anywhere trust anchor and keeps its CRL fresh"
-  assume_role_policy = data.aws_iam_policy_document.crl_issuer_assume.json
-  tags               = local.tags
+  name                 = local.crl_lambda_name
+  description          = "Activates the Roles Anywhere trust anchor and keeps its CRL fresh"
+  assume_role_policy   = data.aws_iam_policy_document.crl_issuer_assume.json
+  permissions_boundary = var.permissions_boundary_arn
+  tags                 = local.tags
 }
 
 data "aws_iam_policy_document" "crl_issuer" {
