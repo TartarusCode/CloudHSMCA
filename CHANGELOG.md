@@ -6,8 +6,29 @@ semantic versioning once it is tagged.
 
 ## [Unreleased]
 
-Security and correctness pass over a full audit. Most items are offline-verified by
-the harnesses; the cloud-side acceptance points are called out below.
+## [0.6.0] - 2026-11-19
+
+Hardened by a live end-to-end run against AWS CloudHSM in `us-west-2`: the
+ceremony now initializes a real cluster, generates a non-exportable Root key,
+signs the KMS Intermediate, publishes the chain, deletes the HSM to trigger the
+escrow backup, and verifies that backup before announcing the chain. Most items
+are offline-verified by the harnesses; the cloud-side acceptance points are
+called out below.
+
+### Added
+
+- **CloudHSM audit log governance**: the module manages
+  `/aws/cloudhsm/<cluster-id>` with `audit_log_retention_days` (default 90).
+- **Backup retention**: `backup_retention_days` (7..379, default 90) is applied
+  through `ModifyCluster`, because the AWS provider does not expose
+  `backup_retention_policy` on `aws_cloudhsm_v2_cluster`.
+- **Ceremony robustness**: bounded `cloudhsm-cli` retries for transport failures,
+  an explicit `logout` at the end of every HSM session, and a variable validation
+  that rejects `t2.nano`/`t2.micro`/`t3.nano`/`t3.micro` ceremony instances.
+- **Sandbox teardown**: `verify_live_control_plane.sh --teardown
+  --confirm-sandbox` removes the protected KMS key from state, schedules its
+  seven-day deletion, purges object-lock versions with
+  `--bypass-governance-retention`, then destroys the rest of the stack.
 
 ### Changed
 
