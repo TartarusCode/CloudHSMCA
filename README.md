@@ -259,6 +259,26 @@ the same event. Five-year default validity: `intermediate_ca_validity_days`.
 | [`examples/auto-bootstrap`](examples/auto-bootstrap) | Composite module with `auto_bootstrap = true` |
 | [`examples/standalone-hsm-ca`](examples/standalone-hsm-ca) | The PKI engine alone, for mTLS/VPN/TLS consumers it does not know about |
 
+## Cost Comparison & Enterprise Add-Ons
+
+| Capability | AWS Private CA (2-Tier) | `CloudHSMCA` (`v0.6.0`) | `CloudHSMCA` + Enterprise Add-Ons |
+| :--- | :--- | :--- | :--- |
+| **Root CA Hardware Protection** | FIPS 140-3 Level 3 | FIPS 140-3 Level 3 (ephemeral CloudHSM + encrypted backup) | FIPS 140-3 Level 3 (ephemeral CloudHSM + encrypted backup) |
+| **Intermediate CA Signing** | Managed HSM | AWS KMS `ECC_NIST_P384` (`SIGN_VERIFY`) | AWS KMS `ECC_NIST_P384` (`SIGN_VERIFY`) |
+| **Steady-State Monthly Cost** | **~$800+/month** ($400/CA) | **~$1–$2/month** ($1/mo KMS key + pennies for SSM/S3) | **~$2–$5/month** (serverless API Gateway + DynamoDB + S3) |
+| **IAM Roles Anywhere & ALB mTLS** | Manual wiring | Built-in event-driven submodules (`CAChainPublished`) | Built-in event-driven submodules (`CAChainPublished`) |
+| **Kubernetes `cert-manager` (RFC 8555 ACME v2)** | Separate connector | DIY `kms:Sign` integration | **`modules/acme-issuer`** (stdlib-only Lambda, `private-eab`, domain allowlists) |
+| **SOC 2 / ISO 27001 / HIPAA Ceremony Audit Packs** | Manual log assembly | CloudWatch + Step Functions history | **`modules/compliance-evidence`** (KMS-signed SHA-256 manifests in Object-Locked S3 + offline CLI verifier) |
+
+### Commercial Enterprise Add-Ons (`CloudHSMCA-Enterprise`)
+
+For platform and security teams that want turnkey Kubernetes certificate automation or auditor-ready compliance evidence without maintaining custom glue code, two commercial Terraform/OpenTofu modules (`>= 1.9.0`) plug directly into `module.hsm_ca` via `ca_contract` and the `CAChainPublished` EventBridge bus:
+
+- **`modules/acme-issuer`:** Serverless RFC 8555 ACME v2 server (API Gateway HTTP API + zero-dependency Python 3.12 Lambda + DynamoDB) backed by your KMS `ECC_NIST_P384` Intermediate CA key, featuring `private-eab` External Account Binding for VPC-internal Kubernetes `cert-manager` issuers and strict SAN domain allowlists.
+- **`modules/compliance-evidence`:** EventBridge-triggered collector that compiles SHA-256 hash-chained Step Functions timelines, CloudHSM `READY` backup escrow proofs, KMS key policies, and CloudWatch audit logs into an S3 Object-Locked (`GOVERNANCE`/`COMPLIANCE`) bundle signed by your Intermediate CA key, complete with an offline `verify_evidence.py` auditor CLI.
+
+To request commercial licensing, private repository access, or a fixed-scope production bootstrap package, open a discussion or reach out to `@TartarusCode`.
+
 ## Requirements, providers, resources, inputs & outputs
 
 <!-- BEGIN_TF_DOCS -->
